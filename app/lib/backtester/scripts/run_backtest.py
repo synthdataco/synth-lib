@@ -1,18 +1,27 @@
 """Run backtests for a miner against Synth subnet scoring data.
 
-Select which profile(s) and asset(s) to run via --profile and --asset.
+Pick assets with --asset (one or more symbols, or "ALL") and profiles with
+--profile (low, high, or all). When both profiles produce ≥2 assets' worth of
+data, also emits grand-total rank + earnings charts across profiles.
+
 Falls back to random predictions if no prediction files are found.
 
 Usage:
-    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --days 2 --profile all --asset ALL
-    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --days 2 --profile low --asset BTC TSLAX
+    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --days 2
+    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC --profile low
+    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC TSLAX
+    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset ALL --profile high
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import os
+import sys
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -20,10 +29,16 @@ from synth.validator.prompt_config import HIGH_FREQUENCY, LOW_FREQUENCY, PromptC
 
 UTC = timezone.utc
 NUM_SIMULATIONS = 100
+PROFILES_BY_NAME: dict[str, list[PromptConfig]] = {
+    "low": [LOW_FREQUENCY],
+    "high": [HIGH_FREQUENCY],
+    "all": [LOW_FREQUENCY, HIGH_FREQUENCY],
+}
 
-PROFILES: list[PromptConfig] = [LOW_FREQUENCY, HIGH_FREQUENCY]
-PROFILE_MAP: dict[str, PromptConfig] = {"low": LOW_FREQUENCY, "high": HIGH_FREQUENCY}
 
+# ---------------------------------------------------------------------------
+# Random-predictions fallback (used when no real predictions exist on disk)
+# ---------------------------------------------------------------------------
 
 def _generate_random_prediction(
     start_time: datetime,
@@ -97,50 +112,168 @@ def _generate_random_predictions(
     print(f"  Generated {generated} random prediction files for {asset}/{time_length}")
 
 
-def _resolve_targets(profile_arg: str, asset_args: list[str]) -> list[tuple[PromptConfig, str]]:
-    """Build the list of (profile, asset) pairs to backtest.
-
-    Assets not in a given profile's asset_list are silently skipped for that profile.
-    """
-    profiles = list(PROFILES) if profile_arg == "all" else [PROFILE_MAP[profile_arg]]
-    requested = {a.upper() for a in asset_args}
-    include_all = "ALL" in requested
-
-    targets: list[tuple[PromptConfig, str]] = []
-    for profile in profiles:
+def _populate_random_dir(filtered_profiles: list[PromptConfig], days: int, output_dir: Path) -> None:
+    """Populate `output_dir` with random predictions for every asset in each filtered profile."""
+    for profile in filtered_profiles:
         for asset in profile.asset_list:
-            if include_all or asset in requested:
-                targets.append((profile, asset))
-    return targets
+            _generate_random_predictions(days, output_dir, asset, profile.time_length, profile.time_increment)
 
+
+# ---------------------------------------------------------------------------
+# Selection parsing
+# ---------------------------------------------------------------------------
+
+def _parse_asset_selection(raw: list[str]) -> list[str] | None:
+    """Normalize --asset tokens. Returns None for 'ALL', else a deduplicated list of symbols.
+
+    Accepts any of: `--asset BTC`, `--asset BTC TSLAX`, `--asset "BTC TSLAX"`,
+    `--asset BTC,TSLAX`. Case-insensitive `ALL` (alone or mixed) means every asset.
+    """
+    tokens: list[str] = []
+    for piece in raw:
+        for sub in piece.replace(",", " ").split():
+            tokens.append(sub)
+    if any(t.upper() == "ALL" for t in tokens):
+        return None
+    # Preserve order, dedupe
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _build_filtered_profiles(
+    profiles: list[PromptConfig],
+    asset_selection: list[str] | None,
+) -> list[PromptConfig]:
+    """Intersect each profile's asset_list with the user selection; drop profiles with no match.
+
+    `asset_selection=None` means keep every asset in each profile (the "ALL" case).
+    """
+    out: list[PromptConfig] = []
+    for profile in profiles:
+        if asset_selection is None:
+            kept = list(profile.asset_list)
+        else:
+            kept = [a for a in asset_selection if a in profile.asset_list]
+        if kept:
+            out.append(dataclasses.replace(profile, asset_list=kept))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+def _run(
+    miner_name: str,
+    filtered_profiles: list[PromptConfig],
+    days: int,
+    predictions_dir: Path | None,
+    scoring_executor: ProcessPoolExecutor,
+) -> None:
+    """Run each filtered profile (parallel if >1) and emit grand-total charts when both produced data."""
+    import pandas as pd
+    from app.lib.backtester.backtest import (
+        BacktestResult,
+        plot_grand_total_earnings,
+        plot_grand_total_rank_evolution,
+        run_backtest,
+    )
+
+    results_by_profile: dict[str, list[BacktestResult]] = {}
+    combined_by_profile: dict[str, pd.DataFrame] = {}
+
+    with ThreadPoolExecutor(max_workers=max(len(filtered_profiles), 1)) as executor:
+        futures = {
+            executor.submit(
+                run_backtest,
+                miner_name=miner_name,
+                prompt_config=profile,
+                n_backtest_days=days,
+                predictions_dir=predictions_dir,
+                scoring_executor=scoring_executor,
+            ): profile
+            for profile in filtered_profiles
+        }
+        for future in as_completed(futures):
+            profile = futures[future]
+            try:
+                results, combined = future.result()
+                results_by_profile[profile.label] = results
+                combined_by_profile[profile.label] = combined
+            except (RuntimeError, FileNotFoundError) as e:
+                print(f"  [{profile.label}] BACKTEST FAILED: {e}")
+
+    print(f"\n{'='*60}\nALL BACKTESTS COMPLETE\n{'='*60}")
+
+    # Grand-total charts require both profiles to have combined frames with data.
+    if (
+        len(combined_by_profile) >= 2
+        and all(not c.empty for c in combined_by_profile.values())
+    ):
+        try:
+            path = plot_grand_total_rank_evolution(results_by_profile, combined_by_profile)
+            print(f"  Grand-total rank chart saved to: {path}")
+        except (RuntimeError, FileNotFoundError, KeyError) as e:
+            print(f"  Grand-total rank chart failed: {e}")
+
+        try:
+            path = plot_grand_total_earnings(results_by_profile, combined_by_profile)
+            print(f"  Grand-total earnings chart saved to: {path}")
+        except (RuntimeError, FileNotFoundError, KeyError) as e:
+            print(f"  Grand-total earnings chart failed: {e}")
+    else:
+        print("  Skipping grand-total charts: need both profiles with ≥2 assets each.")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run backtests against Synth subnet data")
     parser.add_argument("--miner-name", default="btc_research", help="Miner name (default: btc_research)")
     parser.add_argument("--days", type=int, default=2, help="Number of backtest days (default: 2)")
     parser.add_argument(
-        "--profile",
-        choices=["low", "high", "all"],
-        default="low",
-        help="Frequency profile to run: low, high, or all (default: low)",
-    )
-    parser.add_argument(
         "--asset",
         nargs="+",
-        default=["BTC"],
-        help="One or more asset symbols (e.g. BTC TSLAX), or ALL for every asset in the selected profile(s). Default: BTC",
+        default=["ALL"],
+        metavar="ASSET",
+        help='Assets to backtest: one or more symbols (e.g. BTC, or BTC TSLAX), or "ALL" (default: ALL)',
+    )
+    parser.add_argument(
+        "--profile",
+        choices=["low", "high", "all"],
+        default="all",
+        help="Profile to backtest: low, high, or all (default: all)",
     )
     parser.add_argument("--predictions-dir", type=str, default=None, help="Path to predictions directory")
     args = parser.parse_args()
 
-    targets = _resolve_targets(args.profile, args.asset)
-    if not targets:
-        print(f"No matching (profile, asset) pairs for profile={args.profile} asset={args.asset}")
-        return
+    asset_selection = _parse_asset_selection(args.asset)
+    profiles = PROFILES_BY_NAME[args.profile]
+    filtered_profiles = _build_filtered_profiles(profiles, asset_selection)
+
+    if not filtered_profiles:
+        sel = "ALL" if asset_selection is None else " ".join(asset_selection)
+        print(
+            f"ERROR: no assets match --asset '{sel}' in --profile {args.profile}. "
+            f"Available LOW assets: {LOW_FREQUENCY.asset_list}. "
+            f"Available HIGH assets: {HIGH_FREQUENCY.asset_list}.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    asset_summary = ", ".join(f"{p.label}={p.asset_list}" for p in filtered_profiles)
+    print(f"Running backtests for {args.miner_name}: {asset_summary}")
 
     predictions_dir = Path(args.predictions_dir) if args.predictions_dir else None
 
-    # Fall back to random predictions if no prediction files exist
+    # Decide whether to fall back to random predictions.
     use_tmp = False
     if predictions_dir is None:
         default_dir = Path(f"miner_outputs/{args.miner_name}/predictions")
@@ -149,100 +282,19 @@ def main() -> None:
             print(f"No predictions found in {default_dir}, falling back to random predictions.")
             use_tmp = True
 
+    max_workers = max((os.cpu_count() or 4) - 2, 1)
+
+    def _dispatch(pred_dir: Path | None) -> None:
+        with ProcessPoolExecutor(max_workers=max_workers) as scoring_executor:
+            _run(args.miner_name, filtered_profiles, args.days, pred_dir, scoring_executor)
+
     if use_tmp:
         with tempfile.TemporaryDirectory(prefix="backtest_preds_") as tmpdir:
-            predictions_dir = Path(tmpdir)
-            for profile, asset in targets:
-                _generate_random_predictions(
-                    args.days,
-                    predictions_dir,
-                    asset,
-                    profile.time_length,
-                    profile.time_increment,
-                )
-            _run_targets(args.miner_name, args.days, predictions_dir, targets)
+            tmp_dir = Path(tmpdir)
+            _populate_random_dir(filtered_profiles, args.days, tmp_dir)
+            _dispatch(tmp_dir)
     else:
-        _run_targets(args.miner_name, args.days, predictions_dir, targets)
-
-
-def _run_single_backtest(
-    miner_name: str,
-    asset: str,
-    time_length: int,
-    time_increment: int,
-    days: int,
-    predictions_dir: Path | None,
-) -> None:
-    from app.lib.backtester.backtest import (
-        backtest, plot_crps_by_day, plot_crps_by_hour, plot_crps_over_time,
-        plot_crps_ratio_distribution, plot_rank_evolution, plot_weekly_percentile,
-    )
-
-    print(f"\nRunning {days}-day backtest for '{miner_name}' on {asset} (time_length={time_length}s)...")
-    try:
-        result = backtest(
-            miner_name=miner_name,
-            asset=asset,
-            time_length=time_length,
-            time_increment=time_increment,
-            n_backtest_days=days,
-            predictions_dir=predictions_dir,
-        )
-    except (RuntimeError, FileNotFoundError) as e:
-        print(f"  FAILED: {e}")
-        return
-
-    summary = result.summary
-    print(f"  Prompts scored:       {summary['num_prompts']}")
-    print(f"  Mean CRPS:            {summary['mean_crps']:.6f}")
-    print(f"  Final smoothed score: {summary['final_smoothed_score']}")
-
-    chart_path = plot_rank_evolution(result)
-    print(f"  Rank chart saved to:  {chart_path}")
-
-    crps_chart = plot_crps_over_time(result)
-    print(f"  CRPS chart saved to:  {crps_chart}")
-
-    for plot_fn, chart_name in [
-        (plot_crps_by_hour, "CRPS-by-hour"),
-        (plot_crps_by_day, "CRPS-by-day"),
-        (plot_crps_ratio_distribution, "CRPS-ratio-dist"),
-        (plot_weekly_percentile, "Weekly-percentile"),
-    ]:
-        try:
-            path = plot_fn(result)
-            print(f"  {chart_name} chart saved to: {path}")
-        except (RuntimeError, Exception) as e:
-            print(f"  {chart_name} chart generation failed: {e}")
-
-
-def _run_targets(
-    miner_name: str,
-    days: int,
-    predictions_dir: Path | None,
-    targets: list[tuple[PromptConfig, str]],
-) -> None:
-    """Run backtest for each (profile, asset) target and print a summary table."""
-    for profile, asset in targets:
-        print(f"\n{'─'*60}")
-        print(f"[{profile.label}/{asset}] time_length={profile.time_length}s")
-        print(f"{'─'*60}")
-        try:
-            _run_single_backtest(
-                miner_name,
-                asset,
-                profile.time_length,
-                profile.time_increment,
-                days,
-                predictions_dir,
-            )
-        except Exception as e:
-            print(f"  ERROR: {e}")
-            continue
-
-    print(f"\n{'='*60}")
-    print("ALL BACKTESTS COMPLETE")
-    print(f"{'='*60}")
+        _dispatch(predictions_dir)
 
 
 if __name__ == "__main__":

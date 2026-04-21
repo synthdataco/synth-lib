@@ -10,6 +10,7 @@ External dependencies (DB, GCS, synth_subnet_analyses) are replaced with:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -32,9 +33,10 @@ from synth.validator.moving_average import compute_smoothed_score, prepare_df_fo
 from synth.validator.prompt_config import LOW_FREQUENCY, PromptConfig
 from synth.validator.reward import compute_prompt_scores
 
+from app.lib.preparation.market_data import PYTH_SYMBOLS
+
 SYNTHDATA_API_BASE = "https://api.synthdata.co"
 PYTH_HISTORY_URL = "https://benchmarks.pyth.network/v1/shims/tradingview/history"
-
 SCORING_INTERVALS: dict[str, int] = {
     "5min": 300,
     "30min": 1_800,
@@ -42,7 +44,9 @@ SCORING_INTERVALS: dict[str, int] = {
     "24hour_abs": 86_400,
 }
 DEFAULT_MINER_OUTPUT_ROOT = Path("miner_outputs")
+DEFAULT_MARKET_DATA_ROOT = Path("market_data/pyth/BTC/1m")
 LEADERBOARD_WINDOW_DAYS = 10
+_COMBINED_EMPTY_COLS = ["updated_at", "miner_uid", "new_smoothed_score", "reward_weight"]
 
 UTC = timezone.utc
 
@@ -266,52 +270,56 @@ def download_price_data(
     Returns DataFrame with DatetimeIndex (UTC) and a 'close' column at freq resolution.
     Tries local parquet partitions first, falls back to Pyth API.
     """
-    frames = []
-    cursor = start_time.date()
-    while cursor <= end_time.date():
-        root = Path(f"market_data/pyth/{asset}/1m")
-        part = root / f"date={cursor.isoformat()}.parquet"
-        frames.append(pd.read_parquet(part))
-        cursor += timedelta(days=1)
-    frame = pd.concat(frames, ignore_index=True)
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    frame = frame.sort_values("timestamp").set_index("timestamp")
-    return frame[["close"]].loc[start_time:end_time].resample(freq).last()
-    # # Pyth API has limited range per request — paginate in 5-day chunks
-    # frames = []
-    # cursor = start_time
-    # while cursor < end_time:
-    #     chunk_end = min(cursor + timedelta(days=PYTH_PAGE_SIZE_DAYS), end_time)
-    #     resp = requests.get(
-    #         PYTH_HISTORY_URL,
-    #         params={
-    #             "symbol": PYTH_SYMBOLS[asset],
-    #             "resolution": 1,
-    #             "from": int(cursor.timestamp()),
-    #             "to": int(chunk_end.timestamp()),
-    #         },
-    #     )
-    #     resp.raise_for_status()
-    #     payload = resp.json()
-    #     if "t" in payload and payload["t"]:
-    #         frames.append(
-    #             pd.DataFrame(
-    #                 {
-    #                     "timestamp": pd.to_datetime(payload["t"], unit="s", utc=True),
-    #                     "close": pd.Series(payload["c"], dtype="float64"),
-    #                 }
-    #             )
-    #         )
-    #     cursor = chunk_end
+    try:
+        frames = []
+        cursor = start_time.date()
+        while cursor <= end_time.date():
+            root = Path(f"market_data/pyth/{asset}/1m")
+            part = root / f"date={cursor.isoformat()}.parquet"
+            frames.append(pd.read_parquet(part))
+            cursor += timedelta(days=1)
+        frame = pd.concat(frames, ignore_index=True)
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+        frame = frame.sort_values("timestamp").set_index("timestamp")
+        return frame[["close"]].loc[start_time:end_time].resample(freq).last()
+    except FileNotFoundError:
+        pass
 
-    # if not frames:
-    #     raise RuntimeError(
-    #         f"No price data available for {asset} between {start_time} and {end_time}. "
-    #         "Neither local parquet files nor Pyth API returned data."
-    #     )
-    # frame = pd.concat(frames, ignore_index=True)
-    # frame = frame.sort_values("timestamp").drop_duplicates("timestamp").set_index("timestamp")
-    # return frame[["close"]].resample(freq).last()
+    # Pyth API has limited range per request — paginate in 5-day chunks
+    frames = []
+    cursor = start_time
+    while cursor < end_time:
+        chunk_end = min(cursor + timedelta(days=PYTH_PAGE_SIZE_DAYS), end_time)
+        resp = requests.get(
+            PYTH_HISTORY_URL,
+            params={
+                "symbol": PYTH_SYMBOLS[asset],
+                "resolution": 1,
+                "from": int(cursor.timestamp()),
+                "to": int(chunk_end.timestamp()),
+            },
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if "t" in payload and payload["t"]:
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "timestamp": pd.to_datetime(payload["t"], unit="s", utc=True),
+                        "close": pd.Series(payload["c"], dtype="float64"),
+                    }
+                )
+            )
+        cursor = chunk_end
+
+    if not frames:
+        raise RuntimeError(
+            f"No price data available for {asset} between {start_time} and {end_time}. "
+            "Neither local parquet files nor Pyth API returned data."
+        )
+    frame = pd.concat(frames, ignore_index=True)
+    frame = frame.sort_values("timestamp").drop_duplicates("timestamp").set_index("timestamp")
+    return frame[["close"]].resample(freq).last()
 
 
 def _compute_prompt_scores_for_group(crps: pd.Series) -> pd.Series:
@@ -402,9 +410,8 @@ def compute_combined_smoothed_scores(
     reward_weight. reward_weight sums to prompt_config.smoothed_score_coefficient
     across miners per timestamp.
     """
-    empty_cols = ["updated_at", "miner_uid", "new_smoothed_score", "reward_weight"]
     if not results:
-        return pd.DataFrame(columns=empty_cols)
+        return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
 
     # Concat per-asset prompt_df frames (keep asset, scored_time, miner_uid, new_prompt_scores)
     frames = []
@@ -414,7 +421,7 @@ def compute_combined_smoothed_scores(
         df = r.prompt_df[["scored_time", "miner_uid", "asset", "new_prompt_scores"]].copy()
         frames.append(df)
     if not frames:
-        return pd.DataFrame(columns=empty_cols)
+        return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
     combined_crps = pd.concat(frames, ignore_index=True)
 
     # Adapt column names to what synth expects: miner_id, prompt_score_v3
@@ -451,7 +458,7 @@ def compute_combined_smoothed_scores(
             )
 
     if not result_rows:
-        return pd.DataFrame(columns=empty_cols)
+        return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
     return pd.DataFrame(result_rows)
 
 
@@ -644,7 +651,7 @@ def backtest(
     asset_prices: dict[str, pd.DataFrame] = {}
     for asset_ in asset_scores["asset"].unique():
         st_ = asset_scores["start_time"].min() - pd.Timedelta(hours=2)
-        en_ = asset_scores["start_time"].max() + pd.Timedelta(seconds=time_length) + pd.Timedelta(hours=2)
+        en_ = asset_scores["start_time"].max() + pd.Timedelta(hours=26)
         asset_prices[asset_] = download_price_data(st_, en_, asset_, freq="1min")
 
     # Step 6: score LLM miner predictions
@@ -940,6 +947,74 @@ def plot_total_rank_evolution(
         n = len(last_slice)
         rw = float(miner_row["reward_weight"].iloc[0])
         print(f"\n  TOTAL [{profile_label}] rank: {rank}/{n}  reward_weight: {rw:.6f}")
+
+    return chart_path
+
+
+def plot_grand_total_rank_evolution(
+    results_by_profile: dict[str, list[BacktestResult]],
+    combined_by_profile: dict[str, pd.DataFrame],
+    output_dir: Path | None = None,
+) -> Path:
+    """Rank evolution across ALL assets from ALL profiles.
+
+    Merges per-profile `combined` frames via `_compute_grand_total_weights`
+    (forward-fill each profile onto the union of timestamps, then sum per
+    miner). Ranks miners descending by grand-total reward_weight at each
+    timestamp.
+    """
+    grand = _compute_grand_total_weights(combined_by_profile)
+    if grand.empty:
+        raise RuntimeError("No grand-total rows available for rank chart.")
+
+    # miner_name / miner_id from any profile's first result
+    first_result = next(
+        (rs[0] for rs in results_by_profile.values() if rs), None,
+    )
+    if first_result is None:
+        raise RuntimeError("No backtest results to aggregate.")
+    miner_name = first_result.miner_name
+    miner_id = first_result.summary["miner_id"]
+
+    df = grand.copy()
+    df["rank"] = df.groupby("updated_at")["reward_weight"].rank(ascending=False, method="min").astype(int)
+
+    miner_df = df.loc[df["miner_uid"] == miner_id].sort_values("updated_at")
+    if miner_df.empty:
+        raise RuntimeError(f"Miner {miner_id} not found in grand-total weights.")
+
+    total_miners = df.groupby("updated_at")["miner_uid"].nunique()
+
+    sns.set_theme(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(12, 5))
+    sns.lineplot(data=miner_df, x="updated_at", y="rank", marker="o", markersize=5, linewidth=2, ax=ax)
+    ax.fill_between(
+        total_miners.index, 1, total_miners.values, alpha=0.08, color="grey", label="Total miners",
+    )
+    ax.invert_yaxis()
+    ax.set_xlabel("Time (UTC)")
+    ax.set_ylabel("Rank (1 = best)")
+    ax.set_title(f"Grand-total rank evolution — {miner_name} — all profiles, all assets")
+    ax.legend()
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    if output_dir is None:
+        output_dir = DEFAULT_MINER_OUTPUT_ROOT / miner_name / "charts"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chart_path = output_dir / "rank_evolution_GRAND_TOTAL.png"
+    fig.savefig(chart_path, dpi=150)
+    plt.close(fig)
+
+    # Print final grand-total rank
+    last_ts = miner_df["updated_at"].max()
+    last_slice = df.loc[df["updated_at"] == last_ts]
+    miner_row = last_slice.loc[last_slice["miner_uid"] == miner_id]
+    if not miner_row.empty:
+        rank = int(miner_row["rank"].iloc[0])
+        n = len(last_slice)
+        rw = float(miner_row["reward_weight"].iloc[0])
+        print(f"\n  GRAND TOTAL rank: {rank}/{n}  reward_weight: {rw:.6f}")
 
     return chart_path
 
@@ -1246,6 +1321,76 @@ def plot_weekly_percentile(
     return chart_path
 
 
+def _compute_grand_total_weights(
+    combined_by_profile: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Merge per-profile combined frames into one grand-total reward_weight frame.
+
+    At each union timestamp, forward-fill each profile's per-miner reward_weight
+    from its most recent round and sum across profiles. Drops timestamps before
+    all profiles have produced their first round (otherwise the grand-total
+    weights wouldn't sum to 1.0 across miners).
+
+    Returns DataFrame with columns: updated_at, miner_uid, reward_weight,
+    new_smoothed_score. Empty if any profile frame is empty or the input dict is
+    empty (single-profile input also returns empty, since grand-total requires
+    all profiles active).
+    """
+    if not combined_by_profile or any(df.empty for df in combined_by_profile.values()):
+        return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
+    if len(combined_by_profile) < 2:
+        return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
+
+    # Union of timestamps and miners across profiles
+    all_miners: set[int] = set()
+    all_timestamps: set[pd.Timestamp] = set()
+    profile_starts: dict[str, pd.Timestamp] = {}
+    for label, df in combined_by_profile.items():
+        df_ts = pd.to_datetime(df["updated_at"])
+        all_timestamps.update(df_ts.unique())
+        all_miners.update(df["miner_uid"].unique())
+        profile_starts[label] = df_ts.min()
+
+    # Drop timestamps before ALL profiles have started
+    latest_start = max(profile_starts.values())
+    union_ts = sorted(t for t in all_timestamps if t >= latest_start)
+    if not union_ts:
+        return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
+
+    # Forward-fill each profile's reward_weight onto the union grid per miner.
+    # Reindex onto the union of ALL profile timestamps first (including those
+    # before latest_start), so ffill can carry values forward from earlier rounds
+    # of a profile whose first round pre-dates the other profile's first round.
+    # Then restrict to union_ts.
+    miners = sorted(all_miners)
+    full_index = sorted(all_timestamps)
+    ff_frames: list[pd.DataFrame] = []
+    for _label, df in combined_by_profile.items():
+        df_local = df.copy()
+        df_local["updated_at"] = pd.to_datetime(df_local["updated_at"])
+        pivot = (
+            df_local.pivot_table(
+                index="updated_at", columns="miner_uid", values="reward_weight", aggfunc="last"
+            )
+            .reindex(full_index)
+            .ffill()
+            .reindex(index=union_ts)
+            .reindex(columns=miners, fill_value=0.0)
+        )
+        pivot = pivot.fillna(0.0)
+        ff_frames.append(pivot)
+
+    # Sum forward-filled weights across profiles
+    total = sum(ff_frames)
+    long = total.reset_index().melt(
+        id_vars="updated_at", var_name="miner_uid", value_name="reward_weight"
+    )
+    long["new_smoothed_score"] = 0.0  # grand-total doesn't have a meaningful smoothed score
+    return long[_COMBINED_EMPTY_COLS].sort_values(
+        ["updated_at", "miner_uid"]
+    ).reset_index(drop=True)
+
+
 def _compute_earnings_df(
     combined: pd.DataFrame,
     miner_id: int,
@@ -1431,6 +1576,116 @@ def plot_estimated_earnings(
     return chart_path
 
 
+def plot_grand_total_earnings(
+    results_by_profile: dict[str, list[BacktestResult]],
+    combined_by_profile: dict[str, pd.DataFrame],
+    output_dir: Path | None = None,
+) -> Path:
+    """Three-panel estimated earnings chart using grand-total reward_weight.
+
+    Uses the full daily miner-pool USD (no × smoothed_score_coefficient factor),
+    applied to each miner's grand-total share (reward_weight sums to 1.0 across
+    miners per timestamp once both profiles are active).
+    """
+    grand = _compute_grand_total_weights(combined_by_profile)
+    if grand.empty:
+        raise RuntimeError("No grand-total rows — cannot compute earnings.")
+
+    first_result = next(
+        (rs[0] for rs in results_by_profile.values() if rs), None,
+    )
+    if first_result is None:
+        raise RuntimeError("No backtest results to plot.")
+    miner_name = first_result.miner_name
+    miner_id = first_result.summary["miner_id"]
+
+    first_ts = pd.to_datetime(grand["updated_at"].min())
+    last_ts = pd.to_datetime(grand["updated_at"].max())
+    daily_pool = get_daily_miner_pool_usd(
+        first_ts.floor("D").to_pydatetime(),
+        (last_ts.floor("D") + pd.Timedelta(days=1)).to_pydatetime(),
+    )
+    if daily_pool.empty:
+        raise RuntimeError("No daily pool data available from /rewards/historical.")
+
+    # Use a synthetic PromptConfig with smoothed_score_coefficient=1.0 so
+    # _compute_earnings_df treats grand-total reward_weight as the full share.
+    grand_config = dataclasses.replace(
+        LOW_FREQUENCY, smoothed_score_coefficient=1.0, label="GRAND_TOTAL",
+    )
+    earnings = _compute_earnings_df(grand, miner_id, grand_config, daily_pool)
+    if earnings.empty:
+        raise RuntimeError(f"Miner {miner_id} not found in grand-total weights.")
+
+    daily = (
+        earnings.set_index("updated_at")
+        .resample("1D")
+        .agg(usd=("usd_per_round", "sum"), share_mean=("share_of_round", "mean"))
+        .dropna()
+    )
+
+    total_usd = float(earnings["usd_cumulative"].iloc[-1])
+    mean_share_pct = float(earnings["share_of_round"].mean() * 100)
+    mean_daily_usd = float(daily["usd"].mean()) if not daily.empty else 0.0
+    dur_days = (last_ts - first_ts).total_seconds() / 86400
+
+    sns.set_theme(style="whitegrid")
+    fig, axes = plt.subplots(
+        3, 1, figsize=(13, 10), sharex=True,
+        gridspec_kw={"height_ratios": [1.0, 1.1, 1.3]},
+    )
+
+    ax = axes[0]
+    ax.plot(earnings["updated_at"], earnings["share_of_round"] * 100, color="tab:blue", lw=0.9)
+    ax.fill_between(earnings["updated_at"], 0, earnings["share_of_round"] * 100, color="tab:blue", alpha=0.15)
+    ax.axhline(mean_share_pct, color="tab:orange", ls="--", lw=0.8, label=f"window mean {mean_share_pct:.2f}%")
+    ax.set_ylabel("Our share of subnet (%)")
+    ax.legend(loc="upper right", fontsize=9)
+
+    ax = axes[1]
+    ax.bar(daily.index, daily["usd"], color="tab:green", width=0.85, alpha=0.8)
+    ax.axhline(mean_daily_usd, color="black", ls="--", lw=0.8, label=f"mean daily ${mean_daily_usd:,.0f}")
+    ax.set_ylabel("Daily earnings ($)")
+    ax.legend(loc="upper right", fontsize=9)
+
+    ax = axes[2]
+    ax.plot(earnings["updated_at"], earnings["usd_cumulative"], color="tab:purple", lw=1.8)
+    ax.fill_between(earnings["updated_at"], 0, earnings["usd_cumulative"], color="tab:purple", alpha=0.15)
+    ax.set_ylabel("Cumulative earnings ($)")
+    ax.set_xlabel("Date (UTC)")
+    ax.annotate(
+        f"${total_usd:,.0f}",
+        xy=(earnings["updated_at"].iloc[-1], total_usd),
+        xytext=(-80, -10),
+        textcoords="offset points",
+        fontsize=11, fontweight="bold", color="tab:purple",
+    )
+
+    total_assets = sum(len(rs) for rs in results_by_profile.values())
+    fig.suptitle(
+        f"Estimated grand-total earnings — {miner_name} — "
+        f"{len(results_by_profile)} profiles, {total_assets} assets, {dur_days:.1f}d\n"
+        f"Uses full daily miner-pool USD × grand-total share "
+        f"(sums both profile coefficients, matches real-validator weights).",
+        fontsize=11, y=0.995,
+    )
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    if output_dir is None:
+        output_dir = DEFAULT_MINER_OUTPUT_ROOT / miner_name / "charts"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    chart_path = output_dir / "estimated_earnings_GRAND_TOTAL.png"
+    fig.savefig(chart_path, dpi=150)
+    plt.close(fig)
+
+    print(
+        f"\n  GRAND TOTAL EARNINGS total: ${total_usd:,.0f} "
+        f"over {dur_days:.1f}d (mean share {mean_share_pct:.2f}%)"
+    )
+    return chart_path
+
+
 def run_backtest(
     miner_name: str,
     prompt_config: PromptConfig,
@@ -1438,12 +1693,16 @@ def run_backtest(
     predictions_dir: Path | None = None,
     miner_id: int = 999,
     scoring_executor: ProcessPoolExecutor | None = None,
-) -> list[BacktestResult]:
+) -> tuple[list[BacktestResult], pd.DataFrame]:
     """Run the full backtest for all assets in a prompt config.
 
     For each asset: runs backtest, prints rank summary, saves per-asset rank chart.
-    After all assets: saves total rank evolution chart.
-    Returns the list of successful BacktestResults.
+    After all assets: saves total rank evolution chart + estimated earnings chart
+    when ≥2 assets succeed.
+
+    Returns (results, combined) where:
+      - results: list of successful BacktestResult (one per asset)
+      - combined: per-profile combined smoothed-scores DataFrame (empty when <2 assets)
     """
     assets = prompt_config.asset_list
     max_workers = min(len(assets), 6)
@@ -1529,19 +1788,17 @@ def run_backtest(
                 print(f"  {chart_name} chart generation failed: {e}")
 
     # Cross-asset charts: compute combined smoothed scores once, share across both charts.
+    combined = pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
     if len(results) >= 2:
         try:
             combined = compute_combined_smoothed_scores(results, prompt_config)
         except Exception as e:
             print(f"  Combined smoothed scores failed: {e}")
-            combined = None
 
-        if combined is not None and not combined.empty:
+        if not combined.empty:
             try:
                 total_chart = plot_total_rank_evolution(
-                    results,
-                    combined=combined,
-                    profile_label=prompt_config.label,
+                    results, combined=combined, profile_label=prompt_config.label,
                 )
                 print(f"  Total rank chart saved to: {total_chart}")
             except Exception as e:
@@ -1549,12 +1806,10 @@ def run_backtest(
 
             try:
                 earnings_chart = plot_estimated_earnings(
-                    results,
-                    prompt_config=prompt_config,
-                    combined=combined,
+                    results, prompt_config=prompt_config, combined=combined,
                 )
                 print(f"  Earnings chart saved to: {earnings_chart}")
             except Exception as e:
                 print(f"  Earnings chart failed: {e}")
 
-    return results
+    return results, combined

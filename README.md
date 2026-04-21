@@ -78,15 +78,12 @@ uv run app/lib/preparation/market_data.py --asset BTC --force-refresh
 ```python
 from app.lib.preparation.market_data import download_market_data, download_all_assets
 
-# Custom historical window with the programmatic API
-download_market_data("BTC", total_months=6, heldout_months=0)
+# Single asset, default window
+download_market_data("BTC")
 
 # Recent N days, every asset
 download_all_assets(days=30)
 ```
-
-The Python helpers still accept `total_months` / `heldout_months` kwargs for
-finer control; the CLI has been simplified to just `--asset` / `--days`.
 
 ### Output layout
 
@@ -130,26 +127,26 @@ starting from the current price.
 ### Running the backtester
 
 Targets are expressed as a pair: which frequency profile to run (`--profile`)
-and which asset(s) to run within it (`--asset`). If no prediction files exist
-under `miner_outputs/{miner_name}/predictions/`, the script auto-generates
-random-walk predictions into a temp directory so the pipeline can be verified
-end-to-end.
+and which asset(s) to run within it (`--asset`). Defaults are
+`--profile all --asset ALL`, i.e. every asset in every profile. If no
+prediction files exist under `miner_outputs/{miner_name}/predictions/`, the
+script auto-generates random-walk predictions into a temp directory so the
+pipeline can be verified end-to-end.
 
 ```bash
-# Default: LOW_FREQUENCY, BTC, last 2 days
+# Default: both profiles × every asset, last 2 days
 uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent
 
 # BTC across both profiles
-uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile all --asset BTC
+uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC
 
-# Multiple assets in LOW_FREQUENCY
+# Multiple assets in LOW_FREQUENCY (space-, comma-, or quoted list all work)
 uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset BTC ETH TSLAX
+uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset BTC,ETH,TSLAX
+uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset "BTC ETH TSLAX"
 
-# Every asset in HIGH_FREQUENCY
+# Every asset in HIGH_FREQUENCY only
 uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile high --asset ALL
-
-# Full sweep: every profile × every asset
-uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile all --asset ALL
 
 # Longer window or custom predictions directory
 uv run app/lib/backtester/scripts/run_backtest.py \
@@ -159,9 +156,9 @@ uv run app/lib/backtester/scripts/run_backtest.py \
     --predictions-dir /path/to/predictions
 ```
 
-Assets not in a given profile's `asset_list` are silently skipped for that
-profile (e.g. `--profile high --asset TSLAX` produces no runs, since TSLAX
-isn't in HIGH_FREQUENCY).
+Assets not in a given profile's `asset_list` are filtered out for that
+profile; if nothing matches anywhere the script exits with a clear error
+listing the supported assets per profile.
 
 CLI flags (see [run_backtest.py](app/lib/backtester/scripts/run_backtest.py)):
 
@@ -169,16 +166,27 @@ CLI flags (see [run_backtest.py](app/lib/backtester/scripts/run_backtest.py)):
 | --- | --- | --- |
 | `--miner-name` | `btc_research` | Subdirectory under `miner_outputs/` for predictions and chart output |
 | `--days` | `2` | Length of the backtest window (ending now) |
-| `--profile` | `low` | Frequency profile: `low`, `high`, or `all` |
-| `--asset` | `BTC` | One or more asset symbols, or `ALL` to expand to every asset in the selected profile(s) |
+| `--profile` | `all` | Profile to backtest: `low`, `high`, or `all` |
+| `--asset` | `ALL` | One or more asset symbols (space-, comma-, or space-inside-quotes separated), or `ALL` for every asset in the selected profile(s) |
 | `--predictions-dir` | `miner_outputs/{miner_name}/predictions` | Where to read predictions from |
+
+### Parallelism
+
+The runner uses three nested pools, so a full sweep finishes much faster than
+the asset count would suggest:
+
+- Profiles (`low`, `high`) run in a `ThreadPoolExecutor` (one thread per profile).
+- Inside each profile, assets run in their own `ThreadPoolExecutor` (up to 6 at a time, I/O-bound on the Synth API).
+- Inside each asset, per-prompt CRPS scoring is dispatched to a shared `ProcessPoolExecutor` sized to `cpu_count() - 2`.
 
 ### From Python
 
 ```python
-from app.lib.backtester.backtest import backtest
+from synth.validator.prompt_config import LOW_FREQUENCY
+from app.lib.backtester.backtest import run_backtest, backtest
 
-result = backtest(
+# Single asset
+single = backtest(
     miner_name="gbm_agent",
     asset="BTC",
     time_length=86_400,     # 24h prompts (LOW_FREQUENCY) — use 3_600 for HIGH_FREQUENCY
@@ -186,22 +194,41 @@ result = backtest(
     n_backtest_days=7,
 )
 
-print(result.summary)       # {num_prompts, mean_crps, final_smoothed_score, ...}
-result.prompt_df            # per-prompt CRPS and scores (incl. every other miner)
-result.smoothed_scores      # per-round smoothed score + reward_weight
+# Whole profile (parallel across assets + emits per-profile TOTAL charts when ≥2 succeed)
+results, combined = run_backtest(
+    miner_name="gbm_agent",
+    prompt_config=LOW_FREQUENCY,
+    n_backtest_days=7,
+)
+
+print(single.summary)       # {num_prompts, mean_crps, final_smoothed_score, ...}
+single.prompt_df            # per-prompt CRPS and scores (incl. every other miner)
+single.smoothed_scores      # per-round smoothed score + reward_weight
 ```
 
 ### Output
 
 Charts are written to `miner_outputs/{miner_name}/charts/`:
 
+Per-asset:
+
 - `rank_evolution_{asset}_{time_length}.png` — rank over time (1 = best)
 - `crps_over_time_…png`, `crps_by_hour_…png`, `crps_by_day_…png`
 - `crps_ratio_dist_…png` — distribution of your CRPS relative to median
 - `weekly_percentile_…png` — percentile rank per calendar week
 
-The console prints `num_prompts`, mean CRPS, and final smoothed score per
-asset/profile combination.
+Per profile (emitted when ≥2 assets in that profile produce results):
+
+- `rank_evolution_TOTAL_{profile}.png` — combined rank across the profile's assets
+- `estimated_earnings_{profile}.png` — per-round USD + cumulative earnings estimate
+
+Grand total (emitted when both profiles produced data):
+
+- `rank_evolution_GRAND_TOTAL.png`
+- `estimated_earnings_GRAND_TOTAL.png`
+
+The console prints per-asset rank, reward weight, smoothed score, prompt
+count, mean CRPS, and the paths of every saved chart.
 
 ## Tests
 
