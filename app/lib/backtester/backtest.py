@@ -279,7 +279,11 @@ def get_daily_miner_pool_usd(
         end_ts = pd.Timestamp(end_date) if end_date.tzinfo else pd.Timestamp(end_date, tz="UTC")
         mask = (df["date"] >= start_ts) & (df["date"] < end_ts)
         sub = df.loc[mask].sort_values("date")
-        return pd.Series(sub["usd"].values, index=sub["date"].values, dtype=float)
+        return pd.Series(
+            sub["usd"].values,
+            index=pd.DatetimeIndex(sub["date"]),
+            dtype=float,
+        ).sort_index()
 
     merged: dict[pd.Timestamp, float] = {}
     cursor = start_date
