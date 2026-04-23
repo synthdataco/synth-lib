@@ -74,16 +74,31 @@ PREDICTION_MATCH_TOLERANCE_MINUTES = 30
 # otherwise rate-limit the Synth API, or sandboxes with internet disabled).
 #
 # Expected layout under the root:
-#   miner_scores_{asset}_{time_length}_{time_increment}.parquet
+#   miner_scores_{asset}_{label}.parquet         # label = "low" / "high" (see _PROFILE_LABELS)
 #   rewards_history_{prompt_name}.parquet        # prompt_name = "low" or "high"
 #   miner_pool_usd.parquet                       # columns: date, usd
 #   market_data/pyth/{asset}/1m/date=*.parquet   # daily price partitions
 _OFFLINE_ENV_VAR = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
 
+# Short labels for the two canonical Synth profiles, matching prompt_config.label.
+_PROFILE_LABELS: dict[tuple[int, int], str] = {
+    (86400, 300): "low",   # LOW_FREQUENCY
+    (3600, 60): "high",    # HIGH_FREQUENCY
+}
+
 
 def _offline_root() -> Path | None:
     val = os.environ.get(_OFFLINE_ENV_VAR)
     return Path(val) if val else None
+
+
+def _profile_label(time_length: int, time_increment: int) -> str:
+    """Short filename suffix for a (time_length, time_increment) pair.
+
+    Falls back to the explicit numeric form for non-standard profiles so the
+    offline parquet layout stays unambiguous.
+    """
+    return _PROFILE_LABELS.get((time_length, time_increment), f"{time_length}_{time_increment}")
 
 
 def _filter_time_range(df: pd.DataFrame, col: str, start: datetime, end: datetime) -> pd.DataFrame:
@@ -144,7 +159,7 @@ def get_miner_scores(
 
     offline = _offline_root()
     if offline is not None:
-        path = offline / f"miner_scores_{asset}_{time_length}_{time_increment}.parquet"
+        path = offline / f"miner_scores_{asset}_{_profile_label(time_length, time_increment)}.parquet"
         if not path.exists():
             raise FileNotFoundError(
                 f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
