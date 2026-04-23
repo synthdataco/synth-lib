@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -66,6 +67,34 @@ PYTH_PAGE_SIZE_DAYS = 5
 PREDICTION_MATCH_TOLERANCE_MINUTES = 30
 
 
+# -- Offline mode --
+# When SYNTH_BACKTESTER_OFFLINE_DATA_ROOT is set, read bundled parquets from that
+# root instead of calling api.synthdata.co / Pyth. Required for reproducible /
+# network-restricted use cases (e.g. concurrent benchmark rollouts that would
+# otherwise rate-limit the Synth API, or sandboxes with internet disabled).
+#
+# Expected layout under the root:
+#   miner_scores_{asset}_{time_length}_{time_increment}.parquet
+#   rewards_history_{prompt_name}.parquet        # prompt_name = "low" or "high"
+#   miner_pool_usd.parquet                       # columns: date, usd
+#   market_data/pyth/{asset}/1m/date=*.parquet   # daily price partitions
+_OFFLINE_ENV_VAR = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
+
+
+def _offline_root() -> Path | None:
+    val = os.environ.get(_OFFLINE_ENV_VAR)
+    return Path(val) if val else None
+
+
+def _filter_time_range(df: pd.DataFrame, col: str, start: datetime, end: datetime) -> pd.DataFrame:
+    if df.empty:
+        return df
+    s = pd.to_datetime(df[col], utc=True)
+    start_ts = pd.Timestamp(start) if start.tzinfo else pd.Timestamp(start, tz="UTC")
+    end_ts = pd.Timestamp(end) if end.tzinfo else pd.Timestamp(end, tz="UTC")
+    return df.loc[(s >= start_ts) & (s < end_ts)].copy()
+
+
 @dataclass
 class BacktestResult:
     miner_name: str
@@ -112,6 +141,23 @@ def get_miner_scores(
     """
     start_time = start_time.replace(microsecond=0)
     end_time = end_time.replace(microsecond=0)
+
+    offline = _offline_root()
+    if offline is not None:
+        path = offline / f"miner_scores_{asset}_{time_length}_{time_increment}.parquet"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
+            )
+        df = pd.read_parquet(path)
+        df = _filter_time_range(df, "scored_time", start_time, end_time)
+        if df.empty:
+            return df
+        df["scored_time"] = pd.to_datetime(df["scored_time"], utc=True)
+        df["time_increment"] = time_increment
+        df["start_time"] = df["scored_time"] - pd.Timedelta(seconds=time_length)
+        return df.reset_index(drop=True)
+
     chunks = []
     cursor = start_time
     while cursor < end_time:
@@ -160,6 +206,22 @@ def get_rewards_history(
     """
     start_time = start_time.replace(microsecond=0)
     end_time = end_time.replace(microsecond=0)
+
+    offline = _offline_root()
+    if offline is not None:
+        suffix = prompt_name or "all"
+        path = offline / f"rewards_history_{suffix}.parquet"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
+            )
+        df = pd.read_parquet(path)
+        df = _filter_time_range(df, "updated_at", start_time, end_time)
+        if df.empty:
+            return df
+        df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True)
+        return df.drop_duplicates().reset_index(drop=True)
+
     chunks = []
     cursor = start_time
     while cursor < end_time:
@@ -201,6 +263,27 @@ def get_daily_miner_pool_usd(
     """
     start_date = start_date.replace(microsecond=0)
     end_date = end_date.replace(microsecond=0)
+
+    offline = _offline_root()
+    if offline is not None:
+        path = offline / "miner_pool_usd.parquet"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
+            )
+        df = pd.read_parquet(path)
+        if df.empty:
+            return pd.Series(dtype=float)
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+        start_ts = pd.Timestamp(start_date) if start_date.tzinfo else pd.Timestamp(start_date, tz="UTC")
+        end_ts = pd.Timestamp(end_date) if end_date.tzinfo else pd.Timestamp(end_date, tz="UTC")
+        mask = (df["date"] >= start_ts) & (df["date"] < end_ts)
+        sub = df.loc[mask].sort_values("date")
+        return pd.Series(
+            sub["usd"].values,
+            index=pd.DatetimeIndex(sub["date"]),
+            dtype=float,
+        ).sort_index()
 
     merged: dict[pd.Timestamp, float] = {}
     cursor = start_date
@@ -269,13 +352,22 @@ def download_price_data(
     """
     Returns DataFrame with DatetimeIndex (UTC) and a 'close' column at freq resolution.
     Tries local parquet partitions first, falls back to Pyth API.
+
+    Offline mode: if SYNTH_BACKTESTER_OFFLINE_DATA_ROOT is set, looks under
+    {root}/market_data/pyth/{asset}/1m/ and raises instead of falling back
+    to the Pyth API (fail-loud on missing bundled data).
     """
+    offline = _offline_root()
+    parquet_root = (
+        offline / "market_data" / "pyth" / asset / "1m"
+        if offline is not None
+        else Path(f"market_data/pyth/{asset}/1m")
+    )
     try:
         frames = []
         cursor = start_time.date()
         while cursor <= end_time.date():
-            root = Path(f"market_data/pyth/{asset}/1m")
-            part = root / f"date={cursor.isoformat()}.parquet"
+            part = parquet_root / f"date={cursor.isoformat()}.parquet"
             frames.append(pd.read_parquet(part))
             cursor += timedelta(days=1)
         frame = pd.concat(frames, ignore_index=True)
@@ -283,7 +375,11 @@ def download_price_data(
         frame = frame.sort_values("timestamp").set_index("timestamp")
         return frame[["close"]].loc[start_time:end_time].resample(freq).last()
     except FileNotFoundError:
-        pass
+        if offline is not None:
+            raise FileNotFoundError(
+                f"Offline mode: price data missing for {asset} in {parquet_root}. "
+                "Pre-fetch the bundled data snapshot first."
+            )
 
     # Pyth API has limited range per request — paginate in 5-day chunks
     frames = []
