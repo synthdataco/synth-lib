@@ -40,6 +40,7 @@ PROFILES_BY_NAME: dict[str, list[PromptConfig]] = {
 # Random-predictions fallback (used when no real predictions exist on disk)
 # ---------------------------------------------------------------------------
 
+
 def _generate_random_prediction(
     start_time: datetime,
     current_price: float,
@@ -79,9 +80,13 @@ def _generate_random_predictions(
     now = datetime.now(UTC)
     query_start = now - timedelta(days=days)
 
-    print(f"Fetching miner scores for {asset} (time_length={time_length}s) over last {days} days...")
+    print(
+        f"Fetching miner scores for {asset} (time_length={time_length}s) over last {days} days..."
+    )
     try:
-        scores = get_miner_scores(query_start, now, asset, time_length, time_increment=time_increment)
+        scores = get_miner_scores(
+            query_start, now, asset, time_length, time_increment=time_increment
+        )
     except Exception as e:
         print(f"  Failed to fetch scores for {asset}/{time_length}: {e} — skipping.")
         return
@@ -90,7 +95,9 @@ def _generate_random_predictions(
         return
 
     start_times = sorted(scores["start_time"].unique())
-    print(f"  Found {len(start_times)} scored prompts. Generating random predictions...")
+    print(
+        f"  Found {len(start_times)} scored prompts. Generating random predictions..."
+    )
 
     price_start = min(start_times) - timedelta(hours=1)
     price_end = max(start_times) + timedelta(seconds=time_length) + timedelta(hours=1)
@@ -105,23 +112,30 @@ def _generate_random_predictions(
             continue
 
         filename = ts.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{asset}_{time_length}.json"
-        pred = _generate_random_prediction(ts, current_price, asset, time_length, time_increment)
+        pred = _generate_random_prediction(
+            ts, current_price, asset, time_length, time_increment
+        )
         (output_dir / filename).write_text(json.dumps(pred))
         generated += 1
 
     print(f"  Generated {generated} random prediction files for {asset}/{time_length}")
 
 
-def _populate_random_dir(filtered_profiles: list[PromptConfig], days: int, output_dir: Path) -> None:
+def _populate_random_dir(
+    filtered_profiles: list[PromptConfig], days: int, output_dir: Path
+) -> None:
     """Populate `output_dir` with random predictions for every asset in each filtered profile."""
     for profile in filtered_profiles:
         for asset in profile.asset_list:
-            _generate_random_predictions(days, output_dir, asset, profile.time_length, profile.time_increment)
+            _generate_random_predictions(
+                days, output_dir, asset, profile.time_length, profile.time_increment
+            )
 
 
 # ---------------------------------------------------------------------------
 # Selection parsing
 # ---------------------------------------------------------------------------
+
 
 def _parse_asset_selection(raw: list[str]) -> list[str] | None:
     """Normalize --asset tokens. Returns None for 'ALL', else a deduplicated list of symbols.
@@ -168,12 +182,16 @@ def _build_filtered_profiles(
 # Dispatch
 # ---------------------------------------------------------------------------
 
+
 def _run(
     miner_name: str,
     filtered_profiles: list[PromptConfig],
     days: int,
     predictions_dir: Path | None,
     scoring_executor: ProcessPoolExecutor,
+    eval_end: datetime | None = None,
+    simulate_registration: datetime | None = None,
+    simulate_deregistration: datetime | None = None,
 ) -> None:
     """Run each filtered profile (parallel if >1) and emit grand-total charts when both produced data."""
     import pandas as pd
@@ -196,6 +214,9 @@ def _run(
                 n_backtest_days=days,
                 predictions_dir=predictions_dir,
                 scoring_executor=scoring_executor,
+                eval_end=eval_end,
+                simulate_registration=simulate_registration,
+                simulate_deregistration=simulate_deregistration,
             ): profile
             for profile in filtered_profiles
         }
@@ -211,12 +232,13 @@ def _run(
     print(f"\n{'='*60}\nALL BACKTESTS COMPLETE\n{'='*60}")
 
     # Grand-total charts require both profiles to have combined frames with data.
-    if (
-        len(combined_by_profile) >= 2
-        and all(not c.empty for c in combined_by_profile.values())
+    if len(combined_by_profile) >= 2 and all(
+        not c.empty for c in combined_by_profile.values()
     ):
         try:
-            path = plot_grand_total_rank_evolution(results_by_profile, combined_by_profile)
+            path = plot_grand_total_rank_evolution(
+                results_by_profile, combined_by_profile
+            )
             print(f"  Grand-total rank chart saved to: {path}")
         except (RuntimeError, FileNotFoundError, KeyError) as e:
             print(f"  Grand-total rank chart failed: {e}")
@@ -234,10 +256,19 @@ def _run(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run backtests against Synth subnet data")
-    parser.add_argument("--miner-name", default="btc_research", help="Miner name (default: btc_research)")
-    parser.add_argument("--days", type=int, default=2, help="Number of backtest days (default: 2)")
+    parser = argparse.ArgumentParser(
+        description="Run backtests against Synth subnet data"
+    )
+    parser.add_argument(
+        "--miner-name",
+        default="btc_research",
+        help="Miner name (default: btc_research)",
+    )
+    parser.add_argument(
+        "--days", type=int, default=2, help="Number of backtest days (default: 2)"
+    )
     parser.add_argument(
         "--asset",
         nargs="+",
@@ -251,8 +282,46 @@ def main() -> None:
         default="all",
         help="Profile to backtest: low, high, or all (default: all)",
     )
-    parser.add_argument("--predictions-dir", type=str, default=None, help="Path to predictions directory")
+    parser.add_argument(
+        "--predictions-dir",
+        type=str,
+        default=None,
+        help="Path to predictions directory",
+    )
+    parser.add_argument(
+        "--eval-end",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Pin the evaluation window end date (default: now)",
+    )
+    parser.add_argument(
+        "--simulate-registration",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Simulate the miner registering on this date. Drops our CRPS rows "
+        "before this date so synth's worst-score backfill applies symmetrically "
+        "with real late-joining miners.",
+    )
+    parser.add_argument(
+        "--simulate-deregistration",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Simulate the miner leaving on this date. Drops our CRPS rows after "
+        "this date.",
+    )
     args = parser.parse_args()
+
+    def _parse_iso(s: str | None) -> datetime | None:
+        if s is None:
+            return None
+        return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=UTC)
+
+    eval_end = _parse_iso(args.eval_end)
+    simulate_registration = _parse_iso(args.simulate_registration)
+    simulate_deregistration = _parse_iso(args.simulate_deregistration)
 
     asset_selection = _parse_asset_selection(args.asset)
     profiles = PROFILES_BY_NAME[args.profile]
@@ -279,14 +348,25 @@ def main() -> None:
         default_dir = Path(f"miner_outputs/{args.miner_name}/predictions")
         has_predictions = default_dir.exists() and any(default_dir.glob("**/*.json"))
         if not has_predictions:
-            print(f"No predictions found in {default_dir}, falling back to random predictions.")
+            print(
+                f"No predictions found in {default_dir}, falling back to random predictions."
+            )
             use_tmp = True
 
     max_workers = max((os.cpu_count() or 4) - 2, 1)
 
     def _dispatch(pred_dir: Path | None) -> None:
         with ProcessPoolExecutor(max_workers=max_workers) as scoring_executor:
-            _run(args.miner_name, filtered_profiles, args.days, pred_dir, scoring_executor)
+            _run(
+                args.miner_name,
+                filtered_profiles,
+                args.days,
+                pred_dir,
+                scoring_executor,
+                eval_end=eval_end,
+                simulate_registration=simulate_registration,
+                simulate_deregistration=simulate_deregistration,
+            )
 
     if use_tmp:
         with tempfile.TemporaryDirectory(prefix="backtest_preds_") as tmpdir:
