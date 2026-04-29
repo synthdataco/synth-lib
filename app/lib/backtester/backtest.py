@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from time import perf_counter
 from dataclasses import dataclass
@@ -80,6 +81,53 @@ API_SCORES_PAGE_SIZE_DAYS = 6
 # scored_time - time_length. We allow up to 30 minutes of tolerance when
 # matching prediction filenames to scored prompts.
 PREDICTION_MATCH_TOLERANCE_MINUTES = 30
+
+
+# -- Offline mode --
+# When SYNTH_BACKTESTER_OFFLINE_DATA_ROOT is set, read bundled parquets from that
+# root instead of calling api.synthdata.co / Pyth. Required for reproducible /
+# network-restricted use cases (e.g. concurrent benchmark rollouts that would
+# otherwise rate-limit the Synth API, or sandboxes with internet disabled).
+#
+# Expected layout under the root:
+#   miner_scores_{asset}_{label}.parquet         # label = "low" / "high" (see _PROFILE_LABELS)
+#   rewards_history_{prompt_name}.parquet        # prompt_name = "low" or "high"
+#   miner_pool_usd.parquet                       # columns: date, usd
+#   market_data/pyth/{asset}/1m/date=*.parquet   # daily price partitions
+_OFFLINE_ENV_VAR = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
+
+# Short labels for the two canonical Synth profiles, matching prompt_config.label.
+_PROFILE_LABELS: dict[tuple[int, int], str] = {
+    (86400, 300): "low",  # LOW_FREQUENCY
+    (3600, 60): "high",  # HIGH_FREQUENCY
+}
+
+
+def _offline_root() -> Path | None:
+    val = os.environ.get(_OFFLINE_ENV_VAR)
+    return Path(val) if val else None
+
+
+def _profile_label(time_length: int, time_increment: int) -> str:
+    """Short filename suffix for a (time_length, time_increment) pair.
+
+    Falls back to the explicit numeric form for non-standard profiles so the
+    offline parquet layout stays unambiguous.
+    """
+    return _PROFILE_LABELS.get(
+        (time_length, time_increment), f"{time_length}_{time_increment}"
+    )
+
+
+def _filter_time_range(
+    df: pd.DataFrame, col: str, start: datetime, end: datetime
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+    s = pd.to_datetime(df[col], utc=True)
+    start_ts = pd.Timestamp(start) if start.tzinfo else pd.Timestamp(start, tz="UTC")
+    end_ts = pd.Timestamp(end) if end.tzinfo else pd.Timestamp(end, tz="UTC")
+    return df.loc[(s >= start_ts) & (s < end_ts)].copy()
 
 
 @dataclass
@@ -196,6 +244,26 @@ def get_miner_scores(
     """
     start_time = start_time.replace(microsecond=0)
     end_time = end_time.replace(microsecond=0)
+
+    offline = _offline_root()
+    if offline is not None:
+        path = (
+            offline
+            / f"miner_scores_{asset}_{_profile_label(time_length, time_increment)}.parquet"
+        )
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
+            )
+        df = pd.read_parquet(path)
+        df = _filter_time_range(df, "scored_time", start_time, end_time)
+        if df.empty:
+            return df
+        df["scored_time"] = pd.to_datetime(df["scored_time"], utc=True)
+        df["time_increment"] = time_increment
+        df["start_time"] = df["scored_time"] - pd.Timedelta(seconds=time_length)
+        return df.reset_index(drop=True)
+
     chunks = []
     chunk_log: list[tuple[datetime, datetime, int]] = []
     cursor = start_time
@@ -250,6 +318,22 @@ def get_rewards_history(
     """
     start_time = start_time.replace(microsecond=0)
     end_time = end_time.replace(microsecond=0)
+
+    offline = _offline_root()
+    if offline is not None:
+        suffix = prompt_name or "all"
+        path = offline / f"rewards_history_{suffix}.parquet"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
+            )
+        df = pd.read_parquet(path)
+        df = _filter_time_range(df, "updated_at", start_time, end_time)
+        if df.empty:
+            return df
+        df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True)
+        return df.drop_duplicates().reset_index(drop=True)
+
     chunks = []
     chunk_log: list[tuple[datetime, datetime, int]] = []
     cursor = start_time
@@ -297,6 +381,35 @@ def get_daily_miner_pool_usd(
     """
     start_date = start_date.replace(microsecond=0)
     end_date = end_date.replace(microsecond=0)
+
+    offline = _offline_root()
+    if offline is not None:
+        path = offline / "miner_pool_usd.parquet"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
+            )
+        df = pd.read_parquet(path)
+        if df.empty:
+            return pd.Series(dtype=float)
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+        start_ts = (
+            pd.Timestamp(start_date)
+            if start_date.tzinfo
+            else pd.Timestamp(start_date, tz="UTC")
+        )
+        end_ts = (
+            pd.Timestamp(end_date)
+            if end_date.tzinfo
+            else pd.Timestamp(end_date, tz="UTC")
+        )
+        mask = (df["date"] >= start_ts) & (df["date"] < end_ts)
+        sub = df.loc[mask].sort_values("date")
+        return pd.Series(
+            sub["usd"].values,
+            index=pd.DatetimeIndex(sub["date"]),
+            dtype=float,
+        ).sort_index()
 
     merged: dict[pd.Timestamp, float] = {}
     cursor = start_date
