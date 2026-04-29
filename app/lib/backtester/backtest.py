@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from time import perf_counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,21 +23,35 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+import warnings
 import seaborn as sns
 
 from sqlalchemy import create_engine
-from tenacity import retry, retry_if_result, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    retry_if_result,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from synth.validator.crps_calculation import calculate_crps_for_miner
 from synth.validator.miner_data_handler import MinerDataHandler
-from synth.validator.moving_average import compute_smoothed_score, prepare_df_for_moving_average
+from synth.validator.moving_average import (
+    compute_smoothed_score,
+    prepare_df_for_moving_average,
+)
 from synth.validator.prompt_config import LOW_FREQUENCY, PromptConfig
 from synth.validator.reward import compute_prompt_scores
 
-from app.lib.preparation.market_data import PYTH_SYMBOLS
+from app.lib.preparation.market_data import (
+    HYPERLIQUID_SYMBOLS,
+    PYTH_SYMBOLS,
+    HyperliquidClient,
+    MinutePriceStore,
+)
 
 SYNTHDATA_API_BASE = "https://api.synthdata.co"
-PYTH_HISTORY_URL = "https://benchmarks.pyth.network/v1/shims/tradingview/history"
 SCORING_INTERVALS: dict[str, int] = {
     "5min": 300,
     "30min": 1_800,
@@ -45,8 +60,13 @@ SCORING_INTERVALS: dict[str, int] = {
 }
 DEFAULT_MINER_OUTPUT_ROOT = Path("miner_outputs")
 DEFAULT_MARKET_DATA_ROOT = Path("market_data/pyth/BTC/1m")
-LEADERBOARD_WINDOW_DAYS = 10
-_COMBINED_EMPTY_COLS = ["updated_at", "miner_uid", "new_smoothed_score", "reward_weight"]
+_LEGACY_FALLBACK_WINDOW_DAYS = 10  # only used when no prompt_config is in scope
+_COMBINED_EMPTY_COLS = [
+    "updated_at",
+    "miner_uid",
+    "new_smoothed_score",
+    "reward_weight",
+]
 
 UTC = timezone.utc
 
@@ -54,10 +74,6 @@ UTC = timezone.utc
 # Synth API /validation/scores/historical has a 7-day max range.
 # We use 6-day chunks to stay safely within the limit.
 API_SCORES_PAGE_SIZE_DAYS = 6
-
-# Pyth TradingView shim has limited range per request.
-# We use 5-day chunks to stay safely within the limit.
-PYTH_PAGE_SIZE_DAYS = 5
 
 # -- Prediction file matching --
 # Scoring delay: the real prediction start_time is a few minutes before
@@ -78,21 +94,89 @@ def _is_rate_limit_or_server_error(resp: requests.Response) -> bool:
     return resp.status_code == 429 or 500 <= resp.status_code < 600
 
 
+def _warn_on_middle_gap(
+    chunk_log: list[tuple[datetime, datetime, int]],
+    label: str,
+) -> None:
+    """Warn when a paginated API fetch has an empty chunk between two non-empty ones.
+
+    A 0-row chunk surrounded by data indicates a silent mid-range data gap (transient
+    API issue or partial outage). Without this warning the gap propagates downstream
+    into smoothed_scores and rank charts as a phantom dead zone.
+    """
+    if len(chunk_log) < 3:
+        return
+    first_nonempty = next((i for i, (_, _, n) in enumerate(chunk_log) if n > 0), None)
+    last_nonempty = next(
+        (i for i in range(len(chunk_log) - 1, -1, -1) if chunk_log[i][2] > 0), None
+    )
+    if (
+        first_nonempty is None
+        or last_nonempty is None
+        or last_nonempty - first_nonempty < 2
+    ):
+        return
+    bad = [
+        (s, e) for s, e, n in chunk_log[first_nonempty + 1 : last_nonempty] if n == 0
+    ]
+    if not bad:
+        return
+    ranges = ", ".join(f"{s.date()}→{e.date()}" for s, e in bad)
+    warnings.warn(
+        f"{label}: {len(bad)} empty chunk(s) between non-empty chunks: {ranges}. "
+        f"Likely a silent API gap; downstream smoothed_scores and rank charts will "
+        f"show a phantom dead zone over this range.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+def _trim_warmup(
+    smoothed_scores: pd.DataFrame,
+    scored: pd.DataFrame,
+    warmup_days: int = _LEGACY_FALLBACK_WINDOW_DAYS,
+    warmup_anchor: datetime | None = None,
+) -> pd.DataFrame:
+    """Drop smoothed_scores rows whose `updated_at` is in the first `warmup_days`
+    after `warmup_anchor` (or after `scored["scored_time"].min()` if no anchor).
+
+    During that window the moving average is dominated by synth's new-miner
+    worst-score backfill, so ranks are not directly comparable.
+    No-op if trimming would leave the frame empty (short-window backtests / tests).
+    """
+    if smoothed_scores.empty or scored.empty:
+        return smoothed_scores
+    anchor = (
+        pd.Timestamp(warmup_anchor)
+        if warmup_anchor is not None
+        else pd.Timestamp(scored["scored_time"].min())
+    )
+    warmup_end = anchor + pd.Timedelta(days=warmup_days)
+    trimmed = smoothed_scores.loc[smoothed_scores["updated_at"] >= warmup_end]
+    if trimmed.empty:
+        return smoothed_scores
+    return trimmed.reset_index(drop=True)
+
+
 @retry(
     stop=stop_after_attempt(6),
     wait=wait_exponential(multiplier=1, min=1, max=30),
-    retry=retry_if_result(_is_rate_limit_or_server_error),
+    retry=(
+        retry_if_result(_is_rate_limit_or_server_error)
+        | retry_if_exception_type((requests.Timeout, requests.ConnectionError))
+    ),
 )
 def _http_get(
     url: str,
     params: dict[str, Any] | None = None,
     timeout: int = 30,
 ) -> requests.Response:
-    """GET with exponential backoff on 429/5xx.
+    """GET with exponential backoff on 429/5xx and transient network errors.
 
     Needed because the backtest dispatches up to ~11 concurrent threads against
-    the Synth API, which rate-limits. Returns the last response; caller calls
-    raise_for_status() to handle non-retryable errors (e.g. 404).
+    the Synth API, which rate-limits; long-running multi-day pulls also hit
+    occasional ReadTimeout / ConnectionError. Returns the last response; caller
+    calls raise_for_status() to handle non-retryable errors (e.g. 404).
     """
     return requests.get(url, params=params, timeout=timeout)
 
@@ -113,6 +197,7 @@ def get_miner_scores(
     start_time = start_time.replace(microsecond=0)
     end_time = end_time.replace(microsecond=0)
     chunks = []
+    chunk_log: list[tuple[datetime, datetime, int]] = []
     cursor = start_time
     while cursor < end_time:
         chunk_end = min(cursor + timedelta(days=API_SCORES_PAGE_SIZE_DAYS), end_time)
@@ -130,9 +215,14 @@ def get_miner_scores(
         )
         resp.raise_for_status()
         data = resp.json()
+        chunk_log.append((cursor, chunk_end, len(data) if data else 0))
         if data:
             chunks.append(pd.DataFrame(data))
         cursor = chunk_end
+
+    _warn_on_middle_gap(
+        chunk_log, label=f"miner_scores asset={asset} time_length={time_length}"
+    )
 
     df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
     if df.empty:
@@ -161,6 +251,7 @@ def get_rewards_history(
     start_time = start_time.replace(microsecond=0)
     end_time = end_time.replace(microsecond=0)
     chunks = []
+    chunk_log: list[tuple[datetime, datetime, int]] = []
     cursor = start_time
     while cursor < end_time:
         chunk_end = min(cursor + timedelta(days=API_SCORES_PAGE_SIZE_DAYS), end_time)
@@ -172,12 +263,17 @@ def get_rewards_history(
         }
         if prompt_name is not None:
             params["prompt_name"] = prompt_name
-        resp = _http_get(f"{SYNTHDATA_API_BASE}/rewards/scores", params=params, timeout=30)
+        resp = _http_get(
+            f"{SYNTHDATA_API_BASE}/rewards/scores", params=params, timeout=30
+        )
         resp.raise_for_status()
         data = resp.json()
+        chunk_log.append((cursor, chunk_end, len(data) if data else 0))
         if data:
             chunks.append(pd.DataFrame(data))
         cursor = chunk_end
+
+    _warn_on_middle_gap(chunk_log, label=f"rewards_history prompt_name={prompt_name}")
 
     df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
     if df.empty:
@@ -249,7 +345,9 @@ def load_prediction(path: Path) -> dict:
     if "simulation_input" in raw:
         sim = raw["simulation_input"]
         return {
-            "start_timestamp": int(datetime.fromisoformat(sim["start_time"]).timestamp()),
+            "start_timestamp": int(
+                datetime.fromisoformat(sim["start_time"]).timestamp()
+            ),
             "asset": sim["asset"],
             "time_increment": sim["time_increment"],
             "time_length": sim["time_length"],
@@ -260,66 +358,56 @@ def load_prediction(path: Path) -> dict:
     return raw
 
 
+def _price_store(asset: str) -> MinutePriceStore:
+    """Return a MinutePriceStore configured for the asset's upstream (Pyth or Hyperliquid)."""
+    if asset in HYPERLIQUID_SYMBOLS:
+        return MinutePriceStore(asset, client=HyperliquidClient())
+    if asset in PYTH_SYMBOLS:
+        return MinutePriceStore(asset)
+    raise ValueError(
+        f"Unsupported asset: {asset}. "
+        f"Known Pyth: {sorted(PYTH_SYMBOLS)}; Hyperliquid: {sorted(HYPERLIQUID_SYMBOLS)}."
+    )
+
+
 def download_price_data(
     start_time: datetime,
     end_time: datetime,
     asset: str,
     freq: str = "1min",
 ) -> pd.DataFrame:
-    """
-    Returns DataFrame with DatetimeIndex (UTC) and a 'close' column at freq resolution.
-    Tries local parquet partitions first, falls back to Pyth API.
-    """
-    try:
-        frames = []
-        cursor = start_time.date()
-        while cursor <= end_time.date():
-            root = Path(f"market_data/pyth/{asset}/1m")
-            part = root / f"date={cursor.isoformat()}.parquet"
-            frames.append(pd.read_parquet(part))
-            cursor += timedelta(days=1)
-        frame = pd.concat(frames, ignore_index=True)
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-        frame = frame.sort_values("timestamp").set_index("timestamp")
-        return frame[["close"]].loc[start_time:end_time].resample(freq).last()
-    except FileNotFoundError:
-        pass
+    """Returns DataFrame with DatetimeIndex (UTC) and a 'close' column at freq resolution.
 
-    # Pyth API has limited range per request — paginate in 5-day chunks
-    frames = []
-    cursor = start_time
-    while cursor < end_time:
-        chunk_end = min(cursor + timedelta(days=PYTH_PAGE_SIZE_DAYS), end_time)
-        resp = requests.get(
-            PYTH_HISTORY_URL,
-            params={
-                "symbol": PYTH_SYMBOLS[asset],
-                "resolution": 1,
-                "from": int(cursor.timestamp()),
-                "to": int(chunk_end.timestamp()),
-            },
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        if "t" in payload and payload["t"]:
-            frames.append(
-                pd.DataFrame(
-                    {
-                        "timestamp": pd.to_datetime(payload["t"], unit="s", utc=True),
-                        "close": pd.Series(payload["c"], dtype="float64"),
-                    }
-                )
-            )
-        cursor = chunk_end
+    Uses MinutePriceStore for routing (Pyth vs Hyperliquid) and on-demand
+    ingestion. Reads parquets directly for NaN-tolerance — futures assets like
+    WTIOIL have legitimate market-closure gaps, and downstream scoring already
+    filters NaN per-prompt.
+    """
+    store = _price_store(asset)
+    frames: list[pd.DataFrame] = []
+    cursor = start_time.date()
+    missing: list = []
+    while cursor <= end_time.date():
+        path = store.day_path(cursor)
+        if path.exists():
+            frames.append(pd.read_parquet(path))
+        else:
+            missing.append(cursor)
+        cursor += timedelta(days=1)
 
-    if not frames:
-        raise RuntimeError(
-            f"No price data available for {asset} between {start_time} and {end_time}. "
-            "Neither local parquet files nor Pyth API returned data."
-        )
+    if missing:
+        store.ingest_range(missing[0], missing[-1], verbose=False)
+        for day in missing:
+            frames.append(pd.read_parquet(store.day_path(day)))
+
     frame = pd.concat(frames, ignore_index=True)
-    frame = frame.sort_values("timestamp").drop_duplicates("timestamp").set_index("timestamp")
-    return frame[["close"]].resample(freq).last()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    frame = (
+        frame.sort_values("timestamp")
+        .drop_duplicates("timestamp")
+        .set_index("timestamp")
+    )
+    return frame[["close"]].loc[start_time:end_time].resample(freq).last()
 
 
 def _compute_prompt_scores_for_group(crps: pd.Series) -> pd.Series:
@@ -328,6 +416,32 @@ def _compute_prompt_scores_for_group(crps: pd.Series) -> pd.Series:
     if result[0] is None:
         return pd.Series(0.0, index=crps.index)
     return pd.Series(result[0], index=crps.index)
+
+
+def _compute_prompt_score_stats_for_group(crps: pd.Series) -> pd.DataFrame:
+    """Like _compute_prompt_scores_for_group but also returns percentile90 and
+    lowest_score so synth.prepare_df_for_moving_average can apply its worst-score
+    backfill rule to new miners.
+    """
+    capped, p90, low = compute_prompt_scores(crps.values)
+    n = len(crps)
+    if capped is None:
+        return pd.DataFrame(
+            {
+                "new_prompt_scores": [0.0] * n,
+                "percentile90": [0.0] * n,
+                "lowest_score": [0.0] * n,
+            },
+            index=crps.index,
+        )
+    return pd.DataFrame(
+        {
+            "new_prompt_scores": capped,
+            "percentile90": [float(p90)] * n,
+            "lowest_score": [float(low)] * n,
+        },
+        index=crps.index,
+    )
 
 
 class _BacktestMinerDataHandler(MinerDataHandler):
@@ -365,7 +479,9 @@ def calculate_smoothed_scores(
     # Use miner_uid as miner_id for synth; drop any existing miner_id to avoid duplication
     if "miner_id" in input_df.columns:
         input_df = input_df.drop(columns=["miner_id"])
-    input_df = input_df.rename(columns={"miner_uid": "miner_id", scores_column: "prompt_score_v3"})
+    input_df = input_df.rename(
+        columns={"miner_uid": "miner_id", scores_column: "prompt_score_v3"}
+    )
     input_df["scored_time"] = pd.to_datetime(input_df["scored_time"])
 
     # Prepare the df (backfill new miners, etc.)
@@ -374,8 +490,13 @@ def calculate_smoothed_scores(
     result_rows = []
     for updated_at in rewards_history["updated_at"].sort_values().unique():
         cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
-        rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, prompt_config)
+        window_df = prepared.loc[
+            (prepared["scored_time"] >= cutoff)
+            & (prepared["scored_time"] <= updated_at)
+        ]
+        rewards = compute_smoothed_score(
+            _BACKTEST_MDH, window_df, updated_at, prompt_config
+        )
         if rewards is None:
             continue
 
@@ -395,7 +516,8 @@ def calculate_smoothed_scores(
 def compute_combined_smoothed_scores(
     results: list[BacktestResult],
     prompt_config: PromptConfig = LOW_FREQUENCY,
-    cutoff_days: int = LEADERBOARD_WINDOW_DAYS,
+    cutoff_days: int | None = None,
+    simulate_registration: datetime | None = None,
 ) -> pd.DataFrame:
     """Real-validator-equivalent cross-asset smoothed scores.
 
@@ -413,12 +535,26 @@ def compute_combined_smoothed_scores(
     if not results:
         return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
 
-    # Concat per-asset prompt_df frames (keep asset, scored_time, miner_uid, new_prompt_scores)
+    # Default the leaderboard window to the prompt's own setting (HF=3, LF=10).
+    if cutoff_days is None:
+        cutoff_days = prompt_config.window_days
+
+    # Concat per-asset prompt_df frames. percentile90 and lowest_score must be
+    # carried through so synth's prepare_df_for_moving_average can backfill new
+    # miners (it silently skips backfill when those columns are absent).
+    cols = [
+        "scored_time",
+        "miner_uid",
+        "asset",
+        "new_prompt_scores",
+        "percentile90",
+        "lowest_score",
+    ]
     frames = []
     for r in results:
         if r.prompt_df.empty:
             continue
-        df = r.prompt_df[["scored_time", "miner_uid", "asset", "new_prompt_scores"]].copy()
+        df = r.prompt_df[[c for c in cols if c in r.prompt_df.columns]].copy()
         frames.append(df)
     if not frames:
         return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
@@ -427,7 +563,9 @@ def compute_combined_smoothed_scores(
     # Adapt column names to what synth expects: miner_id, prompt_score_v3
     if "miner_id" in combined_crps.columns:
         combined_crps = combined_crps.drop(columns=["miner_id"])
-    combined_crps = combined_crps.rename(columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"})
+    combined_crps = combined_crps.rename(
+        columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"}
+    )
     combined_crps["scored_time"] = pd.to_datetime(combined_crps["scored_time"])
 
     prepared = prepare_df_for_moving_average(combined_crps)
@@ -443,8 +581,13 @@ def compute_combined_smoothed_scores(
     result_rows = []
     for updated_at in sorted(timestamps):
         cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
-        rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, prompt_config)
+        window_df = prepared.loc[
+            (prepared["scored_time"] >= cutoff)
+            & (prepared["scored_time"] <= updated_at)
+        ]
+        rewards = compute_smoothed_score(
+            _BACKTEST_MDH, window_df, updated_at, prompt_config
+        )
         if rewards is None:
             continue
         for row in rewards:
@@ -459,7 +602,14 @@ def compute_combined_smoothed_scores(
 
     if not result_rows:
         return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
-    return pd.DataFrame(result_rows)
+    if simulate_registration is not None:
+        # Simulating registration → show the backfilled onboarding period as-is.
+        return pd.DataFrame(result_rows)
+    return _trim_warmup(
+        pd.DataFrame(result_rows),
+        combined_crps,
+        warmup_days=cutoff_days,
+    )
 
 
 def _parse_prediction_filename_time(path: Path) -> datetime | None:
@@ -532,7 +682,9 @@ def _score_single_prompt(
     llm_predictions_raw = load_prediction(file_path)
     simulation_runs = np.asarray(llm_predictions_raw["paths"], dtype=float)
     real_price_array = np.asarray(real_prices, dtype=float)
-    total_crps, _ = calculate_crps_for_miner(simulation_runs, real_price_array, time_incr, scoring_intervals)
+    total_crps, _ = calculate_crps_for_miner(
+        simulation_runs, real_price_array, time_incr, scoring_intervals
+    )
 
     return {
         "miner_uid": miner_id,
@@ -558,6 +710,9 @@ def backtest(
     scoring_intervals: dict[str, int] | None = None,
     prompt_config: PromptConfig | None = None,
     scoring_executor: ProcessPoolExecutor | None = None,
+    eval_end: datetime | None = None,
+    simulate_registration: datetime | None = None,
+    simulate_deregistration: datetime | None = None,
 ) -> BacktestResult:
     """Backtest a local miner against Synth subnet scoring data.
     Loads predictions from predictions_dir (or miner_outputs/{miner_name}/predictions/).
@@ -568,8 +723,12 @@ def backtest(
         prompt_config = LOW_FREQUENCY
 
     # Discover prediction files and their date range
-    predictions_root = predictions_dir or (DEFAULT_MINER_OUTPUT_ROOT / miner_name / "predictions")
-    prediction_files = sorted(p for p in predictions_root.glob("**/*.json") if not p.name.startswith("_"))
+    predictions_root = predictions_dir or (
+        DEFAULT_MINER_OUTPUT_ROOT / miner_name / "predictions"
+    )
+    prediction_files = sorted(
+        p for p in predictions_root.glob("**/*.json") if not p.name.startswith("_")
+    )
     pred_times = [_parse_prediction_filename_time(p) for p in prediction_files]
     pred_times = [t for t in pred_times if t is not None]
     if not pred_times:
@@ -582,19 +741,42 @@ def backtest(
 
     # Constrain backtest window to prediction coverage. The buffer before pred_start matches the
     # file-matching tolerance, so every returned prompt can resolve to a prediction file.
+    # Anchor priority: simulate_deregistration > eval_end > now. When the user passes
+    # simulate_registration, the window's lower bound shifts to it (minus 10d for the
+    # smoothed-score moving-average lookback) instead of `anchor − n_backtest_days`,
+    # so the API actually fetches scored prompts in the simulated mining period.
+    if simulate_deregistration is not None:
+        anchor = pd.Timestamp(simulate_deregistration).to_pydatetime()
+    elif eval_end is not None:
+        anchor = eval_end
+    else:
+        anchor = datetime.now(UTC)
+    if simulate_registration is not None:
+        window_start = pd.Timestamp(simulate_registration).to_pydatetime() - timedelta(
+            days=prompt_config.window_days
+        )
+    else:
+        window_start = anchor - timedelta(days=n_backtest_days)
     query_start = max(
         pred_start - timedelta(minutes=PREDICTION_MATCH_TOLERANCE_MINUTES),
-        datetime.now(UTC) - timedelta(days=n_backtest_days),
+        window_start,
     )
     query_end = pred_end + timedelta(seconds=time_length) + timedelta(hours=1)
 
     # Step 2: fetch existing miner scores
     asset_backtest = asset
     time_length_backtest = time_length
+    prompt_label = "low" if time_length_backtest == 86400 else "high"
+    log_prefix = f"  [{prompt_label}/{asset_backtest}]"
+    t_start = perf_counter()
 
+    print(
+        f"{log_prefix} fetching scored prompts ({query_start.date()} → {min(query_end, anchor).date()})...",
+        flush=True,
+    )
     asset_scores = get_miner_scores(
         start_time=query_start,
-        end_time=min(query_end, datetime.now(UTC)),
+        end_time=min(query_end, anchor),
         asset=asset_backtest,
         time_length=time_length_backtest,
         time_increment=time_increment,
@@ -604,9 +786,19 @@ def backtest(
             f"Synth API returned no miner scores for asset={asset_backtest}, "
             f"time_length={time_length_backtest}, range=[{query_start}, {query_end}]"
         )
+    print(
+        f"{log_prefix} {len(asset_scores)} score rows ({asset_scores['scored_time'].nunique()} prompts) "
+        f"in {perf_counter()-t_start:.1f}s",
+        flush=True,
+    )
 
     # Step 3: fetch rewards history
-    prompt_name = None if not time_length_backtest else ("low" if time_length_backtest == 86400 else "high")
+    prompt_name = None if not time_length_backtest else prompt_label
+    t_rh = perf_counter()
+    print(
+        f"{log_prefix} fetching rewards history (prompt_name={prompt_name})...",
+        flush=True,
+    )
     rewards_history = get_rewards_history(
         asset_scores["scored_time"].min() - pd.Timedelta(hours=24),
         asset_scores["scored_time"].max() + pd.Timedelta(hours=24),
@@ -617,6 +809,11 @@ def backtest(
             f"Synth API returned no rewards history for prompt_name={prompt_name}, "
             f"range=[{asset_scores['scored_time'].min()}, {asset_scores['scored_time'].max()}]"
         )
+    print(
+        f"{log_prefix} {len(rewards_history)} rewards rows "
+        f"({rewards_history['updated_at'].nunique()} update rounds) in {perf_counter()-t_rh:.1f}s",
+        flush=True,
+    )
 
     # Step 4: align scores and rewards history time ranges
     if asset_backtest is not None:
@@ -631,21 +828,29 @@ def backtest(
             direction="forward",
         )
         result = result[~result["updated_at"].isna()]
-        rewards_history = rewards_history.loc[rewards_history["updated_at"].isin(result["updated_at"])].copy()
-        asset_scores = asset_scores.loc[asset_scores["scored_time"].isin(result["scored_time"])].copy()
+        rewards_history = rewards_history.loc[
+            rewards_history["updated_at"].isin(result["updated_at"])
+        ].copy()
+        asset_scores = asset_scores.loc[
+            asset_scores["scored_time"].isin(result["scored_time"])
+        ].copy()
     else:
         if rewards_history["updated_at"].max() < asset_scores["scored_time"].max():
             max_scored_time = asset_scores.loc[
                 asset_scores["scored_time"] <= rewards_history["updated_at"].max(),
                 "scored_time",
             ].max()
-            asset_scores = asset_scores.loc[asset_scores["scored_time"] <= max_scored_time].copy()
+            asset_scores = asset_scores.loc[
+                asset_scores["scored_time"] <= max_scored_time
+            ].copy()
         elif rewards_history["updated_at"].max() > asset_scores["scored_time"].max():
             max_upd_at = rewards_history.loc[
                 rewards_history["updated_at"] >= asset_scores["scored_time"].max(),
                 "updated_at",
             ].min()
-            rewards_history = rewards_history.loc[rewards_history["updated_at"] <= max_upd_at].copy()
+            rewards_history = rewards_history.loc[
+                rewards_history["updated_at"] <= max_upd_at
+            ].copy()
 
     # Step 5: download asset price data
     asset_prices: dict[str, pd.DataFrame] = {}
@@ -656,17 +861,28 @@ def backtest(
 
     # Step 6: score LLM miner predictions
     start_times = asset_scores["start_time"].sort_values().unique()
+    t_score = perf_counter()
+    print(
+        f"{log_prefix} scoring {len(start_times)} prompts against local predictions...",
+        flush=True,
+    )
 
     # Pre-build work items: resolve file paths and slice prices upfront
     work_items = []
 
     for start_time in start_times:
-        scores_subset = asset_scores.loc[asset_scores["start_time"] == start_time].copy()
+        scores_subset = asset_scores.loc[
+            asset_scores["start_time"] == start_time
+        ].copy()
 
         for _, asset_val, scored_time, time_len, time_incr in (
-            scores_subset[["asset", "scored_time", "time_length", "time_increment"]].drop_duplicates().itertuples()
+            scores_subset[["asset", "scored_time", "time_length", "time_increment"]]
+            .drop_duplicates()
+            .itertuples()
         ):
-            file_path = _find_prediction_file(prediction_files, start_time, asset_val, time_len)
+            file_path = _find_prediction_file(
+                prediction_files, start_time, asset_val, time_len
+            )
 
             # Pre-slice real prices in the main process (avoids pickling DataFrames)
             real_prices: list[float] = []
@@ -674,7 +890,10 @@ def backtest(
                 step_minutes = time_incr // 60
                 real_prices = (
                     asset_prices[asset_val]
-                    .loc[start_time : start_time + pd.Timedelta(seconds=time_len) : step_minutes]
+                    .loc[
+                        start_time : start_time
+                        + pd.Timedelta(seconds=time_len) : step_minutes
+                    ]
                     .iloc[:, 0]
                     .tolist()
                 )
@@ -701,7 +920,9 @@ def backtest(
 
     # Dispatch scoring — parallel if executor provided, else sequential
     if scoring_executor is not None:
-        futures = [scoring_executor.submit(_score_single_prompt, *item) for item in work_items]
+        futures = [
+            scoring_executor.submit(_score_single_prompt, *item) for item in work_items
+        ]
         raw_results = [f.result() for f in futures]
     else:
         raw_results = [_score_single_prompt(*item) for item in work_items]
@@ -715,17 +936,44 @@ def backtest(
             "Check that prediction filenames align with the scored time range."
         )
     new_scores = pd.concat(scores_extensions, ignore_index=True)
+    print(
+        f"{log_prefix} scored {len(new_scores)} prompts in {perf_counter()-t_score:.1f}s",
+        flush=True,
+    )
 
     # Step 8: trim to valid range
     new_scores = new_scores.sort_values("scored_time")
     valid_scores = new_scores.loc[new_scores["crps"] != -1]
     if valid_scores.empty:
         raise RuntimeError(
-            "All matched predictions resulted in crps=-1 (scoring failures). " "No valid backtest results to report."
+            "All matched predictions resulted in crps=-1 (scoring failures). "
+            "No valid backtest results to report."
         )
     end_backtest_time = valid_scores["scored_time"].max()
     new_scores = new_scores.loc[new_scores["scored_time"] <= end_backtest_time]
     asset_scores = asset_scores.loc[asset_scores["scored_time"] <= end_backtest_time]
+
+    # Optional: simulate the miner registering on a specific date by dropping our
+    # CRPS rows before that date. synth.validator.prepare_df_for_moving_average
+    # then sees our miner's first scored_time > global_min and applies the same
+    # worst-score backfill it gives real late-joining miners — making rank
+    # comparisons symmetric instead of giving us an unfair "from-the-start" boost.
+    if simulate_registration is not None:
+        sim_reg = pd.Timestamp(simulate_registration)
+        new_scores = new_scores.loc[new_scores["scored_time"] >= sim_reg]
+        if new_scores.empty:
+            raise RuntimeError(
+                f"simulate_registration={sim_reg} drops all of our miner's CRPS rows; "
+                f"no valid backtest results."
+            )
+    if simulate_deregistration is not None:
+        sim_dereg = pd.Timestamp(simulate_deregistration)
+        new_scores = new_scores.loc[new_scores["scored_time"] <= sim_dereg]
+        if new_scores.empty:
+            raise RuntimeError(
+                f"simulate_deregistration={sim_dereg} drops all of our miner's CRPS rows; "
+                f"no valid backtest results."
+            )
 
     # Step 9: merge LLM scores with all miner scores
     all_scores = pd.concat([asset_scores, new_scores], ignore_index=True)
@@ -742,21 +990,29 @@ def backtest(
             rewards_history["updated_at"] >= all_scores["scored_time"].max(),
             "updated_at",
         ].min()
-        rewards_history = rewards_history.loc[rewards_history["updated_at"] <= max_upd_at].copy()
+        rewards_history = rewards_history.loc[
+            rewards_history["updated_at"] <= max_upd_at
+        ].copy()
 
-    # Step 12: apply prompt score calculation across all scores
-    all_scores["new_prompt_scores"] = (
-        all_scores.groupby(["scored_time", "asset", "time_length", "time_increment"])["crps"]
-        .apply(_compute_prompt_scores_for_group)
-        .reset_index(level=[0, 1, 2, 3], drop=True)
-    )
+    # Step 12: apply prompt score calculation across all scores. We also persist
+    # percentile90 and lowest_score per group because prepare_df_for_moving_average
+    # uses them to compute the worst-score backfill for new miners (silently
+    # skips backfill when those columns are absent).
+    _stats = all_scores.groupby(
+        ["scored_time", "asset", "time_length", "time_increment"], group_keys=False
+    )["crps"].apply(_compute_prompt_score_stats_for_group)
+    all_scores["new_prompt_scores"] = _stats["new_prompt_scores"]
+    all_scores["percentile90"] = _stats["percentile90"]
+    all_scores["lowest_score"] = _stats["lowest_score"]
 
     # Step 13: build rewards history entries for LLM miner
     new_miner_rewards_list = []
     for prompt_name_item in rewards_history["prompt_name"].unique():
         new_miner_rewards_prompt = pd.DataFrame(
             {
-                "updated_at": rewards_history.loc[rewards_history["prompt_name"] == prompt_name_item, "updated_at"]
+                "updated_at": rewards_history.loc[
+                    rewards_history["prompt_name"] == prompt_name_item, "updated_at"
+                ]
                 .sort_values()
                 .unique(),
                 "miner_uid": miner_id,
@@ -764,7 +1020,9 @@ def backtest(
             }
         )
         new_miner_rewards_list.append(new_miner_rewards_prompt)
-    new_miner_rewards = pd.concat(new_miner_rewards_list, ignore_index=True).sort_values("updated_at")
+    new_miner_rewards = pd.concat(
+        new_miner_rewards_list, ignore_index=True
+    ).sort_values("updated_at")
 
     # Step 14: merge LLM miner rewards into full rewards history
     rewards_history = pd.concat(
@@ -775,13 +1033,36 @@ def backtest(
     ).sort_values(["updated_at", "prompt_name", "miner_uid"])
 
     # Step 15: recalculate smoothed scores including LLM miner
+    n_rounds = rewards_history["updated_at"].nunique()
+    t_smooth = perf_counter()
+    print(
+        f"{log_prefix} computing smoothed scores over {n_rounds} reward rounds...",
+        flush=True,
+    )
     recalculated_smoothed_scores = calculate_smoothed_scores(
         all_scores,
         rewards_history,
-        cutoff_days=LEADERBOARD_WINDOW_DAYS,
+        cutoff_days=prompt_config.window_days,
         scores_column="new_prompt_scores",
         prompt_config=prompt_config,
     )
+    print(
+        f"{log_prefix} smoothed scores done in {perf_counter()-t_smooth:.1f}s "
+        f"(total backtest: {perf_counter()-t_start:.1f}s)",
+        flush=True,
+    )
+
+    # Trim the first `prompt_config.window_days` of smoothed_scores when no
+    # simulate_registration is set. In that case the backfill artifact applies to
+    # real late-joining miners and inflates our rank — we want to hide it.
+    # When simulate_registration IS set, the backfill applies to OUR miner and
+    # the warmup ramp-up is the whole point of the simulation — don't trim it.
+    if simulate_registration is None:
+        recalculated_smoothed_scores = _trim_warmup(
+            recalculated_smoothed_scores,
+            all_scores,
+            warmup_days=prompt_config.window_days,
+        )
 
     miner_smoothed = recalculated_smoothed_scores.loc[
         recalculated_smoothed_scores["miner_uid"] == miner_id, "new_smoothed_score"
@@ -791,7 +1072,9 @@ def backtest(
         "miner_id": miner_id,
         "num_prompts": int((new_scores["crps"] != -1).sum()),
         "mean_crps": float(new_scores.loc[new_scores["crps"] != -1, "crps"].mean()),
-        "final_smoothed_score": float(miner_smoothed.iloc[-1]) if not miner_smoothed.empty else None,
+        "final_smoothed_score": (
+            float(miner_smoothed.iloc[-1]) if not miner_smoothed.empty else None
+        ),
     }
 
     return BacktestResult(
@@ -822,7 +1105,11 @@ def plot_rank_evolution(
     tl_label = str(int(time_lengths[0])) if len(time_lengths) == 1 else "mixed"
 
     # Compute rank per timestamp (highest reward_weight = rank 1)
-    df["rank"] = df.groupby("updated_at")["reward_weight"].rank(ascending=False, method="min").astype(int)
+    df["rank"] = (
+        df.groupby("updated_at")["reward_weight"]
+        .rank(ascending=False, method="min")
+        .astype(int)
+    )
 
     miner_df = df.loc[df["miner_uid"] == miner_id].sort_values("updated_at")
 
@@ -889,14 +1176,20 @@ def plot_total_rank_evolution(
     if not results:
         raise RuntimeError("No backtest results to aggregate.")
     if combined.empty:
-        raise RuntimeError("No combined smoothed scores available for total rank chart.")
+        raise RuntimeError(
+            "No combined smoothed scores available for total rank chart."
+        )
 
     miner_name = results[0].miner_name
     miner_id = results[0].summary["miner_id"]
 
     df = combined.copy()
     df["updated_at"] = pd.to_datetime(df["updated_at"])
-    df["rank"] = df.groupby("updated_at")["reward_weight"].rank(ascending=False, method="min").astype(int)
+    df["rank"] = (
+        df.groupby("updated_at")["reward_weight"]
+        .rank(ascending=False, method="min")
+        .astype(int)
+    )
 
     miner_df = df.loc[df["miner_uid"] == miner_id].sort_values("updated_at")
     if miner_df.empty:
@@ -969,7 +1262,8 @@ def plot_grand_total_rank_evolution(
 
     # miner_name / miner_id from any profile's first result
     first_result = next(
-        (rs[0] for rs in results_by_profile.values() if rs), None,
+        (rs[0] for rs in results_by_profile.values() if rs),
+        None,
     )
     if first_result is None:
         raise RuntimeError("No backtest results to aggregate.")
@@ -977,7 +1271,11 @@ def plot_grand_total_rank_evolution(
     miner_id = first_result.summary["miner_id"]
 
     df = grand.copy()
-    df["rank"] = df.groupby("updated_at")["reward_weight"].rank(ascending=False, method="min").astype(int)
+    df["rank"] = (
+        df.groupby("updated_at")["reward_weight"]
+        .rank(ascending=False, method="min")
+        .astype(int)
+    )
 
     miner_df = df.loc[df["miner_uid"] == miner_id].sort_values("updated_at")
     if miner_df.empty:
@@ -987,14 +1285,29 @@ def plot_grand_total_rank_evolution(
 
     sns.set_theme(style="whitegrid")
     fig, ax = plt.subplots(figsize=(12, 5))
-    sns.lineplot(data=miner_df, x="updated_at", y="rank", marker="o", markersize=5, linewidth=2, ax=ax)
+    sns.lineplot(
+        data=miner_df,
+        x="updated_at",
+        y="rank",
+        marker="o",
+        markersize=5,
+        linewidth=2,
+        ax=ax,
+    )
     ax.fill_between(
-        total_miners.index, 1, total_miners.values, alpha=0.08, color="grey", label="Total miners",
+        total_miners.index,
+        1,
+        total_miners.values,
+        alpha=0.08,
+        color="grey",
+        label="Total miners",
     )
     ax.invert_yaxis()
     ax.set_xlabel("Time (UTC)")
     ax.set_ylabel("Rank (1 = best)")
-    ax.set_title(f"Grand-total rank evolution — {miner_name} — all profiles, all assets")
+    ax.set_title(
+        f"Grand-total rank evolution — {miner_name} — all profiles, all assets"
+    )
     ax.legend()
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -1034,10 +1347,14 @@ def _compute_relative_crps(result: BacktestResult) -> pd.DataFrame:
 
     # Median CRPS of other miners at each scored_time
     others = df.loc[df["miner_uid"] != miner_id]
-    others_median = others.groupby("scored_time")["crps"].median().rename("others_median")
+    others_median = (
+        others.groupby("scored_time")["crps"].median().rename("others_median")
+    )
 
     # Our miner's CRPS
-    ours = df.loc[df["miner_uid"] == miner_id, ["scored_time", "crps"]].rename(columns={"crps": "our_crps"})
+    ours = df.loc[df["miner_uid"] == miner_id, ["scored_time", "crps"]].rename(
+        columns={"crps": "our_crps"}
+    )
     if ours.empty:
         raise RuntimeError(f"Miner {miner_id} has no valid CRPS data.")
 
@@ -1151,7 +1468,9 @@ def plot_crps_over_time(
 
     ax.set_xlabel("Time (UTC)")
     ax.set_ylabel("CRPS")
-    ax.set_title(f"CRPS over time \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)")
+    ax.set_title(
+        f"CRPS over time \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)"
+    )
     ax.legend()
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -1179,7 +1498,9 @@ def plot_crps_by_hour(
     tls = result.prompt_df.loc[result.prompt_df["crps"] != -1, "time_length"].unique()
     tl_label = str(int(tls[0])) if len(tls) == 1 else "mixed"
 
-    hourly = rel.groupby("hour")["crps_ratio"].agg(["mean", "median"]).reindex(range(24))
+    hourly = (
+        rel.groupby("hour")["crps_ratio"].agg(["mean", "median"]).reindex(range(24))
+    )
 
     sns.set_theme(style="whitegrid")
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -1194,10 +1515,14 @@ def plot_crps_by_hour(
         label="Median",
         zorder=3,
     )
-    ax.axhline(y=1.0, linestyle="--", color="grey", linewidth=1, label="Even with median miner")
+    ax.axhline(
+        y=1.0, linestyle="--", color="grey", linewidth=1, label="Even with median miner"
+    )
     ax.set_xlabel("Hour (UTC)")
     ax.set_ylabel("CRPS Ratio (ours / others median)")
-    ax.set_title(f"Performance by Hour of Day \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)")
+    ax.set_title(
+        f"Performance by Hour of Day \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)"
+    )
     ax.set_xticks(range(24))
     ax.legend()
     fig.tight_layout()
@@ -1226,18 +1551,33 @@ def plot_crps_by_day(
     tls = result.prompt_df.loc[result.prompt_df["crps"] != -1, "time_length"].unique()
     tl_label = str(int(tls[0])) if len(tls) == 1 else "mixed"
 
-    daily = rel.groupby("day_of_week")["crps_ratio"].agg(["mean", "median"]).reindex(range(7))
+    daily = (
+        rel.groupby("day_of_week")["crps_ratio"]
+        .agg(["mean", "median"])
+        .reindex(range(7))
+    )
 
     sns.set_theme(style="whitegrid")
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.bar(range(7), daily["mean"], color="salmon", label="Mean", zorder=2)
     ax.plot(
-        range(7), daily["median"], marker="o", markersize=5, linewidth=2, color="steelblue", label="Median", zorder=3
+        range(7),
+        daily["median"],
+        marker="o",
+        markersize=5,
+        linewidth=2,
+        color="steelblue",
+        label="Median",
+        zorder=3,
     )
-    ax.axhline(y=1.0, linestyle="--", color="grey", linewidth=1, label="Even with median miner")
+    ax.axhline(
+        y=1.0, linestyle="--", color="grey", linewidth=1, label="Even with median miner"
+    )
     ax.set_xlabel("Day of Week (UTC)")
     ax.set_ylabel("CRPS Ratio (ours / others median)")
-    ax.set_title(f"Performance by Day of Week \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)")
+    ax.set_title(
+        f"Performance by Day of Week \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)"
+    )
     ax.set_xticks(range(7))
     ax.set_xticklabels(DAY_LABELS)
     ax.legend()
@@ -1269,11 +1609,25 @@ def plot_crps_ratio_distribution(
     sns.set_theme(style="whitegrid")
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.hist(rel["crps_ratio"], bins=50, color="salmon", edgecolor="white", zorder=2)
-    ax.axvline(x=1.0, linestyle="--", color="black", linewidth=1.5, label="Even with median miner")
-    ax.axvline(x=our_median, linestyle="--", color="steelblue", linewidth=1.5, label=f"Our median: {our_median:.2f}")
+    ax.axvline(
+        x=1.0,
+        linestyle="--",
+        color="black",
+        linewidth=1.5,
+        label="Even with median miner",
+    )
+    ax.axvline(
+        x=our_median,
+        linestyle="--",
+        color="steelblue",
+        linewidth=1.5,
+        label=f"Our median: {our_median:.2f}",
+    )
     ax.set_xlabel("CRPS Ratio (ours / others median)")
     ax.set_ylabel("Count")
-    ax.set_title(f"Distribution of Relative Performance \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)")
+    ax.set_title(
+        f"Distribution of Relative Performance \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)"
+    )
     ax.legend()
     fig.tight_layout()
 
@@ -1306,7 +1660,9 @@ def plot_weekly_percentile(
     ax.axhline(y=50, linestyle="--", color="grey", linewidth=1, label="50th pctile")
     ax.set_xlabel("ISO Week")
     ax.set_ylabel("Mean Percentile Rank")
-    ax.set_title(f"Weekly Percentile Trend \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)")
+    ax.set_title(
+        f"Weekly Percentile Trend \u2014 {result.miner_name} \u2014 {asset_label} ({tl_label}s)"
+    )
     ax.set_xticks(range(len(weekly)))
     ax.set_xticklabels([str(w) for w in weekly.index])
     ax.legend()
@@ -1370,7 +1726,10 @@ def _compute_grand_total_weights(
         df_local["updated_at"] = pd.to_datetime(df_local["updated_at"])
         pivot = (
             df_local.pivot_table(
-                index="updated_at", columns="miner_uid", values="reward_weight", aggfunc="last"
+                index="updated_at",
+                columns="miner_uid",
+                values="reward_weight",
+                aggfunc="last",
             )
             .reindex(full_index)
             .ffill()
@@ -1385,10 +1744,14 @@ def _compute_grand_total_weights(
     long = total.reset_index().melt(
         id_vars="updated_at", var_name="miner_uid", value_name="reward_weight"
     )
-    long["new_smoothed_score"] = 0.0  # grand-total doesn't have a meaningful smoothed score
-    return long[_COMBINED_EMPTY_COLS].sort_values(
-        ["updated_at", "miner_uid"]
-    ).reset_index(drop=True)
+    long["new_smoothed_score"] = (
+        0.0  # grand-total doesn't have a meaningful smoothed score
+    )
+    return (
+        long[_COMBINED_EMPTY_COLS]
+        .sort_values(["updated_at", "miner_uid"])
+        .reset_index(drop=True)
+    )
 
 
 def _compute_earnings_df(
@@ -1423,17 +1786,23 @@ def _compute_earnings_df(
       usd_per_round, usd_cumulative.
     Empty if the miner is absent from `combined` or every round lacks pool data.
     """
-    our = combined.loc[combined["miner_uid"] == miner_id].sort_values("updated_at").copy()
+    our = (
+        combined.loc[combined["miner_uid"] == miner_id].sort_values("updated_at").copy()
+    )
     if our.empty:
         return our
 
     our["updated_at"] = pd.to_datetime(our["updated_at"])
-    our["share_of_round"] = our["reward_weight"] / prompt_config.smoothed_score_coefficient
+    our["share_of_round"] = (
+        our["reward_weight"] / prompt_config.smoothed_score_coefficient
+    )
     our["date"] = our["updated_at"].dt.floor("D")
 
     missing_mask = ~our["date"].isin(daily_pool_usd.index)
     if missing_mask.any():
-        missing_dates = sorted({d.date().isoformat() for d in our.loc[missing_mask, "date"]})
+        missing_dates = sorted(
+            {d.date().isoformat() for d in our.loc[missing_mask, "date"]}
+        )
         print(
             f"  Warning: dropping {int(missing_mask.sum())} round(s) on "
             f"{len(missing_dates)} day(s) with no /rewards/historical pool data: "
@@ -1444,7 +1813,11 @@ def _compute_earnings_df(
             return our
 
     rounds_per_day = our.groupby("date").size()
-    our["usd_per_round"] = our["reward_weight"] * our["date"].map(daily_pool_usd) / our["date"].map(rounds_per_day)
+    our["usd_per_round"] = (
+        our["reward_weight"]
+        * our["date"].map(daily_pool_usd)
+        / our["date"].map(rounds_per_day)
+    )
     our["usd_cumulative"] = our["usd_per_round"].cumsum()
     return our
 
@@ -1512,23 +1885,54 @@ def plot_estimated_earnings(
 
     # Panel 1: share of round (%)
     ax = axes[0]
-    ax.plot(earnings["updated_at"], earnings["share_of_round"] * 100, color="tab:blue", lw=0.9)
-    ax.fill_between(earnings["updated_at"], 0, earnings["share_of_round"] * 100, color="tab:blue", alpha=0.15)
-    ax.axhline(mean_share_pct, color="tab:orange", ls="--", lw=0.8, label=f"window mean {mean_share_pct:.2f}%")
+    ax.plot(
+        earnings["updated_at"],
+        earnings["share_of_round"] * 100,
+        color="tab:blue",
+        lw=0.9,
+    )
+    ax.fill_between(
+        earnings["updated_at"],
+        0,
+        earnings["share_of_round"] * 100,
+        color="tab:blue",
+        alpha=0.15,
+    )
+    ax.axhline(
+        mean_share_pct,
+        color="tab:orange",
+        ls="--",
+        lw=0.8,
+        label=f"window mean {mean_share_pct:.2f}%",
+    )
     ax.set_ylabel("Our share of round (%)")
     ax.legend(loc="upper right", fontsize=9)
 
     # Panel 2: daily earnings ($)
     ax = axes[1]
     ax.bar(daily.index, daily["usd"], color="tab:green", width=0.85, alpha=0.8)
-    ax.axhline(mean_daily_usd, color="black", ls="--", lw=0.8, label=f"mean daily ${mean_daily_usd:,.0f}")
+    ax.axhline(
+        mean_daily_usd,
+        color="black",
+        ls="--",
+        lw=0.8,
+        label=f"mean daily ${mean_daily_usd:,.0f}",
+    )
     ax.set_ylabel("Daily earnings ($)")
     ax.legend(loc="upper right", fontsize=9)
 
     # Panel 3: cumulative earnings ($)
     ax = axes[2]
-    ax.plot(earnings["updated_at"], earnings["usd_cumulative"], color="tab:purple", lw=1.8)
-    ax.fill_between(earnings["updated_at"], 0, earnings["usd_cumulative"], color="tab:purple", alpha=0.15)
+    ax.plot(
+        earnings["updated_at"], earnings["usd_cumulative"], color="tab:purple", lw=1.8
+    )
+    ax.fill_between(
+        earnings["updated_at"],
+        0,
+        earnings["usd_cumulative"],
+        color="tab:purple",
+        alpha=0.15,
+    )
     ax.set_ylabel("Cumulative earnings ($)")
     ax.set_xlabel("Date (UTC)")
     ax.annotate(
@@ -1568,7 +1972,11 @@ def plot_estimated_earnings(
     fig.savefig(chart_path, dpi=150)
     plt.close(fig)
 
-    partial_tag = f"  PARTIAL COVERAGE ({n_assets}/{total_assets} assets)" if partial_coverage else ""
+    partial_tag = (
+        f"  PARTIAL COVERAGE ({n_assets}/{total_assets} assets)"
+        if partial_coverage
+        else ""
+    )
     print(
         f"\n  EARNINGS [{prompt_config.label}] total: ${total_usd:,.0f} "
         f"over {dur_days:.1f}d (mean share {mean_share_pct:.2f}%){partial_tag}"
@@ -1592,7 +2000,8 @@ def plot_grand_total_earnings(
         raise RuntimeError("No grand-total rows — cannot compute earnings.")
 
     first_result = next(
-        (rs[0] for rs in results_by_profile.values() if rs), None,
+        (rs[0] for rs in results_by_profile.values() if rs),
+        None,
     )
     if first_result is None:
         raise RuntimeError("No backtest results to plot.")
@@ -1611,7 +2020,9 @@ def plot_grand_total_earnings(
     # Use a synthetic PromptConfig with smoothed_score_coefficient=1.0 so
     # _compute_earnings_df treats grand-total reward_weight as the full share.
     grand_config = dataclasses.replace(
-        LOW_FREQUENCY, smoothed_score_coefficient=1.0, label="GRAND_TOTAL",
+        LOW_FREQUENCY,
+        smoothed_score_coefficient=1.0,
+        label="GRAND_TOTAL",
     )
     earnings = _compute_earnings_df(grand, miner_id, grand_config, daily_pool)
     if earnings.empty:
@@ -1631,26 +2042,60 @@ def plot_grand_total_earnings(
 
     sns.set_theme(style="whitegrid")
     fig, axes = plt.subplots(
-        3, 1, figsize=(13, 10), sharex=True,
+        3,
+        1,
+        figsize=(13, 10),
+        sharex=True,
         gridspec_kw={"height_ratios": [1.0, 1.1, 1.3]},
     )
 
     ax = axes[0]
-    ax.plot(earnings["updated_at"], earnings["share_of_round"] * 100, color="tab:blue", lw=0.9)
-    ax.fill_between(earnings["updated_at"], 0, earnings["share_of_round"] * 100, color="tab:blue", alpha=0.15)
-    ax.axhline(mean_share_pct, color="tab:orange", ls="--", lw=0.8, label=f"window mean {mean_share_pct:.2f}%")
+    ax.plot(
+        earnings["updated_at"],
+        earnings["share_of_round"] * 100,
+        color="tab:blue",
+        lw=0.9,
+    )
+    ax.fill_between(
+        earnings["updated_at"],
+        0,
+        earnings["share_of_round"] * 100,
+        color="tab:blue",
+        alpha=0.15,
+    )
+    ax.axhline(
+        mean_share_pct,
+        color="tab:orange",
+        ls="--",
+        lw=0.8,
+        label=f"window mean {mean_share_pct:.2f}%",
+    )
     ax.set_ylabel("Our share of subnet (%)")
     ax.legend(loc="upper right", fontsize=9)
 
     ax = axes[1]
     ax.bar(daily.index, daily["usd"], color="tab:green", width=0.85, alpha=0.8)
-    ax.axhline(mean_daily_usd, color="black", ls="--", lw=0.8, label=f"mean daily ${mean_daily_usd:,.0f}")
+    ax.axhline(
+        mean_daily_usd,
+        color="black",
+        ls="--",
+        lw=0.8,
+        label=f"mean daily ${mean_daily_usd:,.0f}",
+    )
     ax.set_ylabel("Daily earnings ($)")
     ax.legend(loc="upper right", fontsize=9)
 
     ax = axes[2]
-    ax.plot(earnings["updated_at"], earnings["usd_cumulative"], color="tab:purple", lw=1.8)
-    ax.fill_between(earnings["updated_at"], 0, earnings["usd_cumulative"], color="tab:purple", alpha=0.15)
+    ax.plot(
+        earnings["updated_at"], earnings["usd_cumulative"], color="tab:purple", lw=1.8
+    )
+    ax.fill_between(
+        earnings["updated_at"],
+        0,
+        earnings["usd_cumulative"],
+        color="tab:purple",
+        alpha=0.15,
+    )
     ax.set_ylabel("Cumulative earnings ($)")
     ax.set_xlabel("Date (UTC)")
     ax.annotate(
@@ -1658,7 +2103,9 @@ def plot_grand_total_earnings(
         xy=(earnings["updated_at"].iloc[-1], total_usd),
         xytext=(-80, -10),
         textcoords="offset points",
-        fontsize=11, fontweight="bold", color="tab:purple",
+        fontsize=11,
+        fontweight="bold",
+        color="tab:purple",
     )
 
     total_assets = sum(len(rs) for rs in results_by_profile.values())
@@ -1667,7 +2114,8 @@ def plot_grand_total_earnings(
         f"{len(results_by_profile)} profiles, {total_assets} assets, {dur_days:.1f}d\n"
         f"Uses full daily miner-pool USD × grand-total share "
         f"(sums both profile coefficients, matches real-validator weights).",
-        fontsize=11, y=0.995,
+        fontsize=11,
+        y=0.995,
     )
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -1693,6 +2141,9 @@ def run_backtest(
     predictions_dir: Path | None = None,
     miner_id: int = 999,
     scoring_executor: ProcessPoolExecutor | None = None,
+    eval_end: datetime | None = None,
+    simulate_registration: datetime | None = None,
+    simulate_deregistration: datetime | None = None,
 ) -> tuple[list[BacktestResult], pd.DataFrame]:
     """Run the full backtest for all assets in a prompt config.
 
@@ -1724,6 +2175,9 @@ def run_backtest(
                 scoring_intervals=prompt_config.scoring_intervals,
                 prompt_config=prompt_config,
                 scoring_executor=scoring_executor,
+                eval_end=eval_end,
+                simulate_registration=simulate_registration,
+                simulate_deregistration=simulate_deregistration,
             ): asset
             for asset in assets
         }
@@ -1752,16 +2206,24 @@ def run_backtest(
             total_miners = len(last_slice)
             miner_rw = last_slice.loc[last_slice["miner_uid"] == miner_id]
             if not miner_rw.empty:
-                rank = int(last_slice["reward_weight"].rank(ascending=False, method="min").loc[miner_rw.index[0]])
+                rank = int(
+                    last_slice["reward_weight"]
+                    .rank(ascending=False, method="min")
+                    .loc[miner_rw.index[0]]
+                )
                 rw = float(miner_rw["reward_weight"].iloc[0])
                 sm = float(summary.get("final_smoothed_score", 0) or 0)
-                print(f"  rank: {rank}/{total_miners}  reward_weight: {rw:.6f}  smoothed_score: {sm:.2f}")
+                print(
+                    f"  rank: {rank}/{total_miners}  reward_weight: {rw:.6f}  smoothed_score: {sm:.2f}"
+                )
             else:
                 print(f"  Miner {miner_id} not found in final smoothed scores.")
         else:
             print(f"  No smoothed scores computed.")
 
-        print(f"  Prompts scored: {summary['num_prompts']}  Mean CRPS: {summary['mean_crps']:.6f}")
+        print(
+            f"  Prompts scored: {summary['num_prompts']}  Mean CRPS: {summary['mean_crps']:.6f}"
+        )
 
         try:
             chart_path = plot_rank_evolution(result)
@@ -1791,14 +2253,20 @@ def run_backtest(
     combined = pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
     if len(results) >= 2:
         try:
-            combined = compute_combined_smoothed_scores(results, prompt_config)
+            combined = compute_combined_smoothed_scores(
+                results,
+                prompt_config,
+                simulate_registration=simulate_registration,
+            )
         except Exception as e:
             print(f"  Combined smoothed scores failed: {e}")
 
         if not combined.empty:
             try:
                 total_chart = plot_total_rank_evolution(
-                    results, combined=combined, profile_label=prompt_config.label,
+                    results,
+                    combined=combined,
+                    profile_label=prompt_config.label,
                 )
                 print(f"  Total rank chart saved to: {total_chart}")
             except Exception as e:
@@ -1806,7 +2274,9 @@ def run_backtest(
 
             try:
                 earnings_chart = plot_estimated_earnings(
-                    results, prompt_config=prompt_config, combined=combined,
+                    results,
+                    prompt_config=prompt_config,
+                    combined=combined,
                 )
                 print(f"  Earnings chart saved to: {earnings_chart}")
             except Exception as e:
