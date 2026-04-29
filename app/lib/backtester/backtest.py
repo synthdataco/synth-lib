@@ -71,6 +71,13 @@ _COMBINED_EMPTY_COLS = [
 
 UTC = timezone.utc
 
+# -- HF CRPS formula change --
+# On 2026-03-11 the Synth validator changed how it computes CRPS for the
+# HIGH_FREQUENCY profile. CRPS values stored in the API for prompts before that
+# date were produced by the old formula and aren't directly comparable to ranks
+# computed under the current formula. See README "Known caveats".
+HF_CRPS_FORMULA_CHANGE_DATE = datetime(2026, 3, 11, tzinfo=UTC)
+
 # -- Pagination limits (empirical — not confirmed from API docs) --
 # Synth API /validation/scores/historical has a 7-day max range.
 # We use 6-day chunks to stay safely within the limit.
@@ -174,6 +181,66 @@ def _warn_on_middle_gap(
         f"{label}: {len(bad)} empty chunk(s) between non-empty chunks: {ranges}. "
         f"Likely a silent API gap; downstream smoothed_scores and rank charts will "
         f"show a phantom dead zone over this range.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+def _hf_crps_window_start(
+    n_backtest_days: int,
+    prompt_config: PromptConfig,
+    eval_end: datetime | None,
+    simulate_registration: datetime | None,
+    simulate_deregistration: datetime | None,
+) -> datetime:
+    """Compute the effective backtest window start, mirroring backtest()."""
+    if simulate_deregistration is not None:
+        anchor = simulate_deregistration
+    elif eval_end is not None:
+        anchor = eval_end
+    else:
+        anchor = datetime.now(UTC)
+    if simulate_registration is not None:
+        return simulate_registration - timedelta(days=prompt_config.window_days)
+    return anchor - timedelta(days=n_backtest_days)
+
+
+def _maybe_warn_hf_crps_formula_change(
+    prompt_config: PromptConfig,
+    n_backtest_days: int,
+    eval_end: datetime | None,
+    simulate_registration: datetime | None,
+    simulate_deregistration: datetime | None,
+) -> None:
+    """Warn when an HF backtest window starts before the validator's CRPS
+    formula change on 2026-03-11. Pre-cutoff CRPS values stored in the API
+    were computed with the old formula, so ranks derived from them aren't
+    comparable to current live ranks. The smoothing window also pulls in
+    pre-cutoff data for `prompt_config.window_days` after the cutoff, so
+    we recommend resuming evaluation only after `cutoff + window_days`.
+    """
+    if prompt_config.label != "high":
+        return
+    window_start = _hf_crps_window_start(
+        n_backtest_days,
+        prompt_config,
+        eval_end,
+        simulate_registration,
+        simulate_deregistration,
+    )
+    if window_start >= HF_CRPS_FORMULA_CHANGE_DATE:
+        return
+    safe_sim_reg = (
+        HF_CRPS_FORMULA_CHANGE_DATE + timedelta(days=prompt_config.window_days)
+    ).date()
+    cutoff = HF_CRPS_FORMULA_CHANGE_DATE.date()
+    warnings.warn(
+        f"HIGH_FREQUENCY backtest window starts {window_start.date()}, before "
+        f"{cutoff} when the validator's CRPS formula changed. API-stored CRPS "
+        f"for prompts before that date does not reflect how CRPS is computed "
+        f"today, so ranks before {safe_sim_reg} may not be representative. "
+        f"To get current-formula ranks: restrict eval to >= {cutoff}, or use "
+        f"simulate_registration={safe_sim_reg}. See README 'Known caveats'.",
         UserWarning,
         stacklevel=2,
     )
@@ -2268,6 +2335,14 @@ def run_backtest(
       - results: list of successful BacktestResult (one per asset)
       - combined: per-profile combined smoothed-scores DataFrame (empty when <2 assets)
     """
+    _maybe_warn_hf_crps_formula_change(
+        prompt_config=prompt_config,
+        n_backtest_days=n_backtest_days,
+        eval_end=eval_end,
+        simulate_registration=simulate_registration,
+        simulate_deregistration=simulate_deregistration,
+    )
+
     assets = prompt_config.asset_list
     max_workers = min(len(assets), 6)
     print(f"  Dispatching {len(assets)} assets to {max_workers} backtest workers...")
