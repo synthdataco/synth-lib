@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
@@ -14,8 +15,10 @@ import pytest
 
 from app.lib.backtester.backtest import (
     BacktestResult,
+    HF_CRPS_FORMULA_CHANGE_DATE,
     _BacktestMinerDataHandler,
     _find_prediction_file,
+    _maybe_warn_hf_crps_formula_change,
     _parse_prediction_filename_time,
     _score_single_prompt,
     backtest,
@@ -32,6 +35,7 @@ from app.lib.backtester.backtest import (
     plot_total_rank_evolution,
     plot_weekly_percentile,
 )
+from synth.validator.prompt_config import HIGH_FREQUENCY, LOW_FREQUENCY
 
 UTC = timezone.utc
 
@@ -1139,4 +1143,78 @@ class TestPlotEstimatedEarnings:
         total_assets = len(LOW_FREQUENCY.asset_list)
         assert f"PARTIAL COVERAGE (2/{total_assets} assets)" in captured.out
 
+
+class TestHFCrpsFormulaWarning:
+    """Gate logic for the 2026-03-11 HF CRPS formula change warning."""
+
+    CUTOFF = HF_CRPS_FORMULA_CHANGE_DATE  # 2026-03-11
+    SAFE_SIM_REG = CUTOFF + timedelta(days=HIGH_FREQUENCY.window_days)  # 2026-03-14
+
+    def _call(self, **kwargs):
+        defaults = dict(
+            prompt_config=HIGH_FREQUENCY,
+            n_backtest_days=7,
+            eval_end=None,
+            simulate_registration=None,
+            simulate_deregistration=None,
+        )
+        defaults.update(kwargs)
+        return _maybe_warn_hf_crps_formula_change(**defaults)
+
+    def _assert_warns(self, **kwargs) -> str:
+        with pytest.warns(UserWarning, match="HIGH_FREQUENCY backtest window starts") as record:
+            self._call(**kwargs)
+        assert len(record) == 1
+        return str(record[0].message)
+
+    def _assert_silent(self, **kwargs) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            self._call(**kwargs)
+
+    # 1. HF + window pre-cutoff → WARN
+    def test_hf_window_pre_cutoff_warns(self) -> None:
+        msg = self._assert_warns(eval_end=datetime(2026, 3, 1, tzinfo=UTC), n_backtest_days=30)
+        assert "2026-03-11" in msg
+        assert "simulate_registration=2026-03-14" in msg
+
+    # 2. HF + window post-cutoff → silence
+    def test_hf_window_post_cutoff_silent(self) -> None:
+        self._assert_silent(eval_end=datetime(2026, 4, 1, tzinfo=UTC), n_backtest_days=10)
+
+    # 3. LF (always, regardless of window) → silence
+    def test_lf_always_silent(self) -> None:
+        self._assert_silent(
+            prompt_config=LOW_FREQUENCY,
+            eval_end=datetime(2025, 1, 1, tzinfo=UTC),
+            n_backtest_days=365,
+        )
+
+    # 4. HF + sim_reg=2026-03-14 (cutoff + window_days) → silence
+    def test_hf_sim_reg_at_safe_date_silent(self) -> None:
+        self._assert_silent(
+            simulate_registration=self.SAFE_SIM_REG,
+            eval_end=datetime(2026, 4, 1, tzinfo=UTC),
+        )
+
+    # 5. HF + sim_reg=2026-03-11 (cutoff exact, smoothing reaches into pre-fix data) → WARN
+    def test_hf_sim_reg_at_cutoff_warns(self) -> None:
+        self._assert_warns(
+            simulate_registration=self.CUTOFF,
+            eval_end=datetime(2026, 4, 1, tzinfo=UTC),
+        )
+
+    # 6. HF + sim_dereg post-cutoff with window fully post-cutoff → silence
+    def test_hf_sim_dereg_post_cutoff_silent(self) -> None:
+        self._assert_silent(
+            simulate_deregistration=datetime(2026, 3, 25, tzinfo=UTC),
+            n_backtest_days=7,
+        )
+
+    # 7. HF + sim_dereg pre-cutoff → WARN
+    def test_hf_sim_dereg_pre_cutoff_warns(self) -> None:
+        self._assert_warns(
+            simulate_deregistration=datetime(2026, 3, 8, tzinfo=UTC),
+            n_backtest_days=5,
+        )
 

@@ -230,6 +230,40 @@ Grand total (emitted when both profiles produced data):
 The console prints per-asset rank, reward weight, smoothed score, prompt
 count, mean CRPS, and the paths of every saved chart.
 
+## Known caveats
+
+### HIGH_FREQUENCY CRPS formula change on 2026-03-11
+
+On 2026-03-11 the Synth validator changed how it computes CRPS for the
+HIGH_FREQUENCY profile. CRPS values that the API still returns for prompts
+scored before that date were produced by the previous formula and are not
+directly comparable to the values the validator computes today. Practically,
+that means an HF backtest whose window includes any pre-cutoff prompts will
+mix two different scoring regimes, so the resulting ranks and reward weights
+won't match what the same predictions would receive on the live network now.
+
+The smoothing window also looks back `prompt_config.window_days` (3 days for
+HIGH_FREQUENCY), so the smoothed score remains contaminated by pre-cutoff
+CRPS until 2026-03-14.
+
+If you see the corresponding `UserWarning` from `run_backtest`, you have two
+ways to get current-formula ranks:
+
+```bash
+# 1. Restrict evaluation to dates on or after the formula change.
+uv run app/lib/backtester/scripts/run_backtest.py \
+    --miner-name gbm_agent --profile high \
+    --eval-end 2026-04-15 --days 30
+
+# 2. Simulate registering the miner on 2026-03-14 (= cutoff + window_days),
+#    so the smoothing window is fully post-change.
+uv run app/lib/backtester/scripts/run_backtest.py \
+    --miner-name gbm_agent --profile high \
+    --simulate-registration 2026-03-14
+```
+
+The LOW_FREQUENCY profile is unaffected.
+
 ## Tests
 
 Unit and integration tests live in [tests/lib/backtester/](tests/lib/backtester/).
