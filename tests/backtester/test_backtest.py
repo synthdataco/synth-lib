@@ -1,4 +1,4 @@
-"""Tests for app.lib.backtester.backtest — run with: uv run pytest app/lib/backtester/test_backtest.py -v"""
+"""Tests for synth_lib.backtester.backtest — run with: uv run pytest synth_lib/backtester/test_backtest.py -v"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from app.lib.backtester.backtest import (
+from synth_lib.backtester.backtest import (
     BacktestResult,
     HF_CRPS_FORMULA_CHANGE_DATE,
     _BacktestMinerDataHandler,
@@ -269,10 +269,10 @@ FAKE_CRPS = 42.0
 # Full backtest() pipeline with mocked external I/O (Synth API, price data, CRPS).
 # Verifies that predictions are discovered, scored, and aggregated into a valid BacktestResult.
 class TestBacktestIntegration:
-    @patch("app.lib.backtester.backtest.calculate_crps_for_miner")
-    @patch("app.lib.backtester.backtest.download_price_data")
-    @patch("app.lib.backtester.backtest.get_rewards_history")
-    @patch("app.lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.backtest.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.backtest.download_price_data")
+    @patch("synth_lib.backtester.backtest.get_rewards_history")
+    @patch("synth_lib.backtester.backtest.get_miner_scores")
     def test_full_pipeline(
         self,
         mock_scores: object,
@@ -324,10 +324,10 @@ class TestBacktestIntegration:
 
     # -- Partial predictions fill with crps=-1 --
 
-    @patch("app.lib.backtester.backtest.calculate_crps_for_miner")
-    @patch("app.lib.backtester.backtest.download_price_data")
-    @patch("app.lib.backtester.backtest.get_rewards_history")
-    @patch("app.lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.backtest.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.backtest.download_price_data")
+    @patch("synth_lib.backtester.backtest.get_rewards_history")
+    @patch("synth_lib.backtester.backtest.get_miner_scores")
     def test_partial_predictions_fill_crps_minus_one(
         self,
         mock_scores: object,
@@ -357,10 +357,10 @@ class TestBacktestIntegration:
 
     # -- Task 5: Price data gap raises ValueError --
 
-    @patch("app.lib.backtester.backtest.calculate_crps_for_miner")
-    @patch("app.lib.backtester.backtest.download_price_data")
-    @patch("app.lib.backtester.backtest.get_rewards_history")
-    @patch("app.lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.backtest.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.backtest.download_price_data")
+    @patch("synth_lib.backtester.backtest.get_rewards_history")
+    @patch("synth_lib.backtester.backtest.get_miner_scores")
     def test_price_data_gap_raises_valueerror(
         self,
         mock_scores: object,
@@ -593,9 +593,9 @@ class TestScoreSinglePrompt:
 class TestBacktestParallelScoring:
     """Verify backtest() produces identical results with and without scoring_executor."""
 
-    @patch("app.lib.backtester.backtest.download_price_data")
-    @patch("app.lib.backtester.backtest.get_rewards_history")
-    @patch("app.lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.backtest.download_price_data")
+    @patch("synth_lib.backtester.backtest.get_rewards_history")
+    @patch("synth_lib.backtester.backtest.get_miner_scores")
     def test_parallel_matches_sequential(
         self,
         mock_scores: object,
@@ -686,7 +686,7 @@ class TestDownloadPriceDataPerAsset:
 class TestGetDailyMinerPoolUsd:
     """Parses /rewards/historical response into a date-indexed USD series."""
 
-    @patch("app.lib.backtester.backtest._http_get")
+    @patch("synth_lib.backtester.backtest._http_get")
     def test_empty_response_returns_empty_series(self, mock_get: object) -> None:
         class FakeResponse:
             status_code = 200
@@ -699,7 +699,7 @@ class TestGetDailyMinerPoolUsd:
 
         mock_get.return_value = FakeResponse()  # type: ignore[attr-defined]
 
-        from app.lib.backtester.backtest import get_daily_miner_pool_usd
+        from synth_lib.backtester.backtest import get_daily_miner_pool_usd
 
         result = get_daily_miner_pool_usd(
             datetime(2026, 4, 10, tzinfo=UTC),
@@ -709,7 +709,7 @@ class TestGetDailyMinerPoolUsd:
         assert isinstance(result, pd.Series)
         assert len(result) == 0
 
-    @patch("app.lib.backtester.backtest._http_get")
+    @patch("synth_lib.backtester.backtest._http_get")
     def test_paginates_multi_chunk_window(self, mock_get: object) -> None:
         """A 14-day window paginates into 3 chunks (6 + 6 + 2 days); cursor advances and rows merge."""
 
@@ -736,7 +736,7 @@ class TestGetDailyMinerPoolUsd:
             FakeResponse([_row("2026-04-13", 3000.0), _row("2026-04-14", 3500.0)]),
         ]
 
-        from app.lib.backtester.backtest import get_daily_miner_pool_usd
+        from synth_lib.backtester.backtest import get_daily_miner_pool_usd
 
         result = get_daily_miner_pool_usd(
             datetime(2026, 4, 1, tzinfo=UTC),
@@ -821,7 +821,7 @@ class TestComputeCombinedSmoothedScores:
 
     def test_xau_dominance_over_btc(self) -> None:
         """Miner B (good on high-coef XAU) beats Miner A (good on low-coef BTC)."""
-        from app.lib.backtester.backtest import compute_combined_smoothed_scores
+        from synth_lib.backtester.backtest import compute_combined_smoothed_scores
 
         updated = pd.Timestamp("2026-04-15 12:00:00", tz="UTC")
         st = datetime(2026, 4, 15, 10, 0, 0, tzinfo=UTC)
@@ -844,7 +844,7 @@ class TestComputeCombinedSmoothedScores:
         """reward_weight across miners at a single timestamp sums to
         smoothed_score_coefficient (0.5 for LOW_FREQUENCY)."""
         from synth.validator.prompt_config import LOW_FREQUENCY
-        from app.lib.backtester.backtest import compute_combined_smoothed_scores
+        from synth_lib.backtester.backtest import compute_combined_smoothed_scores
 
         updated = pd.Timestamp("2026-04-15 12:00:00", tz="UTC")
         st = datetime(2026, 4, 15, 10, 0, 0, tzinfo=UTC)
@@ -931,7 +931,7 @@ class TestComputeEarningsDf:
     def test_formula(self) -> None:
         """Two rounds on day 1 sharing a $5000 pool, one round on day 2 with $4000 pool."""
         from synth.validator.prompt_config import LOW_FREQUENCY
-        from app.lib.backtester.backtest import _compute_earnings_df
+        from synth_lib.backtester.backtest import _compute_earnings_df
 
         combined = pd.DataFrame(
             [
@@ -984,7 +984,7 @@ class TestComputeEarningsDf:
     def test_drops_rounds_on_missing_pool_days(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Rounds on dates without pool data are dropped with a stdout warning."""
         from synth.validator.prompt_config import LOW_FREQUENCY
-        from app.lib.backtester.backtest import _compute_earnings_df
+        from synth_lib.backtester.backtest import _compute_earnings_df
 
         combined = pd.DataFrame(
             [
@@ -1081,10 +1081,10 @@ class TestPlotEstimatedEarnings:
             },
         )
 
-    @patch("app.lib.backtester.backtest.get_daily_miner_pool_usd")
+    @patch("synth_lib.backtester.backtest.get_daily_miner_pool_usd")
     def test_saves_png(self, mock_pool: object, tmp_path: Path) -> None:
         from synth.validator.prompt_config import LOW_FREQUENCY
-        from app.lib.backtester.backtest import (
+        from synth_lib.backtester.backtest import (
             compute_combined_smoothed_scores,
             plot_estimated_earnings,
         )
@@ -1111,11 +1111,11 @@ class TestPlotEstimatedEarnings:
         assert chart_path.suffix == ".png"
         assert "estimated_earnings_low" in chart_path.name
 
-    @patch("app.lib.backtester.backtest.get_daily_miner_pool_usd")
+    @patch("synth_lib.backtester.backtest.get_daily_miner_pool_usd")
     def test_partial_coverage_warning(self, mock_pool: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """Backtesting fewer assets than the profile's asset_list prints a partial-coverage tag."""
         from synth.validator.prompt_config import LOW_FREQUENCY
-        from app.lib.backtester.backtest import (
+        from synth_lib.backtester.backtest import (
             compute_combined_smoothed_scores,
             plot_estimated_earnings,
         )

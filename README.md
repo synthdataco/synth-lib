@@ -5,9 +5,9 @@ Tools for downloading minute-level market data and backtesting miners against
 
 The library is organised into two pieces:
 
-- [app/lib/preparation/market_data.py](app/lib/preparation/market_data.py) — downloads
+- [synth_lib/preparation/market_data.py](synth_lib/preparation/market_data.py) — downloads
   and stores minute closes as daily parquet partitions.
-- [app/lib/backtester/backtest.py](app/lib/backtester/backtest.py) — scores a miner's
+- [synth_lib/backtester/backtest.py](synth_lib/backtester/backtest.py) — scores a miner's
   predictions against real price paths and computes smoothed scores / reward weights
   using the same logic the live validator runs.
 
@@ -32,7 +32,7 @@ partitions are skipped unless `--force-refresh` is passed.
 ### All supported assets, default 15-month window
 
 ```bash
-uv run app/lib/preparation/market_data.py
+uv run synth_lib/preparation/market_data.py
 ```
 
 This downloads 15 months of history ending yesterday. The asset list comes
@@ -43,17 +43,17 @@ majors such as `BTC`, `ETH`, `SOL`, plus tokenised equities/commodities
 ### A single asset
 
 ```bash
-uv run app/lib/preparation/market_data.py --asset BTC
+uv run synth_lib/preparation/market_data.py --asset BTC
 ```
 
 ### Recent N days (includes today)
 
 ```bash
 # Last 3 days for BTC only, including today
-uv run app/lib/preparation/market_data.py --asset BTC --days 3
+uv run synth_lib/preparation/market_data.py --asset BTC --days 3
 
 # Last 7 days across every asset
-uv run app/lib/preparation/market_data.py --days 7
+uv run synth_lib/preparation/market_data.py --days 7
 ```
 
 `--days N` anchors the window at today (inclusive). Today's partition is
@@ -62,7 +62,7 @@ marked `is_final=False` and is re-downloaded on every subsequent run.
 ### Re-download existing partitions
 
 ```bash
-uv run app/lib/preparation/market_data.py --asset BTC --force-refresh
+uv run synth_lib/preparation/market_data.py --asset BTC --force-refresh
 ```
 
 ### CLI flags
@@ -76,7 +76,7 @@ uv run app/lib/preparation/market_data.py --asset BTC --force-refresh
 ### From Python
 
 ```python
-from app.lib.preparation.market_data import download_market_data, download_all_assets
+from synth_lib.preparation.market_data import download_market_data, download_all_assets
 
 # Single asset, default window
 download_market_data("BTC")
@@ -116,7 +116,7 @@ YYYY-MM-DD_HH:MM:SSZ_{ASSET}_{time_length}.json
 ```
 
 For example: `2026-03-28_00:00:00Z_BTC_86400.json`. Two JSON layouts are
-accepted (see [load_prediction](app/lib/backtester/backtest.py)):
+accepted (see [load_prediction](synth_lib/backtester/backtest.py)):
 
 - Flat notebook format: `{"start_timestamp", "asset", "time_increment", "time_length", "paths", ...}`
 - ArtifactManager format: `{"simulation_input": {...}, "prediction": [meta, meta, path, ...]}`
@@ -135,21 +135,21 @@ pipeline can be verified end-to-end.
 
 ```bash
 # Default: both profiles × every asset, last 2 days
-uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent
+uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent
 
 # BTC across both profiles
-uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC
+uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC
 
 # Multiple assets in LOW_FREQUENCY (space-, comma-, or quoted list all work)
-uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset BTC ETH TSLAX
-uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset BTC,ETH,TSLAX
-uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset "BTC ETH TSLAX"
+uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset BTC ETH TSLAX
+uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset BTC,ETH,TSLAX
+uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile low --asset "BTC ETH TSLAX"
 
 # Every asset in HIGH_FREQUENCY only
-uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile high --asset ALL
+uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --profile high --asset ALL
 
 # Longer window or custom predictions directory
-uv run app/lib/backtester/scripts/run_backtest.py \
+uv run synth_lib/backtester/scripts/run_backtest.py \
     --miner-name gbm_agent \
     --days 7 \
     --profile low --asset BTC \
@@ -160,7 +160,7 @@ Assets not in a given profile's `asset_list` are filtered out for that
 profile; if nothing matches anywhere the script exits with a clear error
 listing the supported assets per profile.
 
-CLI flags (see [run_backtest.py](app/lib/backtester/scripts/run_backtest.py)):
+CLI flags (see [run_backtest.py](synth_lib/backtester/scripts/run_backtest.py)):
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -183,7 +183,7 @@ the asset count would suggest:
 
 ```python
 from synth.validator.prompt_config import LOW_FREQUENCY
-from app.lib.backtester.backtest import run_backtest, backtest
+from synth_lib.backtester.backtest import run_backtest, backtest
 
 # Single asset
 single = backtest(
@@ -251,13 +251,13 @@ ways to get current-formula ranks:
 
 ```bash
 # 1. Restrict evaluation to dates on or after the formula change.
-uv run app/lib/backtester/scripts/run_backtest.py \
+uv run synth_lib/backtester/scripts/run_backtest.py \
     --miner-name gbm_agent --profile high \
     --eval-end 2026-04-15 --days 30
 
 # 2. Simulate registering the miner on 2026-03-14 (= cutoff + window_days),
 #    so the smoothing window is fully post-change.
-uv run app/lib/backtester/scripts/run_backtest.py \
+uv run synth_lib/backtester/scripts/run_backtest.py \
     --miner-name gbm_agent --profile high \
     --simulate-registration 2026-03-14
 ```
@@ -266,10 +266,10 @@ The LOW_FREQUENCY profile is unaffected.
 
 ## Tests
 
-Unit and integration tests live in [tests/lib/backtester/](tests/lib/backtester/).
+Unit and integration tests live in [tests/backtester/](tests/backtester/).
 
 ```bash
-uv run pytest tests/lib/backtester/
+uv run pytest tests/backtester/
 ```
 
 ## Notes

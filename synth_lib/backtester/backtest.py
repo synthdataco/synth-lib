@@ -45,7 +45,7 @@ from synth.validator.moving_average import (
 from synth.validator.prompt_config import LOW_FREQUENCY, PromptConfig
 from synth.validator.reward import compute_prompt_scores
 
-from app.lib.preparation.market_data import (
+from synth_lib.preparation.market_data import (
     HYPERLIQUID_SYMBOLS,
     PYTH_SYMBOLS,
     HyperliquidClient,
