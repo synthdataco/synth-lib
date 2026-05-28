@@ -7,10 +7,10 @@ data, also emits grand-total rank + earnings charts across profiles.
 Falls back to random predictions if no prediction files are found.
 
 Usage:
-    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --days 2
-    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC --profile low
-    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC TSLAX
-    uv run app/lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset ALL --profile high
+    uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --days 2
+    uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC --profile low
+    uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC TSLAX
+    uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset ALL --profile high
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ def _generate_random_predictions(
     time_increment: int,
 ) -> None:
     """Fetch scored prompt times from the API, generate random predictions into output_dir."""
-    from app.lib.backtester.backtest import download_price_data, get_miner_scores
+    from synth_lib.backtester.backtest import download_price_data, get_miner_scores
 
     now = datetime.now(UTC)
     query_start = now - timedelta(days=days)
@@ -195,7 +195,7 @@ def _run(
 ) -> None:
     """Run each filtered profile (parallel if >1) and emit grand-total charts when both produced data."""
     import pandas as pd
-    from app.lib.backtester.backtest import (
+    from synth_lib.backtester.backtest import (
         BacktestResult,
         plot_grand_total_earnings,
         plot_grand_total_rank_evolution,
