@@ -1,16 +1,16 @@
 """Run backtests for a miner against Synth subnet scoring data.
 
-Pick assets with --asset (one or more symbols, or "ALL") and profiles with
---profile (low, high, or all). When both profiles produce ≥2 assets' worth of
-data, also emits grand-total rank + earnings charts across profiles.
+Pick assets with --asset (one or more symbols, or "ALL") and competitions with
+--competition (crypto-1h, crypto-24h, com-equ-24h, or all). When ≥2 competitions
+produce data, also emits grand-total rank + earnings charts across competitions.
 
 Falls back to random predictions if no prediction files are found.
 
 Usage:
     uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --days 2
-    uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC --profile low
+    uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC --competition crypto-24h
     uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset BTC TSLAX
-    uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset ALL --profile high
+    uv run synth_lib/backtester/scripts/run_backtest.py --miner-name gbm_agent --asset ALL --competition crypto-1h
 """
 
 from __future__ import annotations
@@ -25,14 +25,22 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from synth.validator.prompt_config import HIGH_FREQUENCY, LOW_FREQUENCY, PromptConfig
+from synth.validator.competition_config import (
+    ALL_COMPETITIONS,
+    COM_EQU_24H,
+    CRYPTO_1H,
+    CRYPTO_24H,
+    CompetitionConfig,
+)
+from synth_lib.backtester.backtest import slug_for
 
 UTC = timezone.utc
 NUM_SIMULATIONS = 100
-PROFILES_BY_NAME: dict[str, list[PromptConfig]] = {
-    "low": [LOW_FREQUENCY],
-    "high": [HIGH_FREQUENCY],
-    "all": [LOW_FREQUENCY, HIGH_FREQUENCY],
+COMPETITIONS_BY_NAME: dict[str, list[CompetitionConfig]] = {
+    "crypto-1h": [CRYPTO_1H],
+    "crypto-24h": [CRYPTO_24H],
+    "com-equ-24h": [COM_EQU_24H],
+    "all": list(ALL_COMPETITIONS),
 }
 
 
@@ -122,13 +130,13 @@ def _generate_random_predictions(
 
 
 def _populate_random_dir(
-    filtered_profiles: list[PromptConfig], days: int, output_dir: Path
+    filtered_competitions: list[CompetitionConfig], days: int, output_dir: Path
 ) -> None:
-    """Populate `output_dir` with random predictions for every asset in each filtered profile."""
-    for profile in filtered_profiles:
-        for asset in profile.asset_list:
+    """Populate `output_dir` with random predictions for every asset in each filtered competition."""
+    for comp in filtered_competitions:
+        for asset in comp.asset_list:
             _generate_random_predictions(
-                days, output_dir, asset, profile.time_length, profile.time_increment
+                days, output_dir, asset, comp.time_length, comp.time_increment
             )
 
 
@@ -159,22 +167,22 @@ def _parse_asset_selection(raw: list[str]) -> list[str] | None:
     return out
 
 
-def _build_filtered_profiles(
-    profiles: list[PromptConfig],
+def _build_filtered_competitions(
+    competitions: list[CompetitionConfig],
     asset_selection: list[str] | None,
-) -> list[PromptConfig]:
-    """Intersect each profile's asset_list with the user selection; drop profiles with no match.
+) -> list[CompetitionConfig]:
+    """Intersect each competition's asset_list with the user selection; drop competitions with no match.
 
-    `asset_selection=None` means keep every asset in each profile (the "ALL" case).
+    `asset_selection=None` means keep every asset in each competition (the "ALL" case).
     """
-    out: list[PromptConfig] = []
-    for profile in profiles:
+    out: list[CompetitionConfig] = []
+    for comp in competitions:
         if asset_selection is None:
-            kept = list(profile.asset_list)
+            kept = list(comp.asset_list)
         else:
-            kept = [a for a in asset_selection if a in profile.asset_list]
+            kept = [a for a in asset_selection if a in comp.asset_list]
         if kept:
-            out.append(dataclasses.replace(profile, asset_list=kept))
+            out.append(dataclasses.replace(comp, asset_list=kept))
     return out
 
 
@@ -185,7 +193,7 @@ def _build_filtered_profiles(
 
 def _run(
     miner_name: str,
-    filtered_profiles: list[PromptConfig],
+    filtered_competitions: list[CompetitionConfig],
     days: int,
     predictions_dir: Path | None,
     scoring_executor: ProcessPoolExecutor,
@@ -193,7 +201,7 @@ def _run(
     simulate_registration: datetime | None = None,
     simulate_deregistration: datetime | None = None,
 ) -> None:
-    """Run each filtered profile (parallel if >1) and emit grand-total charts when both produced data."""
+    """Run each filtered competition (parallel if >1) and emit grand-total charts when ≥2 produced data."""
     import pandas as pd
     from synth_lib.backtester.backtest import (
         BacktestResult,
@@ -202,54 +210,60 @@ def _run(
         run_backtest,
     )
 
-    results_by_profile: dict[str, list[BacktestResult]] = {}
-    combined_by_profile: dict[str, pd.DataFrame] = {}
+    results_by_competition: dict[str, list[BacktestResult]] = {}
+    combined_by_competition: dict[str, pd.DataFrame] = {}
 
-    with ThreadPoolExecutor(max_workers=max(len(filtered_profiles), 1)) as executor:
+    with ThreadPoolExecutor(
+        max_workers=max(len(filtered_competitions), 1)
+    ) as executor:
         futures = {
             executor.submit(
                 run_backtest,
                 miner_name=miner_name,
-                prompt_config=profile,
+                competition=comp,
                 n_backtest_days=days,
                 predictions_dir=predictions_dir,
                 scoring_executor=scoring_executor,
                 eval_end=eval_end,
                 simulate_registration=simulate_registration,
                 simulate_deregistration=simulate_deregistration,
-            ): profile
-            for profile in filtered_profiles
+            ): comp
+            for comp in filtered_competitions
         }
         for future in as_completed(futures):
-            profile = futures[future]
+            comp = futures[future]
             try:
                 results, combined = future.result()
-                results_by_profile[profile.label] = results
-                combined_by_profile[profile.label] = combined
+                results_by_competition[comp.label] = results
+                combined_by_competition[comp.label] = combined
             except (RuntimeError, FileNotFoundError) as e:
-                print(f"  [{profile.label}] BACKTEST FAILED: {e}")
+                print(f"  [{comp.label}] BACKTEST FAILED: {e}")
 
     print(f"\n{'='*60}\nALL BACKTESTS COMPLETE\n{'='*60}")
 
-    # Grand-total charts require both profiles to have combined frames with data.
-    if len(combined_by_profile) >= 2 and all(
-        not c.empty for c in combined_by_profile.values()
+    # Grand-total charts require ≥2 competitions to have combined frames with data.
+    if len(combined_by_competition) >= 2 and all(
+        not c.empty for c in combined_by_competition.values()
     ):
         try:
             path = plot_grand_total_rank_evolution(
-                results_by_profile, combined_by_profile
+                results_by_competition, combined_by_competition
             )
             print(f"  Grand-total rank chart saved to: {path}")
         except (RuntimeError, FileNotFoundError, KeyError) as e:
             print(f"  Grand-total rank chart failed: {e}")
 
         try:
-            path = plot_grand_total_earnings(results_by_profile, combined_by_profile)
+            path = plot_grand_total_earnings(
+                results_by_competition, combined_by_competition
+            )
             print(f"  Grand-total earnings chart saved to: {path}")
         except (RuntimeError, FileNotFoundError, KeyError) as e:
             print(f"  Grand-total earnings chart failed: {e}")
     else:
-        print("  Skipping grand-total charts: need both profiles with ≥2 assets each.")
+        print(
+            "  Skipping grand-total charts: need ≥2 competitions with data each."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +291,10 @@ def main() -> None:
         help='Assets to backtest: one or more symbols (e.g. BTC, or BTC TSLAX), or "ALL" (default: ALL)',
     )
     parser.add_argument(
-        "--profile",
-        choices=["low", "high", "all"],
+        "--competition",
+        choices=["crypto-1h", "crypto-24h", "com-equ-24h", "all"],
         default="all",
-        help="Profile to backtest: low, high, or all (default: all)",
+        help="Competition to backtest: crypto-1h, crypto-24h, com-equ-24h, or all (default: all)",
     )
     parser.add_argument(
         "--predictions-dir",
@@ -324,20 +338,22 @@ def main() -> None:
     simulate_deregistration = _parse_iso(args.simulate_deregistration)
 
     asset_selection = _parse_asset_selection(args.asset)
-    profiles = PROFILES_BY_NAME[args.profile]
-    filtered_profiles = _build_filtered_profiles(profiles, asset_selection)
+    competitions = COMPETITIONS_BY_NAME[args.competition]
+    filtered_competitions = _build_filtered_competitions(competitions, asset_selection)
 
-    if not filtered_profiles:
+    if not filtered_competitions:
         sel = "ALL" if asset_selection is None else " ".join(asset_selection)
+        avail = ", ".join(f"{slug_for(c)}={c.asset_list}" for c in ALL_COMPETITIONS)
         print(
-            f"ERROR: no assets match --asset '{sel}' in --profile {args.profile}. "
-            f"Available LOW assets: {LOW_FREQUENCY.asset_list}. "
-            f"Available HIGH assets: {HIGH_FREQUENCY.asset_list}.",
+            f"ERROR: no assets match --asset '{sel}' in --competition {args.competition}. "
+            f"Available: {avail}",
             file=sys.stderr,
         )
         sys.exit(2)
 
-    asset_summary = ", ".join(f"{p.label}={p.asset_list}" for p in filtered_profiles)
+    asset_summary = ", ".join(
+        f"{c.label}={c.asset_list}" for c in filtered_competitions
+    )
     print(f"Running backtests for {args.miner_name}: {asset_summary}")
 
     predictions_dir = Path(args.predictions_dir) if args.predictions_dir else None
@@ -359,7 +375,7 @@ def main() -> None:
         with ProcessPoolExecutor(max_workers=max_workers) as scoring_executor:
             _run(
                 args.miner_name,
-                filtered_profiles,
+                filtered_competitions,
                 args.days,
                 pred_dir,
                 scoring_executor,
@@ -371,7 +387,7 @@ def main() -> None:
     if use_tmp:
         with tempfile.TemporaryDirectory(prefix="backtest_preds_") as tmpdir:
             tmp_dir = Path(tmpdir)
-            _populate_random_dir(filtered_profiles, args.days, tmp_dir)
+            _populate_random_dir(filtered_competitions, args.days, tmp_dir)
             _dispatch(tmp_dir)
     else:
         _dispatch(predictions_dir)

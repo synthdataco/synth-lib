@@ -10,7 +10,6 @@ External dependencies (DB, GCS, synth_subnet_analyses) are replaced with:
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -42,7 +41,14 @@ from synth.validator.moving_average import (
     compute_smoothed_score,
     prepare_df_for_moving_average,
 )
-from synth.validator.prompt_config import LOW_FREQUENCY, PromptConfig
+from synth.validator.competition_config import (
+    ALL_COMPETITIONS,
+    COM_EQU_24H,
+    CRYPTO_1H,
+    CRYPTO_24H,
+    SMOOTHED_SCORE_COEFFICIENT,
+    CompetitionConfig,
+)
 from synth.validator.reward import compute_prompt_scores
 
 from synth_lib.preparation.market_data import (
@@ -53,6 +59,8 @@ from synth_lib.preparation.market_data import (
 )
 
 SYNTHDATA_API_BASE = "https://api.synthdata.co"
+# Default 24h scoring intervals (crypto-24h / com-equ-24h); only used when no
+# competition is passed to backtest().
 SCORING_INTERVALS: dict[str, int] = {
     "5min": 300,
     "30min": 1_800,
@@ -61,7 +69,7 @@ SCORING_INTERVALS: dict[str, int] = {
 }
 DEFAULT_MINER_OUTPUT_ROOT = Path("miner_outputs")
 DEFAULT_MARKET_DATA_ROOT = Path("market_data/pyth/BTC/1m")
-_LEGACY_FALLBACK_WINDOW_DAYS = 10  # only used when no prompt_config is in scope
+_LEGACY_FALLBACK_WINDOW_DAYS = 10  # only used when no competition is in scope
 _COMBINED_EMPTY_COLS = [
     "updated_at",
     "miner_uid",
@@ -73,10 +81,33 @@ UTC = timezone.utc
 
 # -- HF CRPS formula change --
 # On 2026-03-11 the Synth validator changed how it computes CRPS for the
-# HIGH_FREQUENCY profile. CRPS values stored in the API for prompts before that
-# date were produced by the old formula and aren't directly comparable to ranks
-# computed under the current formula. See README "Known caveats".
+# high-frequency competition (now crypto-1h). CRPS values stored in the API for
+# prompts before that date were produced by the old formula and aren't directly
+# comparable to ranks computed under the current formula. See README "Known
+# caveats".
 HF_CRPS_FORMULA_CHANGE_DATE = datetime(2026, 3, 11, tzinfo=UTC)
+
+# On-chain emission normalization for the USD earnings estimate. A miner's
+# realized emission is not exactly proportional to the reward_weight the
+# validator sets: Yuma consensus (trust/clipping) and the presence of other
+# neurons flatten realized emissions relative to set weight, so
+# `reward_weight * pool` OVERESTIMATES the USD a competitive miner actually
+# earns. This factor rescales the raw formula to realized emissions.
+#
+# Empirically calibrated against live on-chain data (validate_earnings_formula.py,
+# window 2026-07-04→2026-07-06, all 3 competitions, top-15 miners by actual USD):
+# raw bt/actual SUM = 1414.19/980.97 = 1.442 (a consistent +44-47% overestimate
+# across the top miners), so factor = actual/bt = 0.6935. It is an approximation
+# (per-miner spread ~±a few %; the tail of small miners is under-corrected since
+# realized emission is flatter than set weight) and may drift over time — treat
+# absolute USD as an estimate. 1.0 disables the correction (raw reward-weight USD).
+EMISSION_NORMALIZATION_FACTOR = 0.6935
+
+# The subnet split into 3 competitions (crypto-24h, com-equ-24h, crypto-1h) on
+# this date (first com-equ-24h appearance in /rewards/scores, verified live).
+# Before it the reward structure was 2 profiles (each /2) and com-equ-24h did
+# not exist, so a backtest window predating it mixes incompatible structures.
+COMPETITION_SPLIT_DATE = datetime(2026, 6, 23, tzinfo=UTC)
 
 # -- Pagination limits (empirical — not confirmed from API docs) --
 # Synth API /validation/scores/historical has a 7-day max range.
@@ -96,34 +127,64 @@ PREDICTION_MATCH_TOLERANCE_MINUTES = 30
 # network-restricted use cases (e.g. concurrent benchmark rollouts that would
 # otherwise rate-limit the Synth API, or sandboxes with internet disabled).
 #
-# Expected layout under the root:
-#   miner_scores_{asset}_{label}.parquet         # label = "low" / "high" (see _PROFILE_LABELS)
-#   rewards_history_{prompt_name}.parquet        # prompt_name = "low" or "high"
+# Expected layout under the root (slug ∈ crypto-1h / crypto-24h / com-equ-24h):
+#   miner_scores_{asset}_{slug}.parquet          # slug = competition slug
+#   rewards_history_{slug}.parquet               # slug = competition slug
 #   miner_pool_usd.parquet                       # columns: date, usd
 #   market_data/pyth/{asset}/1m/date=*.parquet   # daily price partitions
 _OFFLINE_ENV_VAR = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
 
-# Short labels for the two canonical Synth profiles, matching prompt_config.label.
-_PROFILE_LABELS: dict[tuple[int, int], str] = {
-    (86400, 300): "low",  # LOW_FREQUENCY
-    (3600, 60): "high",  # HIGH_FREQUENCY
+# comp.label -> API slug used by /rewards/scores?prompt_name=. synth does not
+# define these slugs; they are the backtester's canonical competition keys and
+# double as offline-parquet filename suffixes.
+COMPETITION_SLUGS: dict[str, str] = {
+    "Crypto 1h": "crypto-1h",
+    "Crypto 24h": "crypto-24h",
+    "Commodities/Equities 24h": "com-equ-24h",
 }
+# Fail loudly at import if synth adds/renames a competition we haven't mapped,
+# instead of a bare KeyError surfacing later deep in a call site.
+_UNMAPPED_LABELS = [c.label for c in ALL_COMPETITIONS if c.label not in COMPETITION_SLUGS]
+if _UNMAPPED_LABELS:
+    raise RuntimeError(
+        f"COMPETITION_SLUGS has no slug for competition label(s) {_UNMAPPED_LABELS}; "
+        "update it to match synth.validator.competition_config.ALL_COMPETITIONS."
+    )
+SLUG_TO_COMPETITION: dict[str, CompetitionConfig] = {
+    COMPETITION_SLUGS[c.label]: c for c in ALL_COMPETITIONS
+}
+
+
+def slug_for(comp: CompetitionConfig) -> str:
+    """API slug / filename suffix for a competition."""
+    try:
+        return COMPETITION_SLUGS[comp.label]
+    except KeyError:
+        raise ValueError(
+            f"No slug mapped for competition label {comp.label!r}; "
+            "add it to COMPETITION_SLUGS."
+        ) from None
+
+
+def competition_for(asset: str, time_length: int) -> CompetitionConfig:
+    """Resolve the competition owning (asset, time_length).
+
+    (time_length, time_increment) alone is ambiguous for the two 24h
+    competitions (crypto-24h and com-equ-24h share 86400/300); the asset
+    disambiguates because their asset_lists are disjoint.
+    """
+    for comp in ALL_COMPETITIONS:
+        if comp.time_length == time_length and asset in comp.asset_list:
+            return comp
+    raise ValueError(
+        f"No competition for asset={asset!r} time_length={time_length}. "
+        f"Known: {[(c.label, c.asset_list) for c in ALL_COMPETITIONS]}"
+    )
 
 
 def _offline_root() -> Path | None:
     val = os.environ.get(_OFFLINE_ENV_VAR)
     return Path(val) if val else None
-
-
-def _profile_label(time_length: int, time_increment: int) -> str:
-    """Short filename suffix for a (time_length, time_increment) pair.
-
-    Falls back to the explicit numeric form for non-standard profiles so the
-    offline parquet layout stays unambiguous.
-    """
-    return _PROFILE_LABELS.get(
-        (time_length, time_increment), f"{time_length}_{time_increment}"
-    )
 
 
 def _filter_time_range(
@@ -188,7 +249,7 @@ def _warn_on_middle_gap(
 
 def _hf_crps_window_start(
     n_backtest_days: int,
-    prompt_config: PromptConfig,
+    competition: CompetitionConfig,
     eval_end: datetime | None,
     simulate_registration: datetime | None,
     simulate_deregistration: datetime | None,
@@ -201,12 +262,12 @@ def _hf_crps_window_start(
     else:
         anchor = datetime.now(UTC)
     if simulate_registration is not None:
-        return simulate_registration - timedelta(days=prompt_config.window_days)
+        return simulate_registration - timedelta(days=competition.window_days)
     return anchor - timedelta(days=n_backtest_days)
 
 
 def _maybe_warn_hf_crps_formula_change(
-    prompt_config: PromptConfig,
+    competition: CompetitionConfig,
     n_backtest_days: int,
     eval_end: datetime | None,
     simulate_registration: datetime | None,
@@ -216,14 +277,14 @@ def _maybe_warn_hf_crps_formula_change(
     formula change on 2026-03-11. Pre-cutoff CRPS values stored in the API
     were computed with the old formula, so ranks derived from them aren't
     comparable to current live ranks. The smoothing window also pulls in
-    pre-cutoff data for `prompt_config.window_days` after the cutoff, so
+    pre-cutoff data for `competition.window_days` after the cutoff, so
     we recommend resuming evaluation only after `cutoff + window_days`.
     """
-    if prompt_config.label != "high":
+    if slug_for(competition) != "crypto-1h":
         return
     window_start = _hf_crps_window_start(
         n_backtest_days,
-        prompt_config,
+        competition,
         eval_end,
         simulate_registration,
         simulate_deregistration,
@@ -231,16 +292,45 @@ def _maybe_warn_hf_crps_formula_change(
     if window_start >= HF_CRPS_FORMULA_CHANGE_DATE:
         return
     safe_sim_reg = (
-        HF_CRPS_FORMULA_CHANGE_DATE + timedelta(days=prompt_config.window_days)
+        HF_CRPS_FORMULA_CHANGE_DATE + timedelta(days=competition.window_days)
     ).date()
     cutoff = HF_CRPS_FORMULA_CHANGE_DATE.date()
     warnings.warn(
-        f"HIGH_FREQUENCY backtest window starts {window_start.date()}, before "
+        f"crypto-1h backtest window starts {window_start.date()}, before "
         f"{cutoff} when the validator's CRPS formula changed. API-stored CRPS "
         f"for prompts before that date does not reflect how CRPS is computed "
         f"today, so ranks before {safe_sim_reg} may not be representative. "
         f"To get current-formula ranks: restrict eval to >= {cutoff}, or use "
         f"simulate_registration={safe_sim_reg}. See README 'Known caveats'.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+def _maybe_warn_competition_split(
+    competition: CompetitionConfig,
+    n_backtest_days: int,
+    eval_end: datetime | None,
+    simulate_registration: datetime | None,
+    simulate_deregistration: datetime | None,
+) -> None:
+    """Warn when a backtest window starts before the 3-competition split.
+
+    The backtester models only the current 3-competition era; pre-split windows
+    are scored under a 2-profile structure that no longer exists.
+    """
+    window_start = _hf_crps_window_start(
+        n_backtest_days, competition, eval_end,
+        simulate_registration, simulate_deregistration,
+    )
+    if window_start >= COMPETITION_SPLIT_DATE:
+        return
+    warnings.warn(
+        f"{slug_for(competition)} backtest window starts {window_start.date()}, "
+        f"before the 3-competition split on {COMPETITION_SPLIT_DATE.date()}. "
+        f"The backtester models only the current 3-competition era; results over "
+        f"pre-split prompts mix an incompatible 2-profile reward structure. "
+        f"Restrict the window to >= {COMPETITION_SPLIT_DATE.date()}.",
         UserWarning,
         stacklevel=2,
     )
@@ -316,7 +406,7 @@ def get_miner_scores(
     if offline is not None:
         path = (
             offline
-            / f"miner_scores_{asset}_{_profile_label(time_length, time_increment)}.parquet"
+            / f"miner_scores_{asset}_{slug_for(competition_for(asset, time_length))}.parquet"
         )
         if not path.exists():
             raise FileNotFoundError(
@@ -645,7 +735,7 @@ def calculate_smoothed_scores(
     rewards_history: pd.DataFrame,
     cutoff_days: int = 10,
     scores_column: str = "new_prompt_scores",
-    prompt_config: PromptConfig = LOW_FREQUENCY,
+    competition: CompetitionConfig = CRYPTO_24H,
 ) -> pd.DataFrame:
     """Compute smoothed scores and reward weights using synth's compute_smoothed_score.
 
@@ -675,7 +765,7 @@ def calculate_smoothed_scores(
             & (prepared["scored_time"] <= updated_at)
         ]
         rewards = compute_smoothed_score(
-            _BACKTEST_MDH, window_df, updated_at, prompt_config
+            _BACKTEST_MDH, window_df, updated_at, competition
         )
         if rewards is None:
             continue
@@ -695,7 +785,7 @@ def calculate_smoothed_scores(
 
 def compute_combined_smoothed_scores(
     results: list[BacktestResult],
-    prompt_config: PromptConfig = LOW_FREQUENCY,
+    competition: CompetitionConfig = CRYPTO_24H,
     cutoff_days: int | None = None,
     simulate_registration: datetime | None = None,
 ) -> pd.DataFrame:
@@ -709,15 +799,15 @@ def compute_combined_smoothed_scores(
     previous un-weighted hand-rolled aggregation.
 
     Returns DataFrame with columns: updated_at, miner_uid, new_smoothed_score,
-    reward_weight. reward_weight sums to prompt_config.smoothed_score_coefficient
+    reward_weight. reward_weight sums to SMOOTHED_SCORE_COEFFICIENT (1/3)
     across miners per timestamp.
     """
     if not results:
         return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
 
-    # Default the leaderboard window to the prompt's own setting (HF=3, LF=10).
+    # Default the leaderboard window to the competition's own setting.
     if cutoff_days is None:
-        cutoff_days = prompt_config.window_days
+        cutoff_days = competition.window_days
 
     # Concat per-asset prompt_df frames. percentile90 and lowest_score must be
     # carried through so synth's prepare_df_for_moving_average can backfill new
@@ -766,7 +856,7 @@ def compute_combined_smoothed_scores(
             & (prepared["scored_time"] <= updated_at)
         ]
         rewards = compute_smoothed_score(
-            _BACKTEST_MDH, window_df, updated_at, prompt_config
+            _BACKTEST_MDH, window_df, updated_at, competition
         )
         if rewards is None:
             continue
@@ -888,7 +978,7 @@ def backtest(
     miner_id: int = 999,
     predictions_dir: Path | None = None,
     scoring_intervals: dict[str, int] | None = None,
-    prompt_config: PromptConfig | None = None,
+    competition: CompetitionConfig | None = None,
     scoring_executor: ProcessPoolExecutor | None = None,
     eval_end: datetime | None = None,
     simulate_registration: datetime | None = None,
@@ -897,10 +987,10 @@ def backtest(
     """Backtest a local miner against Synth subnet scoring data.
     Loads predictions from predictions_dir (or miner_outputs/{miner_name}/predictions/).
     """
+    if competition is None:
+        competition = competition_for(asset, time_length)
     if scoring_intervals is None:
-        scoring_intervals = SCORING_INTERVALS
-    if prompt_config is None:
-        prompt_config = LOW_FREQUENCY
+        scoring_intervals = competition.scoring_intervals
 
     # Discover prediction files and their date range
     predictions_root = predictions_dir or (
@@ -933,7 +1023,7 @@ def backtest(
         anchor = datetime.now(UTC)
     if simulate_registration is not None:
         window_start = pd.Timestamp(simulate_registration).to_pydatetime() - timedelta(
-            days=prompt_config.window_days
+            days=competition.window_days
         )
     else:
         window_start = anchor - timedelta(days=n_backtest_days)
@@ -946,7 +1036,7 @@ def backtest(
     # Step 2: fetch existing miner scores
     asset_backtest = asset
     time_length_backtest = time_length
-    prompt_label = "low" if time_length_backtest == 86400 else "high"
+    prompt_label = slug_for(competition)
     log_prefix = f"  [{prompt_label}/{asset_backtest}]"
     t_start = perf_counter()
 
@@ -1222,9 +1312,9 @@ def backtest(
     recalculated_smoothed_scores = calculate_smoothed_scores(
         all_scores,
         rewards_history,
-        cutoff_days=prompt_config.window_days,
+        cutoff_days=competition.window_days,
         scores_column="new_prompt_scores",
-        prompt_config=prompt_config,
+        competition=competition,
     )
     print(
         f"{log_prefix} smoothed scores done in {perf_counter()-t_smooth:.1f}s "
@@ -1232,7 +1322,7 @@ def backtest(
         flush=True,
     )
 
-    # Trim the first `prompt_config.window_days` of smoothed_scores when no
+    # Trim the first `competition.window_days` of smoothed_scores when no
     # simulate_registration is set. In that case the backfill artifact applies to
     # real late-joining miners and inflates our rank — we want to hide it.
     # When simulate_registration IS set, the backfill applies to OUR miner and
@@ -1241,7 +1331,7 @@ def backtest(
         recalculated_smoothed_scores = _trim_warmup(
             recalculated_smoothed_scores,
             all_scores,
-            warmup_days=prompt_config.window_days,
+            warmup_days=competition.window_days,
         )
 
     miner_smoothed = recalculated_smoothed_scores.loc[
@@ -1937,25 +2027,33 @@ def _compute_grand_total_weights(
 def _compute_earnings_df(
     combined: pd.DataFrame,
     miner_id: int,
-    prompt_config: PromptConfig,
     daily_pool_usd: pd.Series,
+    *,
+    share_denominator: float = SMOOTHED_SCORE_COEFFICIENT,
+    emission_factor: float = EMISSION_NORMALIZATION_FACTOR,
 ) -> pd.DataFrame:
     """Compute per-round estimated USD earnings for a single miner.
 
     Formula per round:
-      share_of_round = reward_weight / prompt_config.smoothed_score_coefficient
+      share_of_round = reward_weight / share_denominator
       usd_per_round  = reward_weight * daily_pool_usd[date] / rounds_per_day[date]
+                       * emission_factor
 
     `reward_weight` is already the miner's share of the FULL on-chain weight
-    attributable to this profile: synth.validator.moving_average.combine_moving_averages
-    sums per-profile reward_weights, and each profile's softmax contributes up
-    to `smoothed_score_coefficient` (0.5 for both LOW and HIGH today, summing
-    to 1.0 on-chain). So multiplying reward_weight by the subnet-wide daily
-    pool yields the profile's realistic USD contribution — summing the LOW
-    and HIGH charts gives the miner's total expected daily earnings.
+    attributable to this competition: synth.validator.moving_average.combine_moving_averages
+    sums per-competition reward_weights, and each competition's softmax
+    contributes up to SMOOTHED_SCORE_COEFFICIENT (1/3), the three summing to
+    1.0 on-chain. So multiplying reward_weight by the subnet-wide daily pool
+    yields the competition's realistic USD contribution — summing the three
+    competition charts gives the miner's total expected daily earnings.
+
+    Per-competition callers divide share_of_round by 1/3 (the default); the
+    grand-total caller passes share_denominator=1.0 because grand-total
+    reward_weight already sums to ~1.0. `emission_factor` scales USD to account
+    for the validator's appended owner miner (see EMISSION_NORMALIZATION_FACTOR).
 
     `share_of_round` is kept as a display-friendly intermediate ("share of this
-    profile's pool") used by the chart's top panel.
+    competition's pool") used by the chart's top panel.
 
     Rounds on dates missing from `daily_pool_usd` (API gap / recent day not yet
     populated) are dropped with a stdout warning. The returned totals reflect
@@ -1973,9 +2071,7 @@ def _compute_earnings_df(
         return our
 
     our["updated_at"] = pd.to_datetime(our["updated_at"])
-    our["share_of_round"] = (
-        our["reward_weight"] / prompt_config.smoothed_score_coefficient
-    )
+    our["share_of_round"] = our["reward_weight"] / share_denominator
     our["date"] = our["updated_at"].dt.floor("D")
 
     missing_mask = ~our["date"].isin(daily_pool_usd.index)
@@ -1997,6 +2093,7 @@ def _compute_earnings_df(
         our["reward_weight"]
         * our["date"].map(daily_pool_usd)
         / our["date"].map(rounds_per_day)
+        * emission_factor
     )
     our["usd_cumulative"] = our["usd_per_round"].cumsum()
     return our
@@ -2004,7 +2101,7 @@ def _compute_earnings_df(
 
 def plot_estimated_earnings(
     results: list[BacktestResult],
-    prompt_config: PromptConfig,
+    competition: CompetitionConfig,
     combined: pd.DataFrame,
     output_dir: Path | None = None,
 ) -> Path:
@@ -2035,7 +2132,7 @@ def plot_estimated_earnings(
     if daily_pool.empty:
         raise RuntimeError("No daily pool data available from /rewards/historical.")
 
-    earnings = _compute_earnings_df(combined, miner_id, prompt_config, daily_pool)
+    earnings = _compute_earnings_df(combined, miner_id, daily_pool)
     if earnings.empty:
         raise RuntimeError(f"Miner {miner_id} not found in combined smoothed scores.")
 
@@ -2051,7 +2148,7 @@ def plot_estimated_earnings(
     mean_daily_usd = float(daily["usd"].mean()) if not daily.empty else 0.0
     dur_days = (last_ts - first_ts).total_seconds() / 86400
     n_assets = len(results)
-    total_assets = len(prompt_config.asset_list)
+    total_assets = len(competition.asset_list)
     partial_coverage = n_assets < total_assets
 
     sns.set_theme(style="whitegrid")
@@ -2131,14 +2228,14 @@ def plot_estimated_earnings(
         if partial_coverage
         else ""
     )
-    profile_pct = prompt_config.smoothed_score_coefficient * 100
+    profile_pct = SMOOTHED_SCORE_COEFFICIENT * 100
     fig.suptitle(
-        f"Estimated earnings — {miner_name} — {prompt_config.label} "
+        f"Estimated earnings — {miner_name} — {competition.label} "
         f"({n_assets}/{total_assets} assets, {dur_days:.1f}d)\n"
         f"{partial_line}"
-        f"Uses live daily miner-pool USD × {profile_pct:.0f}% "
-        f"(this profile's on-chain weight share; sum {prompt_config.label.upper()} "
-        "+ other profile charts for total).",
+        f"reward_weight × live daily miner-pool USD × {EMISSION_NORMALIZATION_FACTOR:.4g} "
+        f"emission-normalization (realized-emission estimate; each competition's "
+        f"weight sums to {profile_pct:.0f}%, sum all competition charts for total).",
         fontsize=11,
         y=0.995,
     )
@@ -2148,7 +2245,7 @@ def plot_estimated_earnings(
     if output_dir is None:
         output_dir = DEFAULT_MINER_OUTPUT_ROOT / miner_name / "charts"
     output_dir.mkdir(parents=True, exist_ok=True)
-    chart_path = output_dir / f"estimated_earnings_{prompt_config.label}.png"
+    chart_path = output_dir / f"estimated_earnings_{slug_for(competition)}.png"
     fig.savefig(chart_path, dpi=150)
     plt.close(fig)
 
@@ -2158,7 +2255,7 @@ def plot_estimated_earnings(
         else ""
     )
     print(
-        f"\n  EARNINGS [{prompt_config.label}] total: ${total_usd:,.0f} "
+        f"\n  EARNINGS [{competition.label}] total: ${total_usd:,.0f} "
         f"over {dur_days:.1f}d (mean share {mean_share_pct:.2f}%){partial_tag}"
     )
     return chart_path
@@ -2197,14 +2294,11 @@ def plot_grand_total_earnings(
     if daily_pool.empty:
         raise RuntimeError("No daily pool data available from /rewards/historical.")
 
-    # Use a synthetic PromptConfig with smoothed_score_coefficient=1.0 so
-    # _compute_earnings_df treats grand-total reward_weight as the full share.
-    grand_config = dataclasses.replace(
-        LOW_FREQUENCY,
-        smoothed_score_coefficient=1.0,
-        label="GRAND_TOTAL",
+    # Grand-total reward_weight already sums to ~1.0 across the 3 competitions,
+    # so share_of_round divides by 1.0 (not the per-competition 1/3).
+    earnings = _compute_earnings_df(
+        grand, miner_id, daily_pool, share_denominator=1.0,
     )
-    earnings = _compute_earnings_df(grand, miner_id, grand_config, daily_pool)
     if earnings.empty:
         raise RuntimeError(f"Miner {miner_id} not found in grand-total weights.")
 
@@ -2291,9 +2385,10 @@ def plot_grand_total_earnings(
     total_assets = sum(len(rs) for rs in results_by_profile.values())
     fig.suptitle(
         f"Estimated grand-total earnings — {miner_name} — "
-        f"{len(results_by_profile)} profiles, {total_assets} assets, {dur_days:.1f}d\n"
-        f"Uses full daily miner-pool USD × grand-total share "
-        f"(sums both profile coefficients, matches real-validator weights).",
+        f"{len(results_by_profile)} competitions, {total_assets} assets, {dur_days:.1f}d\n"
+        f"grand-total reward_weight (summed across competitions, ~1.0) × live daily "
+        f"miner-pool USD × {EMISSION_NORMALIZATION_FACTOR:.4g} emission-normalization "
+        f"(realized-emission estimate).",
         fontsize=11,
         y=0.995,
     )
@@ -2316,7 +2411,7 @@ def plot_grand_total_earnings(
 
 def run_backtest(
     miner_name: str,
-    prompt_config: PromptConfig,
+    competition: CompetitionConfig,
     n_backtest_days: int,
     predictions_dir: Path | None = None,
     miner_id: int = 999,
@@ -2336,14 +2431,21 @@ def run_backtest(
       - combined: per-profile combined smoothed-scores DataFrame (empty when <2 assets)
     """
     _maybe_warn_hf_crps_formula_change(
-        prompt_config=prompt_config,
+        competition=competition,
+        n_backtest_days=n_backtest_days,
+        eval_end=eval_end,
+        simulate_registration=simulate_registration,
+        simulate_deregistration=simulate_deregistration,
+    )
+    _maybe_warn_competition_split(
+        competition=competition,
         n_backtest_days=n_backtest_days,
         eval_end=eval_end,
         simulate_registration=simulate_registration,
         simulate_deregistration=simulate_deregistration,
     )
 
-    assets = prompt_config.asset_list
+    assets = competition.asset_list
     max_workers = min(len(assets), 6)
     print(f"  Dispatching {len(assets)} assets to {max_workers} backtest workers...")
 
@@ -2355,13 +2457,13 @@ def run_backtest(
                 backtest,
                 miner_name=miner_name,
                 asset=asset,
-                time_length=prompt_config.time_length,
-                time_increment=prompt_config.time_increment,
+                time_length=competition.time_length,
+                time_increment=competition.time_increment,
                 n_backtest_days=n_backtest_days,
                 miner_id=miner_id,
                 predictions_dir=predictions_dir,
-                scoring_intervals=prompt_config.scoring_intervals,
-                prompt_config=prompt_config,
+                scoring_intervals=competition.scoring_intervals,
+                competition=competition,
                 scoring_executor=scoring_executor,
                 eval_end=eval_end,
                 simulate_registration=simulate_registration,
@@ -2374,7 +2476,7 @@ def run_backtest(
             try:
                 asset_results[asset] = future.result()
             except Exception as e:
-                print(f"\n--- BACKTEST [{prompt_config.label}/{asset}] ---")
+                print(f"\n--- BACKTEST [{competition.label}/{asset}] ---")
                 print(f"  FAILED: {e}")
 
     # Phase 2: print summaries + plot charts sequentially (matplotlib is not thread-safe)
@@ -2386,7 +2488,7 @@ def run_backtest(
         results.append(result)
         summary = result.summary
 
-        print(f"\n--- BACKTEST [{prompt_config.label}/{asset}] ---")
+        print(f"\n--- BACKTEST [{competition.label}/{asset}] ---")
         ss = result.smoothed_scores.copy()
         if not ss.empty:
             last_ts = ss["updated_at"].max()
@@ -2443,7 +2545,7 @@ def run_backtest(
         try:
             combined = compute_combined_smoothed_scores(
                 results,
-                prompt_config,
+                competition,
                 simulate_registration=simulate_registration,
             )
         except Exception as e:
@@ -2454,7 +2556,7 @@ def run_backtest(
                 total_chart = plot_total_rank_evolution(
                     results,
                     combined=combined,
-                    profile_label=prompt_config.label,
+                    profile_label=slug_for(competition),
                 )
                 print(f"  Total rank chart saved to: {total_chart}")
             except Exception as e:
@@ -2463,7 +2565,7 @@ def run_backtest(
             try:
                 earnings_chart = plot_estimated_earnings(
                     results,
-                    prompt_config=prompt_config,
+                    competition=competition,
                     combined=combined,
                 )
                 print(f"  Earnings chart saved to: {earnings_chart}")
