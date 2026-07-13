@@ -26,4 +26,4 @@ dev = [
 
 
 [tool.uv.sources]
-synth-subnet = { git = "https://github.com/synthdataco/synth-subnet" }
+synth-subnet = { git = "https://github.com/synthdataco/synth-subnet", rev = "7714c5b8b695d9c7813c58148eece3b1e6bcaa8f" }

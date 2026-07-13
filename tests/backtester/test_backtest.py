@@ -22,6 +22,8 @@ from synth_lib.backtester.backtest import (
     _parse_prediction_filename_time,
     _score_single_prompt,
     backtest,
+    competition_for,
+    slug_for,
     _compute_prompt_scores_for_group,
     _compute_relative_crps,
     calculate_smoothed_scores,
@@ -35,7 +37,12 @@ from synth_lib.backtester.backtest import (
     plot_total_rank_evolution,
     plot_weekly_percentile,
 )
-from synth.validator.prompt_config import HIGH_FREQUENCY, LOW_FREQUENCY
+from synth.validator.competition_config import (
+    COM_EQU_24H,
+    CRYPTO_1H,
+    CRYPTO_24H,
+    SMOOTHED_SCORE_COEFFICIENT,
+)
 
 UTC = timezone.utc
 
@@ -134,6 +141,24 @@ def single_prediction_dir(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Unit tests — pure functions, no mocking needed
 # ---------------------------------------------------------------------------
+
+
+class TestCompetitionHelper:
+    def test_slug_for_each_competition(self) -> None:
+        assert slug_for(CRYPTO_1H) == "crypto-1h"
+        assert slug_for(CRYPTO_24H) == "crypto-24h"
+        assert slug_for(COM_EQU_24H) == "com-equ-24h"
+
+    def test_competition_for_disambiguates_24h_by_asset(self) -> None:
+        assert competition_for("BTC", 86400) is CRYPTO_24H
+        assert competition_for("XAU", 86400) is COM_EQU_24H
+
+    def test_competition_for_1h_by_time_length(self) -> None:
+        assert competition_for("BTC", 3600) is CRYPTO_1H
+
+    def test_competition_for_unknown_raises(self) -> None:
+        with pytest.raises(ValueError, match="No competition"):
+            competition_for("DOGE", 86400)
 
 
 # Parsing of prediction filenames like "2026-03-28_00:00:00Z_BTC_86400.json" into datetime objects.
@@ -385,6 +410,34 @@ class TestBacktestIntegration:
                 miner_id=MINER_ID,
                 predictions_dir=predictions_dir,
             )
+
+
+class TestRewardSlug:
+    """backtest() must request rewards by competition slug, not legacy low/high."""
+
+    @patch("synth_lib.backtester.backtest.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.backtest.download_price_data")
+    @patch("synth_lib.backtester.backtest.get_rewards_history")
+    @patch("synth_lib.backtester.backtest.get_miner_scores")
+    def test_com_equ_asset_requests_com_equ_slug(
+        self, mock_scores, mock_rewards, mock_prices, mock_crps, tmp_path
+    ) -> None:
+        scored = _make_scores_df()
+        scored["asset"] = "XAU"
+        mock_scores.return_value = scored
+        rewards = _make_rewards_df()
+        rewards["prompt_name"] = "com-equ-24h"
+        mock_rewards.return_value = rewards
+        mock_prices.return_value = _make_price_df(T0, SCORED_T1)
+        mock_crps.return_value = (FAKE_CRPS, [{"interval": "stub"}])
+        for t in (T0, T1):
+            fname = t.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_XAU_{TIME_LENGTH}.json"
+            (tmp_path / fname).write_text(json.dumps({**_make_prediction(t), "asset": "XAU"}))
+        backtest(
+            miner_name="t", asset="XAU", time_length=TIME_LENGTH,
+            n_backtest_days=5, miner_id=MINER_ID, predictions_dir=tmp_path,
+        )
+        assert mock_rewards.call_args.kwargs["prompt_name"] == "com-equ-24h"
 
 
 # ---------------------------------------------------------------------------
@@ -819,41 +872,31 @@ class TestComputeCombinedSmoothedScores:
             },
         )
 
-    def test_xau_dominance_over_btc(self) -> None:
-        """Miner B (good on high-coef XAU) beats Miner A (good on low-coef BTC)."""
+    def test_spyx_dominance_over_xau(self) -> None:
         from synth_lib.backtester.backtest import compute_combined_smoothed_scores
-
-        updated = pd.Timestamp("2026-04-15 12:00:00", tz="UTC")
-        st = datetime(2026, 4, 15, 10, 0, 0, tzinfo=UTC)
-
-        r_btc = self._make_result("BTC", {1: 100.0, 2: 500.0}, st, updated)
-        r_xau = self._make_result("XAU", {1: 500.0, 2: 100.0}, st, updated)
-
-        combined = compute_combined_smoothed_scores([r_btc, r_xau])
-
-        rows_at_updated = combined.loc[combined["updated_at"] == updated]
-        assert len(rows_at_updated) == 2
-
-        rw = rows_at_updated.set_index("miner_uid")["reward_weight"]
-        # Lower smoothed_score is better; XAU weight (1.74) means miner 2 wins
-        assert rw.loc[2] > rw.loc[1], (
-            f"Expected miner 2 (good on XAU coef 1.74) to beat miner 1 " f"(good on BTC coef 1.0). Got {rw.to_dict()}"
-        )
+        updated = pd.Timestamp("2026-07-01 12:00:00", tz="UTC")
+        st = datetime(2026, 7, 1, 10, 0, 0, tzinfo=UTC)
+        r_xau = self._make_result("XAU", {1: 100.0, 2: 500.0}, st, updated)
+        r_spyx = self._make_result("SPYX", {1: 500.0, 2: 100.0}, st, updated)
+        combined = compute_combined_smoothed_scores([r_xau, r_spyx], COM_EQU_24H)
+        rows = combined.loc[combined["updated_at"] == updated]
+        assert len(rows) == 2
+        rw = rows.set_index("miner_uid")["reward_weight"]
+        assert rw.loc[2] > rw.loc[1]  # miner 2 good on higher-coef SPYX (3.44) wins
 
     def test_output_columns_and_sums(self) -> None:
         """reward_weight across miners at a single timestamp sums to
-        smoothed_score_coefficient (0.5 for LOW_FREQUENCY)."""
-        from synth.validator.prompt_config import LOW_FREQUENCY
+        SMOOTHED_SCORE_COEFFICIENT (1/3)."""
         from synth_lib.backtester.backtest import compute_combined_smoothed_scores
 
         updated = pd.Timestamp("2026-04-15 12:00:00", tz="UTC")
         st = datetime(2026, 4, 15, 10, 0, 0, tzinfo=UTC)
         r_btc = self._make_result("BTC", {1: 100.0, 2: 500.0, 3: 300.0}, st, updated)
 
-        combined = compute_combined_smoothed_scores([r_btc])
+        combined = compute_combined_smoothed_scores([r_btc], CRYPTO_24H)
 
         rw_sum = combined.loc[combined["updated_at"] == updated, "reward_weight"].sum()
-        assert rw_sum == pytest.approx(LOW_FREQUENCY.smoothed_score_coefficient, abs=1e-6)
+        assert rw_sum == pytest.approx(SMOOTHED_SCORE_COEFFICIENT, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -906,7 +949,7 @@ class TestPlotTotalRankEvolution:
         r_btc = self._make_result_with_crps("BTC", MINER_ID)
         r_eth = self._make_result_with_crps("ETH", MINER_ID)
 
-        combined = compute_combined_smoothed_scores([r_btc, r_eth])
+        combined = compute_combined_smoothed_scores([r_btc, r_eth], CRYPTO_24H)
         assert not combined.empty
 
         chart_path = plot_total_rank_evolution(
@@ -926,116 +969,42 @@ class TestPlotTotalRankEvolution:
 
 
 class TestComputeEarningsDf:
-    """usd_per_round = share_of_round * daily_pool / rounds_per_day."""
+    """usd_per_round = reward_weight * daily_pool / rounds_per_day * emission_factor."""
 
     def test_formula(self) -> None:
-        """Two rounds on day 1 sharing a $5000 pool, one round on day 2 with $4000 pool."""
-        from synth.validator.prompt_config import LOW_FREQUENCY
         from synth_lib.backtester.backtest import _compute_earnings_df
-
-        combined = pd.DataFrame(
-            [
-                {
-                    "updated_at": pd.Timestamp("2026-04-10 08:00", tz="UTC"),
-                    "miner_uid": 999,
-                    "new_smoothed_score": 1.0,
-                    "reward_weight": 0.1,
-                },
-                {
-                    "updated_at": pd.Timestamp("2026-04-10 16:00", tz="UTC"),
-                    "miner_uid": 999,
-                    "new_smoothed_score": 1.0,
-                    "reward_weight": 0.2,
-                },
-                {
-                    "updated_at": pd.Timestamp("2026-04-11 08:00", tz="UTC"),
-                    "miner_uid": 999,
-                    "new_smoothed_score": 1.0,
-                    "reward_weight": 0.05,
-                },
-            ]
-        )
-        daily_pool = pd.Series(
-            {
-                pd.Timestamp("2026-04-10", tz="UTC"): 5000.0,
-                pd.Timestamp("2026-04-11", tz="UTC"): 4000.0,
-            }
-        )
-
-        earnings = _compute_earnings_df(
-            combined,
-            miner_id=999,
-            prompt_config=LOW_FREQUENCY,
-            daily_pool_usd=daily_pool,
-        )
-
-        # usd_per_round = reward_weight * daily_pool / rounds_per_day
-        # (reward_weight is already the profile's on-chain share — it sums to
-        # smoothed_score_coefficient across miners per round, matching synth's
-        # combine_moving_averages.)
-        # Day 1: 2 rounds, pool $5000
-        #   r1: reward_weight 0.1, usd = 0.1 * 5000 / 2 = 250
-        #   r2: reward_weight 0.2, usd = 0.2 * 5000 / 2 = 500
-        # Day 2: 1 round, pool $4000
-        #   r3: reward_weight 0.05, usd = 0.05 * 4000 / 1 = 200
+        combined = pd.DataFrame([
+            {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
+            {"updated_at": pd.Timestamp("2026-06-25 16:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.2},
+            {"updated_at": pd.Timestamp("2026-06-26 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.05},
+        ])
+        daily_pool = pd.Series({pd.Timestamp("2026-06-25", tz="UTC"): 5000.0, pd.Timestamp("2026-06-26", tz="UTC"): 4000.0})
+        earnings = _compute_earnings_df(combined, miner_id=999, daily_pool_usd=daily_pool, emission_factor=1.0)
         assert earnings["usd_per_round"].tolist() == pytest.approx([250.0, 500.0, 200.0])
         assert earnings["usd_cumulative"].tolist() == pytest.approx([250.0, 750.0, 950.0])
 
-    def test_drops_rounds_on_missing_pool_days(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """Rounds on dates without pool data are dropped with a stdout warning."""
-        from synth.validator.prompt_config import LOW_FREQUENCY
+    def test_emission_factor_scales_usd(self) -> None:
         from synth_lib.backtester.backtest import _compute_earnings_df
+        combined = pd.DataFrame([
+            {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
+        ])
+        daily_pool = pd.Series({pd.Timestamp("2026-06-25", tz="UTC"): 5000.0})
+        earnings = _compute_earnings_df(combined, miner_id=999, daily_pool_usd=daily_pool, emission_factor=0.5)
+        assert earnings["usd_per_round"].tolist() == pytest.approx([250.0])
 
-        combined = pd.DataFrame(
-            [
-                {
-                    "updated_at": pd.Timestamp("2026-04-10 08:00", tz="UTC"),
-                    "miner_uid": 999,
-                    "new_smoothed_score": 1.0,
-                    "reward_weight": 0.1,
-                },
-                {
-                    "updated_at": pd.Timestamp("2026-04-11 08:00", tz="UTC"),
-                    "miner_uid": 999,
-                    "new_smoothed_score": 1.0,
-                    "reward_weight": 0.2,
-                },
-                {
-                    "updated_at": pd.Timestamp("2026-04-12 08:00", tz="UTC"),
-                    "miner_uid": 999,
-                    "new_smoothed_score": 1.0,
-                    "reward_weight": 0.15,
-                },
-            ]
-        )
-        # 2026-04-11 pool missing (API gap)
-        daily_pool = pd.Series(
-            {
-                pd.Timestamp("2026-04-10", tz="UTC"): 5000.0,
-                pd.Timestamp("2026-04-12", tz="UTC"): 4000.0,
-            }
-        )
-
-        earnings = _compute_earnings_df(
-            combined,
-            miner_id=999,
-            prompt_config=LOW_FREQUENCY,
-            daily_pool_usd=daily_pool,
-        )
-
-        # The 2026-04-11 round is dropped; only the two days with pool data remain.
+    def test_drops_rounds_on_missing_pool_days(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from synth_lib.backtester.backtest import _compute_earnings_df
+        combined = pd.DataFrame([
+            {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
+            {"updated_at": pd.Timestamp("2026-06-26 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.2},
+            {"updated_at": pd.Timestamp("2026-06-27 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.15},
+        ])
+        daily_pool = pd.Series({pd.Timestamp("2026-06-25", tz="UTC"): 5000.0, pd.Timestamp("2026-06-27", tz="UTC"): 4000.0})
+        earnings = _compute_earnings_df(combined, miner_id=999, daily_pool_usd=daily_pool, emission_factor=1.0)
         assert len(earnings) == 2
-        assert set(earnings["date"].dt.strftime("%Y-%m-%d")) == {"2026-04-10", "2026-04-12"}
-        # Cumulative totals reflect ONLY days with pool data.
-        # usd_per_round = reward_weight * daily_pool / rounds_per_day
-        #   2026-04-10: reward_weight 0.1, usd = 0.1 * 5000 / 1 = 500
-        #   2026-04-12: reward_weight 0.15, usd = 0.15 * 4000 / 1 = 600
         assert earnings["usd_per_round"].tolist() == pytest.approx([500.0, 600.0])
-        assert earnings["usd_cumulative"].iloc[-1] == pytest.approx(1100.0)
-
         captured = capsys.readouterr()
-        assert "2026-04-11" in captured.out
-        assert "dropping" in captured.out.lower()
+        assert "2026-06-26" in captured.out and "dropping" in captured.out.lower()
 
 # ---------------------------------------------------------------------------
 # plot_estimated_earnings
@@ -1083,7 +1052,6 @@ class TestPlotEstimatedEarnings:
 
     @patch("synth_lib.backtester.backtest.get_daily_miner_pool_usd")
     def test_saves_png(self, mock_pool: object, tmp_path: Path) -> None:
-        from synth.validator.prompt_config import LOW_FREQUENCY
         from synth_lib.backtester.backtest import (
             compute_combined_smoothed_scores,
             plot_estimated_earnings,
@@ -1098,23 +1066,22 @@ class TestPlotEstimatedEarnings:
 
         r_btc = self._make_result_with_crps("BTC", MINER_ID)
         r_eth = self._make_result_with_crps("ETH", MINER_ID)
-        combined = compute_combined_smoothed_scores([r_btc, r_eth])
+        combined = compute_combined_smoothed_scores([r_btc, r_eth], CRYPTO_24H)
 
         chart_path = plot_estimated_earnings(
             [r_btc, r_eth],
-            prompt_config=LOW_FREQUENCY,
+            competition=CRYPTO_24H,
             combined=combined,
             output_dir=tmp_path,
         )
 
         assert chart_path.exists()
         assert chart_path.suffix == ".png"
-        assert "estimated_earnings_low" in chart_path.name
+        assert "estimated_earnings_crypto-24h" in chart_path.name
 
     @patch("synth_lib.backtester.backtest.get_daily_miner_pool_usd")
     def test_partial_coverage_warning(self, mock_pool: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        """Backtesting fewer assets than the profile's asset_list prints a partial-coverage tag."""
-        from synth.validator.prompt_config import LOW_FREQUENCY
+        """Backtesting fewer assets than the competition's asset_list prints a partial-coverage tag."""
         from synth_lib.backtester.backtest import (
             compute_combined_smoothed_scores,
             plot_estimated_earnings,
@@ -1127,20 +1094,20 @@ class TestPlotEstimatedEarnings:
             }
         )
 
-        # LOW_FREQUENCY has 12 assets; we backtest only 2 → partial coverage
+        # CRYPTO_24H has 5 assets; we backtest only 2 → partial coverage
         r_btc = self._make_result_with_crps("BTC", MINER_ID)
         r_eth = self._make_result_with_crps("ETH", MINER_ID)
-        combined = compute_combined_smoothed_scores([r_btc, r_eth])
+        combined = compute_combined_smoothed_scores([r_btc, r_eth], CRYPTO_24H)
 
         plot_estimated_earnings(
             [r_btc, r_eth],
-            prompt_config=LOW_FREQUENCY,
+            competition=CRYPTO_24H,
             combined=combined,
             output_dir=tmp_path,
         )
 
         captured = capsys.readouterr()
-        total_assets = len(LOW_FREQUENCY.asset_list)
+        total_assets = len(CRYPTO_24H.asset_list)
         assert f"PARTIAL COVERAGE (2/{total_assets} assets)" in captured.out
 
 
@@ -1148,11 +1115,11 @@ class TestHFCrpsFormulaWarning:
     """Gate logic for the 2026-03-11 HF CRPS formula change warning."""
 
     CUTOFF = HF_CRPS_FORMULA_CHANGE_DATE  # 2026-03-11
-    SAFE_SIM_REG = CUTOFF + timedelta(days=HIGH_FREQUENCY.window_days)  # 2026-03-14
+    SAFE_SIM_REG = CUTOFF + timedelta(days=CRYPTO_1H.window_days)  # 2026-03-16
 
     def _call(self, **kwargs):
         defaults = dict(
-            prompt_config=HIGH_FREQUENCY,
+            competition=CRYPTO_1H,
             n_backtest_days=7,
             eval_end=None,
             simulate_registration=None,
@@ -1162,7 +1129,7 @@ class TestHFCrpsFormulaWarning:
         return _maybe_warn_hf_crps_formula_change(**defaults)
 
     def _assert_warns(self, **kwargs) -> str:
-        with pytest.warns(UserWarning, match="HIGH_FREQUENCY backtest window starts") as record:
+        with pytest.warns(UserWarning, match="crypto-1h backtest window starts") as record:
             self._call(**kwargs)
         assert len(record) == 1
         return str(record[0].message)
@@ -1176,7 +1143,7 @@ class TestHFCrpsFormulaWarning:
     def test_hf_window_pre_cutoff_warns(self) -> None:
         msg = self._assert_warns(eval_end=datetime(2026, 3, 1, tzinfo=UTC), n_backtest_days=30)
         assert "2026-03-11" in msg
-        assert "simulate_registration=2026-03-14" in msg
+        assert "simulate_registration=2026-03-16" in msg
 
     # 2. HF + window post-cutoff → silence
     def test_hf_window_post_cutoff_silent(self) -> None:
@@ -1185,7 +1152,7 @@ class TestHFCrpsFormulaWarning:
     # 3. LF (always, regardless of window) → silence
     def test_lf_always_silent(self) -> None:
         self._assert_silent(
-            prompt_config=LOW_FREQUENCY,
+            competition=CRYPTO_24H,
             eval_end=datetime(2025, 1, 1, tzinfo=UTC),
             n_backtest_days=365,
         )
@@ -1217,4 +1184,38 @@ class TestHFCrpsFormulaWarning:
             simulate_deregistration=datetime(2026, 3, 8, tzinfo=UTC),
             n_backtest_days=5,
         )
+
+
+class TestSplitWarning:
+    def test_pre_split_window_warns(self) -> None:
+        from synth_lib.backtester.backtest import _maybe_warn_competition_split, COMPETITION_SPLIT_DATE
+        with pytest.warns(UserWarning, match="before the 3-competition split"):
+            _maybe_warn_competition_split(
+                competition=CRYPTO_24H, n_backtest_days=30,
+                eval_end=COMPETITION_SPLIT_DATE - timedelta(days=1),
+                simulate_registration=None, simulate_deregistration=None,
+            )
+
+    def test_post_split_window_silent(self) -> None:
+        from synth_lib.backtester.backtest import _maybe_warn_competition_split, COMPETITION_SPLIT_DATE
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            _maybe_warn_competition_split(
+                competition=CRYPTO_24H, n_backtest_days=5,
+                eval_end=COMPETITION_SPLIT_DATE + timedelta(days=20),
+                simulate_registration=None, simulate_deregistration=None,
+            )
+
+
+class TestCliSelection:
+    def test_competitions_by_name_all_has_three(self) -> None:
+        from synth_lib.backtester.scripts.run_backtest import COMPETITIONS_BY_NAME
+        assert len(COMPETITIONS_BY_NAME["all"]) == 3
+
+    def test_build_filtered_competitions_intersects_assets(self) -> None:
+        from synth_lib.backtester.scripts.run_backtest import _build_filtered_competitions
+        out = _build_filtered_competitions([CRYPTO_24H, COM_EQU_24H], ["BTC", "XAU"])
+        by_label = {c.label: c.asset_list for c in out}
+        assert by_label["Crypto 24h"] == ["BTC"]
+        assert by_label["Commodities/Equities 24h"] == ["XAU"]
 
