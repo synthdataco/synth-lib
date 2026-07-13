@@ -19,6 +19,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import matplotlib
+
+# Charts are rendered inside worker threads; GUI backends (the macOS default)
+# can only run on the main thread, so force the non-interactive Agg backend.
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd

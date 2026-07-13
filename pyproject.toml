@@ -9,7 +9,7 @@ packages = ["synth_lib"]
 [project]
 name = "synth-lib"
 version = "0.1.0"
-description = "Add your description here"
+description = "Market-data preparation and validator-faithful backtesting for Synth Subnet miners"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
