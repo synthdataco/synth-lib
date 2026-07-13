@@ -3,6 +3,8 @@
 Tools for downloading minute-level market data and backtesting miners against
 [Synth Subnet](https://github.com/synthdataco/synth-subnet) scoring.
 
+New to mining on SN50? Start with the [miner tutorial](https://github.com/synthdataco/synth-subnet/blob/main/docs/miner_tutorial.md) — backtesting is step 2.3 of that journey.
+
 The library is organised into two pieces:
 
 - [synth_lib/preparation/market_data.py](synth_lib/preparation/market_data.py) — downloads
