@@ -65,6 +65,8 @@ from synth_lib.preparation.market_data import (
 )
 
 SYNTHDATA_API_BASE = "https://api.synthdata.co"
+# Miner-dashboard read API (shared host with the monitoring API, /v1 prefix).
+MINER_DASHBOARD_API_BASE = "https://monitoring.synthdata.co/v1"
 # Default 24h scoring intervals (crypto-24h / com-equ-24h); only used when no
 # competition is passed to backtest().
 SCORING_INTERVALS: dict[str, int] = {
@@ -119,6 +121,9 @@ COMPETITION_SPLIT_DATE = datetime(2026, 6, 23, tzinfo=UTC)
 # Synth API /validation/scores/historical has a 7-day max range.
 # We use 6-day chunks to stay safely within the limit.
 API_SCORES_PAGE_SIZE_DAYS = 6
+
+# /v1/miners/rewards/pool caps ranges at 366 days; 300-day chunks stay under it.
+API_POOL_PAGE_SIZE_DAYS = 300
 
 # -- Prediction file matching --
 # Scoring delay: the real prediction start_time is a few minutes before
@@ -534,11 +539,11 @@ def get_daily_miner_pool_usd(
     start_date: datetime,
     end_date: datetime,
 ) -> pd.Series:
-    """Fetch daily subnet miner pool USD from /rewards/historical.
+    """Fetch daily subnet miner pool USD from /v1/miners/rewards/pool.
 
-    Paginated in 6-day chunks (same as API_SCORES_PAGE_SIZE_DAYS). The endpoint's
-    asset/time_increment/time_length query params are required by the API but the
-    response is subnet-wide (verified identical across asset choices).
+    The endpoint computes the pool server-side (daily-mean SUB-50 USD rate ×
+    burn-adjusted alpha emission) over an inclusive [from, to] date range,
+    paginated here in 300-day chunks (API_POOL_PAGE_SIZE_DAYS).
 
     Returns Series indexed by date (UTC midnight, tz-aware) → USD amount.
     """
@@ -577,29 +582,17 @@ def get_daily_miner_pool_usd(
     merged: dict[pd.Timestamp, float] = {}
     cursor = start_date
     while cursor < end_date:
-        chunk_end = min(cursor + timedelta(days=API_SCORES_PAGE_SIZE_DAYS), end_date)
-        if cursor >= chunk_end:
-            break
+        chunk_end = min(cursor + timedelta(days=API_POOL_PAGE_SIZE_DAYS), end_date)
         resp = _http_get(
-            f"{SYNTHDATA_API_BASE}/rewards/historical",
+            f"{MINER_DASHBOARD_API_BASE}/miners/rewards/pool",
             params={
-                "from": cursor.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "to": chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "asset": "BTC",
-                "time_increment": 300,
-                "time_length": 86400,
+                "from": cursor.strftime("%Y-%m-%d"),
+                "to": chunk_end.strftime("%Y-%m-%d"),
             },
         )
         resp.raise_for_status()
-        data = resp.json()
-        for row in data:
-            date = pd.to_datetime(row["date"], utc=True).floor("D")
-            usd = next(
-                (x["amount"] for x in row["rewards"] if x["asset"] == "USD"),
-                None,
-            )
-            if usd is not None:
-                merged[date] = float(usd)
+        for row in resp.json()["rows"]:
+            merged[pd.to_datetime(row["date"], utc=True)] = float(row["usd"])
         cursor = chunk_end
 
     if not merged:
@@ -2087,7 +2080,7 @@ def _compute_earnings_df(
         )
         print(
             f"  Warning: dropping {int(missing_mask.sum())} round(s) on "
-            f"{len(missing_dates)} day(s) with no /rewards/historical pool data: "
+            f"{len(missing_dates)} day(s) with no /v1/miners/rewards/pool data: "
             f"{missing_dates}"
         )
         our = our.loc[~missing_mask].copy()
@@ -2117,7 +2110,7 @@ def plot_estimated_earnings(
     Panel 2: Daily earnings ($) bars, mean-daily reference.
     Panel 3: Cumulative earnings ($) line, total annotated.
 
-    Uses live subnet daily miner-pool USD via /rewards/historical. Attributes the
+    Uses live subnet daily miner-pool USD via /v1/miners/rewards/pool. Attributes the
     full daily pool to this profile; if the subnet splits the pool across high/low
     frequency prompts, the $ here is an upper bound for a single-profile run.
     """
@@ -2136,7 +2129,7 @@ def plot_estimated_earnings(
         (last_ts.floor("D") + pd.Timedelta(days=1)).to_pydatetime(),
     )
     if daily_pool.empty:
-        raise RuntimeError("No daily pool data available from /rewards/historical.")
+        raise RuntimeError("No daily pool data available from /v1/miners/rewards/pool.")
 
     earnings = _compute_earnings_df(combined, miner_id, daily_pool)
     if earnings.empty:
@@ -2298,7 +2291,7 @@ def plot_grand_total_earnings(
         (last_ts.floor("D") + pd.Timedelta(days=1)).to_pydatetime(),
     )
     if daily_pool.empty:
-        raise RuntimeError("No daily pool data available from /rewards/historical.")
+        raise RuntimeError("No daily pool data available from /v1/miners/rewards/pool.")
 
     # Grand-total reward_weight already sums to ~1.0 across the 3 competitions,
     # so share_of_round divides by 1.0 (not the per-competition 1/3).

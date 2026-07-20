@@ -3,7 +3,7 @@
 For a user-specified window, compares the backtester's USD earnings formula
 (reward_weight × daily_pool_usd / rounds_per_day, from backtest._compute_earnings_df)
 against actual on-chain USD earnings derived from /leaderboard/historical
-emissions proportionally applied to /rewards/historical USD pool.
+emissions proportionally applied to /v1/miners/rewards/pool USD pool.
 
 The comparison is per the 3-competition model (crypto-1h / crypto-24h /
 com-equ-24h). With --competition all (default) the three competitions'
@@ -185,7 +185,7 @@ def compute_actual_usd(
     if missing_days.any():
         dropped = sorted({d.date().isoformat() for d in agg.loc[missing_days, "date"]})
         print(f"  Warning: dropping {int(missing_days.sum())} miner-day rows on "
-              f"{len(dropped)} day(s) with no /rewards/historical pool data: {dropped}")
+              f"{len(dropped)} day(s) with no /v1/miners/rewards/pool data: {dropped}")
         agg = agg.loc[~missing_days].copy()
 
     return agg
@@ -231,7 +231,7 @@ def compute_backtester_usd(
     if missing.any():
         dropped = sorted({d.date().isoformat() for d in df.loc[missing, "date"]})
         print(f"  Warning: dropping {int(missing.sum())} reward rows on "
-              f"{len(dropped)} day(s) with no /rewards/historical pool data: {dropped}")
+              f"{len(dropped)} day(s) with no /v1/miners/rewards/pool data: {dropped}")
         df = df.loc[~missing].copy()
         if df.empty:
             return pd.DataFrame(columns=[
@@ -349,10 +349,10 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
 
-    print("Fetching /rewards/historical (daily USD pool) ...")
+    print("Fetching /v1/miners/rewards/pool (daily USD pool) ...")
     daily_pool = get_daily_miner_pool_usd(args.from_dt, args.to_dt)
     if daily_pool.empty:
-        print("ERROR: /rewards/historical returned no pool data for this window.", file=sys.stderr)
+        print("ERROR: /v1/miners/rewards/pool returned no pool data for this window.", file=sys.stderr)
         return 1
 
     print("Fetching /leaderboard/historical ...")
