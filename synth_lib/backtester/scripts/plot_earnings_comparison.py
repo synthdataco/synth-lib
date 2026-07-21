@@ -61,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Window: {args.from_date} → {args.to_date} ({days} days)")
 
-    print("Fetching /rewards/historical (daily USD pool) ...")
+    print("Fetching /v1/miners/rewards/pool (daily USD pool) ...")
     daily_pool = get_daily_miner_pool_usd(args.from_dt, args.to_dt)
     print("Fetching /leaderboard/historical ...")
     lb_df = fetch_leaderboard_historical(args.from_dt, args.to_dt)
