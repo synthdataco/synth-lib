@@ -58,10 +58,8 @@ from synth.validator.competition_config import (
 from synth.validator.reward import compute_prompt_scores
 
 from synth_lib.preparation.market_data import (
-    HYPERLIQUID_SYMBOLS,
-    PYTH_SYMBOLS,
-    HyperliquidClient,
     MinutePriceStore,
+    build_price_client,
 )
 
 SYNTHDATA_API_BASE = "https://api.synthdata.co"
@@ -628,15 +626,12 @@ def load_prediction(path: Path) -> dict:
 
 
 def _price_store(asset: str) -> MinutePriceStore:
-    """Return a MinutePriceStore configured for the asset's upstream (Pyth or Hyperliquid)."""
-    if asset in HYPERLIQUID_SYMBOLS:
-        return MinutePriceStore(asset, client=HyperliquidClient())
-    if asset in PYTH_SYMBOLS:
-        return MinutePriceStore(asset)
-    raise ValueError(
-        f"Unsupported asset: {asset}. "
-        f"Known Pyth: {sorted(PYTH_SYMBOLS)}; Hyperliquid: {sorted(HYPERLIQUID_SYMBOLS)}."
-    )
+    """Return a MinutePriceStore configured for the asset's upstream provider.
+
+    Provider routing (Binance / Hyperliquid / Pyth) mirrors the validator via
+    build_price_client.
+    """
+    return MinutePriceStore(asset, client=build_price_client(asset))
 
 
 def download_price_data(

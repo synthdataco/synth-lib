@@ -14,7 +14,7 @@ import requests
 UTC = timezone.utc
 
 # ---------------------------------------------------------------------------
-# Pyth symbol mapping — pulled dynamically from synth-subnet
+# Symbol mapping — pulled dynamically from synth-subnet
 # ---------------------------------------------------------------------------
 PYTH_HISTORY_URL = "https://benchmarks.pyth.network/v1/shims/tradingview/history"
 
@@ -23,8 +23,12 @@ SYNTHDATA_API_BASE = "https://api.synthdata.co"
 from synth.validator.price_data_provider import PriceDataProvider
 
 PYTH_SYMBOLS: dict[str, str] = dict(PriceDataProvider.PYTH_SYMBOL_MAP)
-HYPERLIQUID_SYMBOLS: dict[str, str] = dict(PriceDataProvider.HYPERLIQUID_SYMBOL_MAP)
-ALL_SYMBOLS: dict[str, str] = {**PYTH_SYMBOLS, **HYPERLIQUID_SYMBOLS}
+BINANCE_SYMBOLS: dict[str, str] = dict(PriceDataProvider.BINANCE_ASSET_MAP)
+HYPERLIQUID_SYMBOLS: dict[str, str] = dict(PriceDataProvider.HYPERLIQUID_ASSET_MAP)
+# Provider precedence mirrors the validator's PriceDataProvider.fetch_data
+# routing: Binance first, then Hyperliquid, then Pyth. The dict merge order below
+# lets a later provider win on any overlapping asset, matching that precedence.
+ALL_SYMBOLS: dict[str, str] = {**PYTH_SYMBOLS, **HYPERLIQUID_SYMBOLS, **BINANCE_SYMBOLS}
 
 MINUTES_PER_DAY = 24 * 60
 CONTEXT_WINDOW_MINUTES = 7 * 24 * 60
@@ -133,6 +137,44 @@ class HyperliquidClient:
         if len(timestamps) != len(closes):
             raise RuntimeError(
                 f"Hyperliquid timestamp/close length mismatch for {asset}: "
+                f"{len(timestamps)} vs {len(closes)}"
+            )
+        frame = pd.DataFrame({"timestamp": timestamps, "close": pd.Series(closes, dtype="float64")})
+        return frame.dropna(subset=["close"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Binance API client (delegates to synth.validator.price_data_provider)
+# ---------------------------------------------------------------------------
+
+
+class BinanceClient:
+    """Wrapper around synth's PriceDataProvider matching PythHistoryClient's interface."""
+
+    def __init__(self) -> None:
+        self._provider = PriceDataProvider()
+
+    def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
+        start_time = _utc_datetime(start_time)
+        end_time = _utc_datetime(end_time)
+        if asset not in BINANCE_SYMBOLS:
+            raise ValueError(f"Unsupported Binance asset: {asset}")
+
+        start_ts = int(start_time.timestamp())
+        end_ts = int(end_time.timestamp())
+        closes = self._provider.download_binance_price_data(
+            beginning=start_ts,
+            end=end_ts,
+            symbol=asset,
+            time_increment=60,
+        )
+        if not closes:
+            return pd.DataFrame(columns=["timestamp", "close"])
+
+        timestamps = pd.date_range(start_time, end_time, freq="1min", tz="UTC")
+        if len(timestamps) != len(closes):
+            raise RuntimeError(
+                f"Binance timestamp/close length mismatch for {asset}: "
                 f"{len(timestamps)} vs {len(closes)}"
             )
         frame = pd.DataFrame({"timestamp": timestamps, "close": pd.Series(closes, dtype="float64")})
@@ -297,6 +339,21 @@ def _compute_date_range(total_months: int, heldout_months: int) -> tuple[date, d
     return start_day, end_day
 
 
+def build_price_client(asset: str) -> PriceClient:
+    """Return the price client for an asset, mirroring the validator's routing.
+
+    Precedence matches PriceDataProvider.fetch_data: Binance, then Hyperliquid,
+    then Pyth.
+    """
+    if asset in BINANCE_SYMBOLS:
+        return BinanceClient()
+    if asset in HYPERLIQUID_SYMBOLS:
+        return HyperliquidClient()
+    if asset in PYTH_SYMBOLS:
+        return PythHistoryClient()
+    raise ValueError(f"Unsupported asset: {asset}. Supported: {list(ALL_SYMBOLS.keys())}")
+
+
 def download_market_data(
     asset: str = "BTC",
     total_months: int = DEFAULT_TOTAL_MONTHS,
@@ -311,11 +368,9 @@ def download_market_data(
 
     Returns the root directory containing the parquet files.
     """
-    if asset not in ALL_SYMBOLS:
-        raise ValueError(f"Unsupported asset: {asset}. Supported: {list(ALL_SYMBOLS.keys())}")
     start_day, end_day = _compute_date_range(total_months, heldout_months)
     print(f"Downloading {asset} data: {start_day} to {end_day} ({total_months} months, {heldout_months} held out)")
-    client = HyperliquidClient() if asset in HYPERLIQUID_SYMBOLS else PythHistoryClient()
+    client = build_price_client(asset)
     store = MinutePriceStore(asset, client=client)
     store.ingest_range(start_day, end_day, force_refresh=force_refresh)
     print(f"Done. Data stored in {store.root}")
@@ -333,7 +388,7 @@ def download_all_assets(
 
     Parameters
     ----------
-    assets : list of asset names to download. Defaults to all PYTH_SYMBOLS.
+    assets : list of asset names to download. Defaults to all supported assets.
     days : if set, download this many days ending today (ignores
         total_months / heldout_months).
     """
@@ -347,16 +402,14 @@ def download_all_assets(
         start_day, end_day = _compute_date_range(total_months, heldout_months)
 
     print(f"Downloading {len(asset_list)} assets: {start_day} to {end_day}")
-    hyperliquid_client = HyperliquidClient()
     results: dict[str, Path] = {}
     for asset in asset_list:
-        if asset in HYPERLIQUID_SYMBOLS:
-            store = MinutePriceStore(asset, client=hyperliquid_client)
-        elif asset in PYTH_SYMBOLS:
-            store = MinutePriceStore(asset)
-        else:
+        try:
+            client = build_price_client(asset)
+        except ValueError:
             print(f"  Skipping unsupported asset: {asset}")
             continue
+        store = MinutePriceStore(asset, client=client)
         store.ingest_range(start_day, end_day, force_refresh=force_refresh)
         results[asset] = store.root
     print("Done.")
