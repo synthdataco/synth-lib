@@ -277,8 +277,14 @@ which compares the backtester's USD against the on-chain `/leaderboard`.
 ### Long backtests / offline mode
 
 The scores endpoints reject ranges over a few days, so a long backtest (e.g.
-30 days) cannot fetch its data live in one call. Instead, download the data
-once into an **offline bundle** and point the backtester at it:
+30 days) cannot fetch its data live in one call. **`run_backtest.py` handles
+this automatically**: for `--days` above 3 it builds (or resumes) an offline
+bundle under `offline_data/auto_{end}_{days}d/` and runs against it — no extra
+steps. Pass `--no-auto-bundle` or set `SYNTH_BACKTESTER_OFFLINE_DATA_ROOT`
+yourself to override.
+
+To build a bundle manually (CI images, network-restricted sandboxes, or reuse
+across many runs), use the same machinery directly:
 
 ```bash
 # 1. Download 30 days of scores/rewards/pool in small chunks (resumable)
