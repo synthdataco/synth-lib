@@ -274,6 +274,42 @@ The absolute USD number is therefore an **estimate**; recalibrate periodically
 with [`scripts/validate_earnings_formula.py`](synth_lib/backtester/scripts/validate_earnings_formula.py),
 which compares the backtester's USD against the on-chain `/leaderboard`.
 
+### Long backtests / offline mode
+
+The scores endpoints reject ranges over a few days, so a long backtest (e.g.
+30 days) cannot fetch its data live in one call. Instead, download the data
+once into an **offline bundle** and point the backtester at it:
+
+```bash
+# 1. Download 30 days of scores/rewards/pool in small chunks (resumable)
+uv run synth_lib/backtester/scripts/build_offline_bundle.py \
+    --competition crypto-24h --days 30 --eval-end 2026-07-19
+
+# 2. Pre-download the price parquets covering the window (+ 7-day context)
+uv run synth_lib/preparation/market_data.py --days 40
+
+# 3. Run the backtest against the bundle instead of the live API
+SYNTH_BACKTESTER_OFFLINE_DATA_ROOT=offline_data/crypto-24h \
+    uv run synth_lib/backtester/scripts/run_backtest.py \
+    --miner-name my_agent --competition crypto-24h --days 30
+```
+
+With `SYNTH_BACKTESTER_OFFLINE_DATA_ROOT` set, `get_miner_scores`,
+`get_rewards_history`, and `get_daily_miner_pool_usd` read the bundled
+parquets instead of calling `api.synthdata.co`. This also makes runs
+reproducible and rate-limit-proof (prices still come from the local
+`market_data/` parquets either way). Bundle layout under the root:
+
+```
+miner_scores_{ASSET}_{competition}.parquet
+rewards_history_{competition}.parquet
+miner_pool_usd.parquet
+```
+
+Note the competition's smoothed-score window (`window_days`, 10 for the 24h
+competitions) is trimmed from the start of the backtest as warmup, so a
+30-day bundle yields ~20 days of ranked results.
+
 ## Known caveats
 
 ### crypto-1h CRPS formula change on 2026-03-11
