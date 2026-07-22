@@ -25,3 +25,4 @@ dev/
 # Data files
 market_data
 miner_outputs
+offline_data/
