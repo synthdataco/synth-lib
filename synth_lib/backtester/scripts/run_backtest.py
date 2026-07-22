@@ -32,7 +32,8 @@ from synth.validator.competition_config import (
     CRYPTO_24H,
     CompetitionConfig,
 )
-from synth_lib.backtester.backtest import slug_for
+from synth_lib.backtester.backtest import _OFFLINE_ENV_VAR, slug_for
+from synth_lib.backtester.scripts.build_offline_bundle import build_bundle
 
 UTC = timezone.utc
 NUM_SIMULATIONS = 100
@@ -42,6 +43,10 @@ COMPETITIONS_BY_NAME: dict[str, list[CompetitionConfig]] = {
     "com-equ-24h": [COM_EQU_24H],
     "all": list(ALL_COMPETITIONS),
 }
+# The scores endpoints reject ranges over ~3 days, so any longer live backtest
+# would fail mid-fetch. Beyond this, the runner auto-builds an offline bundle
+# (chunked download, resumable) and points the backtest at it.
+AUTO_BUNDLE_MIN_DAYS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +331,13 @@ def main() -> None:
         help="Simulate the miner leaving on this date. Drops our CRPS rows after "
         "this date.",
     )
+    parser.add_argument(
+        "--no-auto-bundle",
+        action="store_true",
+        help=f"Disable the automatic offline bundle for --days > {AUTO_BUNDLE_MIN_DAYS} "
+        "and fetch live (the scores API rejects ranges over a few days, so long "
+        "live runs are expected to fail).",
+    )
     args = parser.parse_args()
 
     def _parse_iso(s: str | None) -> datetime | None:
@@ -355,6 +367,39 @@ def main() -> None:
         f"{c.label}={c.asset_list}" for c in filtered_competitions
     )
     print(f"Running backtests for {args.miner_name}: {asset_summary}")
+
+    # Long backtests default to an offline bundle: the scores endpoints reject
+    # ranges over a few days, so fetching live would fail. Bundle downloads are
+    # chunked and resumable; the bundle directory is keyed by (anchor, days) so
+    # a different window never silently reuses stale files.
+    if (
+        args.days > AUTO_BUNDLE_MIN_DAYS
+        and not args.no_auto_bundle
+        and os.environ.get(_OFFLINE_ENV_VAR) is None
+    ):
+        anchor = simulate_deregistration or eval_end or datetime.now(UTC)
+        bundle_days = args.days
+        if simulate_registration is not None:
+            window_days = max(c.window_days for c in filtered_competitions)
+            bundle_days = max(
+                bundle_days, (anchor - simulate_registration).days + window_days + 1
+            )
+        root = Path("offline_data") / f"auto_{anchor:%Y%m%d}_{bundle_days}d"
+        print(
+            f"--days {args.days} exceeds the live scores-API range; building an "
+            f"offline bundle in {root} (resumable; pass --no-auto-bundle or set "
+            f"{_OFFLINE_ENV_VAR} to override)."
+        )
+        for comp in filtered_competitions:
+            build_bundle(
+                slug=slug_for(comp),
+                days=bundle_days,
+                eval_end=anchor,
+                assets=list(comp.asset_list),
+                chunk_days=2.0,
+                out=root,
+            )
+        os.environ[_OFFLINE_ENV_VAR] = str(root)
 
     predictions_dir = Path(args.predictions_dir) if args.predictions_dir else None
 
