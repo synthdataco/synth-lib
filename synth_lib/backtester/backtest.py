@@ -471,6 +471,50 @@ def get_miner_scores(
     return df
 
 
+def get_realized_path(
+    asset: str,
+    start_time: datetime,
+    time_length: int,
+    time_increment: int,
+) -> pd.Series | None:
+    """
+    GET https://api.synthdata.co/validation/realized-path
+
+    The validator's stored realized price path for one scored request — the
+    literal array its CRPS scoring consumed. `start_time` must match a scored
+    request's start (from get_miner_scores / the scored-times endpoints);
+    arbitrary timestamps return "No realized path available" -> None.
+
+    Useful when local minute-price history cannot be reconstructed from the
+    upstream providers (e.g. Hyperliquid's ~5000-candle retention makes HYPE
+    history unreachable weeks later) — per-prompt realized paths keep a
+    backtest's scoring identical to the validator's.
+
+    Returns a Series of prices indexed by UTC timestamp
+    (time_length // time_increment + 1 points), or None when unavailable.
+    """
+    start_time = start_time.replace(microsecond=0)
+    resp = _http_get(
+        f"{SYNTHDATA_API_BASE}/validation/realized-path",
+        params={
+            "asset": asset,
+            "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "time_length": time_length,
+            "time_increment": time_increment,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    prices = payload.get("real_prices")
+    if not prices:
+        return None
+    ts = pd.Timestamp(start_time)
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+    index = pd.date_range(start=ts, periods=len(prices), freq=pd.Timedelta(seconds=time_increment))
+    return pd.Series(prices, index=index, dtype=float, name="close")
+
+
 def get_rewards_history(
     start_time: datetime,
     end_time: datetime,
