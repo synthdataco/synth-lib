@@ -1219,3 +1219,52 @@ class TestCliSelection:
         assert by_label["Crypto 24h"] == ["BTC"]
         assert by_label["Commodities/Equities 24h"] == ["XAU"]
 
+
+
+class TestGetRealizedPath:
+    """GET /validation/realized-path — per-request realized paths."""
+
+    @patch("synth_lib.backtester.backtest._http_get")
+    def test_returns_indexed_series(self, mock_get: object) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                return {
+                    "start_time": "2026-07-22T17:05:00Z",
+                    "asset": "HYPE",
+                    "time_increment": 60,
+                    "time_length": 180,
+                    "real_prices": [58.1, 58.2, 58.3, 58.4],
+                }
+
+        mock_get.return_value = FakeResponse()  # type: ignore[attr-defined]
+
+        from synth_lib.backtester.backtest import get_realized_path
+
+        s = get_realized_path("HYPE", datetime(2026, 7, 22, 17, 5, tzinfo=UTC), 180, 60)
+        assert s is not None
+        assert len(s) == 4
+        assert s.index[0] == pd.Timestamp("2026-07-22T17:05:00Z")
+        assert s.index[-1] == pd.Timestamp("2026-07-22T17:08:00Z")
+        assert float(s.iloc[-1]) == 58.4
+
+    @patch("synth_lib.backtester.backtest._http_get")
+    def test_unavailable_returns_none(self, mock_get: object) -> None:
+        class FakeResponse:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict:
+                return {"message": "No realized path available"}
+
+        mock_get.return_value = FakeResponse()  # type: ignore[attr-defined]
+
+        from synth_lib.backtester.backtest import get_realized_path
+
+        assert get_realized_path("HYPE", datetime(2026, 3, 25, 2, 39, tzinfo=UTC), 3600, 60) is None
