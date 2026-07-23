@@ -22,24 +22,17 @@ SYNTHDATA_API_BASE = "https://api.synthdata.co"
 
 from synth.validator.price_data_provider import PriceDataProvider
 
-# --- SPCX price-source override --------------------------------------------
-# synth maps SPCX to the Pyth feed "Pyth.HL.SPCX/USDC", which the validator reads
-# via Pyth Pro (fixed-rate 200 ms). The FREE Pyth benchmarks shim this backtester
-# uses returns no data for Pyth.HL.* feeds, so SPCX ingested via Pyth is empty.
-# Hyperliquid serves the same SPCX/USDC market under coin "xyz:SPCX" with real
-# 1-minute candles (SPCX began trading ~2026-07-19), so route SPCX to Hyperliquid
-# for local ingestion — the same path as WTIOIL -> xyz:CL. The setdefault also
-# teaches synth's delegated fetch (download_hyperliquid_price_data, which maps
-# asset -> coin via this same dict) how to resolve SPCX.
-PriceDataProvider.HYPERLIQUID_SYMBOL_MAP.setdefault("SPCX", "xyz:SPCX")
-
-PYTH_SYMBOLS: dict[str, str] = {
-    asset: symbol
-    for asset, symbol in PriceDataProvider.PYTH_SYMBOL_MAP.items()
-    if asset != "SPCX"
-}
-HYPERLIQUID_SYMBOLS: dict[str, str] = dict(PriceDataProvider.HYPERLIQUID_SYMBOL_MAP)
-ALL_SYMBOLS: dict[str, str] = {**PYTH_SYMBOLS, **HYPERLIQUID_SYMBOLS}
+# Provider symbol maps, mirrored 1:1 from synth-subnet. The validator's
+# fetch_data routes each asset by precedence Binance -> Hyperliquid -> Pyth, and
+# build_price_client() below mirrors that. As of the PR #304 feed migration the
+# split is: crypto majors (BTC/ETH/SOL/XRP) from Binance; HYPE plus every
+# commodity/equity — XAU, NVDAX, TSLAX, AAPLX, GOOGLX, WTIOIL, SPCX and SP500
+# (coin xyz:SP500, which replaces the tokenized SPY) — from Hyperliquid; only the
+# deprecated SPYX rollout tail from Pyth.
+BINANCE_SYMBOLS: dict[str, str] = dict(PriceDataProvider.BINANCE_ASSET_MAP)
+HYPERLIQUID_SYMBOLS: dict[str, str] = dict(PriceDataProvider.HYPERLIQUID_ASSET_MAP)
+PYTH_SYMBOLS: dict[str, str] = dict(PriceDataProvider.PYTH_SYMBOL_MAP)
+ALL_SYMBOLS: dict[str, str] = {**BINANCE_SYMBOLS, **HYPERLIQUID_SYMBOLS, **PYTH_SYMBOLS}
 
 MINUTES_PER_DAY = 24 * 60
 CONTEXT_WINDOW_MINUTES = 7 * 24 * 60
@@ -173,6 +166,8 @@ class HyperliquidClient:
 class BinanceClient:
     """Wrapper around synth's PriceDataProvider matching PythHistoryClient's interface."""
 
+    source_name = "binance"
+
     def __init__(self) -> None:
         self._provider = PriceDataProvider()
 
@@ -184,12 +179,18 @@ class BinanceClient:
 
         start_ts = int(start_time.timestamp())
         end_ts = int(end_time.timestamp())
-        closes = self._provider.download_binance_price_data(
-            beginning=start_ts,
-            end=end_ts,
-            symbol=asset,
-            time_increment=60,
-        )
+        try:
+            closes = self._provider.download_binance_price_data(
+                beginning=start_ts,
+                end=end_ts,
+                symbol=asset,
+                time_increment=60,
+            )
+        except ValueError:
+            # No settled Binance candles for this window (unsettled current day or
+            # a gap) — treat as "no data" so the day ingests as NaN instead of
+            # crashing, matching the Hyperliquid path.
+            return pd.DataFrame(columns=["timestamp", "close"])
         if not closes:
             return pd.DataFrame(columns=["timestamp", "close"])
 
