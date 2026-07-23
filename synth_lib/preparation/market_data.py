@@ -22,13 +22,17 @@ SYNTHDATA_API_BASE = "https://api.synthdata.co"
 
 from synth.validator.price_data_provider import PriceDataProvider
 
-PYTH_SYMBOLS: dict[str, str] = dict(PriceDataProvider.PYTH_SYMBOL_MAP)
+# Provider symbol maps, mirrored 1:1 from synth-subnet. The validator's
+# fetch_data routes each asset by precedence Binance -> Hyperliquid -> Pyth, and
+# build_price_client() below mirrors that. As of the PR #304 feed migration the
+# split is: crypto majors (BTC/ETH/SOL/XRP) from Binance; HYPE plus every
+# commodity/equity — XAU, NVDAX, TSLAX, AAPLX, GOOGLX, WTIOIL, SPCX and SP500
+# (coin xyz:SP500, which replaces the tokenized SPY) — from Hyperliquid; only the
+# deprecated SPYX rollout tail from Pyth.
 BINANCE_SYMBOLS: dict[str, str] = dict(PriceDataProvider.BINANCE_ASSET_MAP)
 HYPERLIQUID_SYMBOLS: dict[str, str] = dict(PriceDataProvider.HYPERLIQUID_ASSET_MAP)
-# Provider precedence mirrors the validator's PriceDataProvider.fetch_data
-# routing: Binance first, then Hyperliquid, then Pyth. The dict merge order below
-# lets a later provider win on any overlapping asset, matching that precedence.
-ALL_SYMBOLS: dict[str, str] = {**PYTH_SYMBOLS, **HYPERLIQUID_SYMBOLS, **BINANCE_SYMBOLS}
+PYTH_SYMBOLS: dict[str, str] = dict(PriceDataProvider.PYTH_SYMBOL_MAP)
+ALL_SYMBOLS: dict[str, str] = {**BINANCE_SYMBOLS, **HYPERLIQUID_SYMBOLS, **PYTH_SYMBOLS}
 
 MINUTES_PER_DAY = 24 * 60
 CONTEXT_WINDOW_MINUTES = 7 * 24 * 60
@@ -71,6 +75,8 @@ class PythHistoryClient:
     """
 
     MAX_DAYS_PER_REQUEST = 5
+
+    source_name = "pyth"
 
     def __init__(self, timeout_seconds: int = 30, max_retries: int = 3):
         self.timeout_seconds = timeout_seconds
@@ -148,6 +154,8 @@ class PythHistoryClient:
 class HyperliquidClient:
     """Wrapper around synth's PriceDataProvider matching PythHistoryClient's interface."""
 
+    source_name = "hyperliquid"
+
     def __init__(self) -> None:
         self._provider = PriceDataProvider()
 
@@ -159,12 +167,19 @@ class HyperliquidClient:
 
         start_ts = int(start_time.timestamp())
         end_ts = int(end_time.timestamp())
-        closes = self._provider.download_hyperliquid_price_data(
-            beginning=start_ts,
-            end=end_ts,
-            symbol=asset,
-            time_increment=60,
-        )
+        try:
+            closes = self._provider.download_hyperliquid_price_data(
+                beginning=start_ts,
+                end=end_ts,
+                symbol=asset,
+                time_increment=60,
+            )
+        except ValueError:
+            # No settled Hyperliquid candles for this window — e.g. the asset was
+            # not yet listed (SPCX before ~2026-07-19) or a market-closure gap.
+            # Treat as "no data" so the day ingests as NaN (downstream scoring
+            # tolerates NaN per-prompt) instead of crashing the backtest.
+            return pd.DataFrame(columns=["timestamp", "close"])
         if not closes:
             return pd.DataFrame(columns=["timestamp", "close"])
 
@@ -186,6 +201,8 @@ class HyperliquidClient:
 class BinanceClient:
     """Wrapper around synth's PriceDataProvider matching PythHistoryClient's interface."""
 
+    source_name = "binance"
+
     def __init__(self) -> None:
         self._provider = PriceDataProvider()
 
@@ -197,12 +214,18 @@ class BinanceClient:
 
         start_ts = int(start_time.timestamp())
         end_ts = int(end_time.timestamp())
-        closes = self._provider.download_binance_price_data(
-            beginning=start_ts,
-            end=end_ts,
-            symbol=asset,
-            time_increment=60,
-        )
+        try:
+            closes = self._provider.download_binance_price_data(
+                beginning=start_ts,
+                end=end_ts,
+                symbol=asset,
+                time_increment=60,
+            )
+        except ValueError:
+            # No settled Binance candles for this window (unsettled current day or
+            # a gap) — treat as "no data" so the day ingests as NaN instead of
+            # crashing, matching the Hyperliquid path.
+            return pd.DataFrame(columns=["timestamp", "close"])
         if not closes:
             return pd.DataFrame(columns=["timestamp", "close"])
 
@@ -273,7 +296,7 @@ class MinutePriceStore:
             fetched = fetched.set_index("timestamp")
         frame = pd.DataFrame(index=expected_index)
         frame["close"] = fetched["close"].reindex(expected_index) if not fetched.empty else pd.NA
-        frame["source"] = "pyth"
+        frame["source"] = getattr(self.client, "source_name", "pyth")
         frame["ingested_at"] = datetime.now(tz=UTC).replace(microsecond=0)
         frame["is_final"] = bool(is_final)
         frame = frame.reset_index(names="timestamp")

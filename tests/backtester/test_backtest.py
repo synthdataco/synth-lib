@@ -747,8 +747,8 @@ class TestGetDailyMinerPoolUsd:
             def raise_for_status(self) -> None:
                 pass
 
-            def json(self) -> list[dict]:
-                return []
+            def json(self) -> dict:
+                return {"source": "test", "rows": []}
 
         mock_get.return_value = FakeResponse()  # type: ignore[attr-defined]
 
@@ -764,7 +764,8 @@ class TestGetDailyMinerPoolUsd:
 
     @patch("synth_lib.backtester.backtest._http_get")
     def test_paginates_multi_chunk_window(self, mock_get: object) -> None:
-        """A 14-day window paginates into 3 chunks (6 + 6 + 2 days); cursor advances and rows merge."""
+        """A window longer than API_POOL_PAGE_SIZE_DAYS (300 days) paginates into
+        multiple 300-day chunks; rows ({date, usd}) merge into a sorted Series."""
 
         class FakeResponse:
             def __init__(self, rows: list[dict]) -> None:
@@ -774,55 +775,40 @@ class TestGetDailyMinerPoolUsd:
             def raise_for_status(self) -> None:
                 pass
 
-            def json(self) -> list[dict]:
-                return self._rows
+            def json(self) -> dict:
+                return {"source": "test", "rows": self._rows}
 
         def _row(date_str: str, usd: float) -> dict:
-            return {
-                "date": f"{date_str}T00:00:00Z",
-                "rewards": [{"asset": "USD", "amount": usd}],
-            }
+            return {"date": date_str, "usd": usd}
 
+        # 335-day window (2026-01-01 → 2026-12-01) → 2 chunks: 300 days then 34.
         mock_get.side_effect = [  # type: ignore[attr-defined]
-            FakeResponse([_row("2026-04-01", 1000.0), _row("2026-04-06", 1500.0)]),
-            FakeResponse([_row("2026-04-07", 2000.0), _row("2026-04-12", 2500.0)]),
-            FakeResponse([_row("2026-04-13", 3000.0), _row("2026-04-14", 3500.0)]),
+            FakeResponse([_row("2026-01-01", 1000.0)]),
+            FakeResponse([_row("2026-11-15", 3500.0)]),
         ]
 
         from synth_lib.backtester.backtest import get_daily_miner_pool_usd
 
         result = get_daily_miner_pool_usd(
-            datetime(2026, 4, 1, tzinfo=UTC),
-            datetime(2026, 4, 15, tzinfo=UTC),
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 12, 1, tzinfo=UTC),
         )
 
-        # All three chunks were fetched
-        assert mock_get.call_count == 3  # type: ignore[attr-defined]
-
-        # Cursor advances correctly across chunks — verify each call's from/to params
+        # Two 300-day-capped chunks were fetched, dates formatted YYYY-MM-DD
+        assert mock_get.call_count == 2  # type: ignore[attr-defined]
         params_per_call = [c.kwargs["params"] for c in mock_get.call_args_list]  # type: ignore[attr-defined]
-        assert params_per_call[0]["from"] == "2026-04-01T00:00:00Z"
-        assert params_per_call[0]["to"] == "2026-04-07T00:00:00Z"
-        assert params_per_call[1]["from"] == "2026-04-07T00:00:00Z"
-        assert params_per_call[1]["to"] == "2026-04-13T00:00:00Z"
-        assert params_per_call[2]["from"] == "2026-04-13T00:00:00Z"
-        assert params_per_call[2]["to"] == "2026-04-15T00:00:00Z"
+        assert params_per_call[0]["from"] == "2026-01-01"
+        assert params_per_call[0]["to"] == "2026-10-28"
+        assert params_per_call[1]["from"] == "2026-10-28"
+        assert params_per_call[1]["to"] == "2026-12-01"
 
-        # All 6 rows across the 3 chunks merged into a sorted Series
-        assert len(result) == 6
+        # The two USD rows merged into a sorted Series
         assert list(result.index) == [
-            pd.Timestamp(d, tz="UTC")
-            for d in [
-                "2026-04-01",
-                "2026-04-06",
-                "2026-04-07",
-                "2026-04-12",
-                "2026-04-13",
-                "2026-04-14",
-            ]
+            pd.Timestamp("2026-01-01", tz="UTC"),
+            pd.Timestamp("2026-11-15", tz="UTC"),
         ]
-        assert result.loc[pd.Timestamp("2026-04-01", tz="UTC")] == pytest.approx(1000.0)
-        assert result.loc[pd.Timestamp("2026-04-14", tz="UTC")] == pytest.approx(3500.0)
+        assert result.loc[pd.Timestamp("2026-01-01", tz="UTC")] == pytest.approx(1000.0)
+        assert result.loc[pd.Timestamp("2026-11-15", tz="UTC")] == pytest.approx(3500.0)
 
 
 # ---------------------------------------------------------------------------

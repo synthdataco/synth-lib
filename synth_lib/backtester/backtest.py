@@ -118,7 +118,7 @@ COMPETITION_SPLIT_DATE = datetime(2026, 6, 23, tzinfo=UTC)
 # -- Pagination limits (empirical — not confirmed from API docs) --
 # Synth API /validation/scores/historical has a 7-day max range.
 # We use 6-day chunks to stay safely within the limit.
-API_SCORES_PAGE_SIZE_DAYS = 6
+API_SCORES_PAGE_SIZE_DAYS = 1  # /validation/scores/historical: "to" = inclusive whole day; >2d spans 400. Endpoint thins crypto-1h prompts to ~10-min density (~144/day, full 256-miner field each) at ANY range size. 1-day pages + drop_duplicates = full accessible coverage.
 
 # /v1/miners/rewards/pool caps ranges at 366 days; 300-day chunks stay under it.
 API_POOL_PAGE_SIZE_DAYS = 300
