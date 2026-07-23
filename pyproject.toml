@@ -9,7 +9,7 @@ packages = ["synth_lib"]
 [project]
 name = "synth-lib"
 version = "0.1.0"
-description = "Add your description here"
+description = "Market-data preparation and validator-faithful backtesting for Synth Subnet miners"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -26,4 +26,4 @@ dev = [
 
 
 [tool.uv.sources]
-synth-subnet = { git = "https://github.com/synthdataco/synth-subnet", rev = "7714c5b8b695d9c7813c58148eece3b1e6bcaa8f" }
+synth-subnet = { git = "https://github.com/synthdataco/synth-subnet", rev = "0d014cbcec376b28e887403b84025ebf1a89f60e" }
