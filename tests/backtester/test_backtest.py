@@ -764,7 +764,9 @@ class TestGetDailyMinerPoolUsd:
 
     @patch("synth_lib.backtester.backtest._http_get")
     def test_paginates_multi_chunk_window(self, mock_get: object) -> None:
-        """A 14-day window paginates into 3 chunks (6 + 6 + 2 days); cursor advances and rows merge."""
+        """A 14-day window paginates into 14 one-day chunks
+        (API_SCORES_PAGE_SIZE_DAYS=1); the cursor advances one day at a time and
+        rows merge into a sorted Series."""
 
         class FakeResponse:
             def __init__(self, rows: list[dict]) -> None:
@@ -783,11 +785,18 @@ class TestGetDailyMinerPoolUsd:
                 "rewards": [{"asset": "USD", "amount": usd}],
             }
 
-        mock_get.side_effect = [  # type: ignore[attr-defined]
-            FakeResponse([_row("2026-04-01", 1000.0), _row("2026-04-06", 1500.0)]),
-            FakeResponse([_row("2026-04-07", 2000.0), _row("2026-04-12", 2500.0)]),
-            FakeResponse([_row("2026-04-13", 3000.0), _row("2026-04-14", 3500.0)]),
-        ]
+        # One response per 1-day chunk (04-01..04-14 = 14 chunks). Put a USD row
+        # on the first and last day; the rest are empty.
+        responses = []
+        for d in range(1, 15):
+            day = f"2026-04-{d:02d}"
+            if day == "2026-04-01":
+                responses.append(FakeResponse([_row("2026-04-01", 1000.0)]))
+            elif day == "2026-04-14":
+                responses.append(FakeResponse([_row("2026-04-14", 3500.0)]))
+            else:
+                responses.append(FakeResponse([]))
+        mock_get.side_effect = responses  # type: ignore[attr-defined]
 
         from synth_lib.backtester.backtest import get_daily_miner_pool_usd
 
@@ -796,30 +805,20 @@ class TestGetDailyMinerPoolUsd:
             datetime(2026, 4, 15, tzinfo=UTC),
         )
 
-        # All three chunks were fetched
-        assert mock_get.call_count == 3  # type: ignore[attr-defined]
+        # 14 one-day chunks were fetched
+        assert mock_get.call_count == 14  # type: ignore[attr-defined]
 
-        # Cursor advances correctly across chunks — verify each call's from/to params
+        # Cursor advances one day at a time — spot-check the first and last chunk
         params_per_call = [c.kwargs["params"] for c in mock_get.call_args_list]  # type: ignore[attr-defined]
         assert params_per_call[0]["from"] == "2026-04-01T00:00:00Z"
-        assert params_per_call[0]["to"] == "2026-04-07T00:00:00Z"
-        assert params_per_call[1]["from"] == "2026-04-07T00:00:00Z"
-        assert params_per_call[1]["to"] == "2026-04-13T00:00:00Z"
-        assert params_per_call[2]["from"] == "2026-04-13T00:00:00Z"
-        assert params_per_call[2]["to"] == "2026-04-15T00:00:00Z"
+        assert params_per_call[0]["to"] == "2026-04-02T00:00:00Z"
+        assert params_per_call[13]["from"] == "2026-04-14T00:00:00Z"
+        assert params_per_call[13]["to"] == "2026-04-15T00:00:00Z"
 
-        # All 6 rows across the 3 chunks merged into a sorted Series
-        assert len(result) == 6
+        # The two USD rows merged into a sorted Series
         assert list(result.index) == [
-            pd.Timestamp(d, tz="UTC")
-            for d in [
-                "2026-04-01",
-                "2026-04-06",
-                "2026-04-07",
-                "2026-04-12",
-                "2026-04-13",
-                "2026-04-14",
-            ]
+            pd.Timestamp("2026-04-01", tz="UTC"),
+            pd.Timestamp("2026-04-14", tz="UTC"),
         ]
         assert result.loc[pd.Timestamp("2026-04-01", tz="UTC")] == pytest.approx(1000.0)
         assert result.loc[pd.Timestamp("2026-04-14", tz="UTC")] == pytest.approx(3500.0)
