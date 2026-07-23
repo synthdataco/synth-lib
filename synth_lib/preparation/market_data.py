@@ -22,7 +22,22 @@ SYNTHDATA_API_BASE = "https://api.synthdata.co"
 
 from synth.validator.price_data_provider import PriceDataProvider
 
-PYTH_SYMBOLS: dict[str, str] = dict(PriceDataProvider.PYTH_SYMBOL_MAP)
+# --- SPCX price-source override --------------------------------------------
+# synth maps SPCX to the Pyth feed "Pyth.HL.SPCX/USDC", which the validator reads
+# via Pyth Pro (fixed-rate 200 ms). The FREE Pyth benchmarks shim this backtester
+# uses returns no data for Pyth.HL.* feeds, so SPCX ingested via Pyth is empty.
+# Hyperliquid serves the same SPCX/USDC market under coin "xyz:SPCX" with real
+# 1-minute candles (SPCX began trading ~2026-07-19), so route SPCX to Hyperliquid
+# for local ingestion — the same path as WTIOIL -> xyz:CL. The setdefault also
+# teaches synth's delegated fetch (download_hyperliquid_price_data, which maps
+# asset -> coin via this same dict) how to resolve SPCX.
+PriceDataProvider.HYPERLIQUID_SYMBOL_MAP.setdefault("SPCX", "xyz:SPCX")
+
+PYTH_SYMBOLS: dict[str, str] = {
+    asset: symbol
+    for asset, symbol in PriceDataProvider.PYTH_SYMBOL_MAP.items()
+    if asset != "SPCX"
+}
 HYPERLIQUID_SYMBOLS: dict[str, str] = dict(PriceDataProvider.HYPERLIQUID_SYMBOL_MAP)
 ALL_SYMBOLS: dict[str, str] = {**PYTH_SYMBOLS, **HYPERLIQUID_SYMBOLS}
 
@@ -57,6 +72,8 @@ class PriceClient(Protocol):
 
 class PythHistoryClient:
     """Thin client for the Pyth minute-price endpoint with retry logic."""
+
+    source_name = "pyth"
 
     def __init__(self, timeout_seconds: int = 30, max_retries: int = 3):
         self.timeout_seconds = timeout_seconds
@@ -109,6 +126,8 @@ class PythHistoryClient:
 class HyperliquidClient:
     """Wrapper around synth's PriceDataProvider matching PythHistoryClient's interface."""
 
+    source_name = "hyperliquid"
+
     def __init__(self) -> None:
         self._provider = PriceDataProvider()
 
@@ -120,12 +139,19 @@ class HyperliquidClient:
 
         start_ts = int(start_time.timestamp())
         end_ts = int(end_time.timestamp())
-        closes = self._provider.download_hyperliquid_price_data(
-            beginning=start_ts,
-            end=end_ts,
-            symbol=asset,
-            time_increment=60,
-        )
+        try:
+            closes = self._provider.download_hyperliquid_price_data(
+                beginning=start_ts,
+                end=end_ts,
+                symbol=asset,
+                time_increment=60,
+            )
+        except ValueError:
+            # No settled Hyperliquid candles for this window — e.g. the asset was
+            # not yet listed (SPCX before ~2026-07-19) or a market-closure gap.
+            # Treat as "no data" so the day ingests as NaN (downstream scoring
+            # tolerates NaN per-prompt) instead of crashing the backtest.
+            return pd.DataFrame(columns=["timestamp", "close"])
         if not closes:
             return pd.DataFrame(columns=["timestamp", "close"])
 
@@ -196,7 +222,7 @@ class MinutePriceStore:
             fetched = fetched.set_index("timestamp")
         frame = pd.DataFrame(index=expected_index)
         frame["close"] = fetched["close"].reindex(expected_index) if not fetched.empty else pd.NA
-        frame["source"] = "pyth"
+        frame["source"] = getattr(self.client, "source_name", "pyth")
         frame["ingested_at"] = datetime.now(tz=UTC).replace(microsecond=0)
         frame["is_final"] = bool(is_final)
         frame = frame.reset_index(names="timestamp")
