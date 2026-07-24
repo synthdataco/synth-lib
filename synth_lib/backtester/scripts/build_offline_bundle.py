@@ -34,6 +34,7 @@ from time import sleep
 from typing import Callable
 
 import pandas as pd
+import requests
 
 from synth_lib.backtester.backtest import (
     SLUG_TO_COMPETITION,
@@ -67,6 +68,15 @@ def fetch_chunked(
             try:
                 df = fetch(cursor, chunk_end)
                 break
+            except requests.HTTPError as e:
+                # A 404 means the endpoint has no rows for this range — the asset was
+                # not yet listed in the competition (assets are added mid-window).
+                # Treat it as an empty chunk, not a transient error.
+                if e.response is not None and e.response.status_code == 404:
+                    df = pd.DataFrame()
+                    break
+                print(f"  {label} [{cursor:%m-%d} -> {chunk_end:%m-%d}] attempt {attempt + 1} failed: {e}")
+                sleep(10 * (attempt + 1))
             except Exception as e:  # noqa: BLE001 - transient API errors, retried
                 print(f"  {label} [{cursor:%m-%d} -> {chunk_end:%m-%d}] attempt {attempt + 1} failed: {e}")
                 sleep(10 * (attempt + 1))
