@@ -63,9 +63,9 @@ def get_miner_scores(
     time_length: int,
     time_increment: int,
 ) -> pd.DataFrame:
-    """
-    GET https://api.synthdata.co/validation/scores/historical
-    API has a 7-day max range, so we paginate in 7-day chunks.
+    """GET https://api.synthdata.co/validation/scores/historical.
+
+    API ranges are paginated in API_SCORES_PAGE_SIZE_DAYS-day chunks.
     Returns DataFrame with columns: miner_uid, asset, crps, scored_time, time_length,
     time_increment, start_time (derived).
     """
