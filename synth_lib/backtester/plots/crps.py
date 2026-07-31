@@ -50,15 +50,20 @@ def _compute_relative_crps(result: BacktestResult) -> pd.DataFrame:
 
     # Percentile rank: what fraction of miners we beat at each scored_time
     # Lower CRPS = better, so rank ascending. percentile = (rank-1)/(n-1)*100
-    ranks = []
-    for st in merged["scored_time"]:
-        all_at_st = df.loc[df["scored_time"] == st, "crps"]
-        our_val = merged.loc[merged["scored_time"] == st, "our_crps"].iloc[0]
-        n = len(all_at_st)
-        rank = (all_at_st < our_val).sum() + 1  # 1-based rank, ascending
-        pct = (rank - 1) / (n - 1) * 100 if n > 1 else 0.0
-        ranks.append(pct)
-    merged["percentile_rank"] = ranks
+    df = df.copy()
+    df["_rank"] = df.groupby("scored_time")["crps"].rank(method="min", ascending=True)
+    group_sizes = df.groupby("scored_time")["crps"].size().rename("_n")
+    ours_rank = df.loc[df["miner_uid"] == miner_id, ["scored_time", "_rank"]]
+    merged = (
+        merged.merge(ours_rank, on="scored_time", how="left")
+        .merge(group_sizes, on="scored_time", how="left")
+    )
+    merged["percentile_rank"] = np.where(
+        merged["_n"] > 1,
+        (merged["_rank"] - 1) / (merged["_n"] - 1) * 100,
+        0.0,
+    )
+    merged = merged.drop(columns=["_rank", "_n"])
 
     # Time-derived columns
     merged["hour"] = merged["scored_time"].dt.hour
