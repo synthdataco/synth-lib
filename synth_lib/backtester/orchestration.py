@@ -67,7 +67,7 @@ def backtest(
     asset: str = "BTC",
     *,
     time_length: int,
-    time_increment: int = None,
+    time_increment: int | None = None,
     n_backtest_days: int = 15,
     miner_id: int = 999,
     predictions_dir: Path | None = None,
@@ -83,6 +83,8 @@ def backtest(
     """
     if competition is None:
         competition = competition_for(asset, time_length)
+    if time_increment is None:
+        time_increment = competition.time_increment
     if scoring_intervals is None:
         scoring_intervals = competition.scoring_intervals
 
