@@ -142,9 +142,9 @@ def get_rewards_history(
     end_time: datetime,
     prompt_name: str | None = None,
 ) -> pd.DataFrame:
-    """
-    GET https://api.synthdata.co/rewards/scores
-    API has a 7-day max range, so we paginate in 7-day chunks.
+    """GET https://api.synthdata.co/rewards/scores.
+
+    API ranges are paginated in API_SCORES_PAGE_SIZE_DAYS-day chunks.
     Returns DataFrame with columns: miner_uid, smoothed_score, reward_weight,
     prompt_name, updated_at.
     """
