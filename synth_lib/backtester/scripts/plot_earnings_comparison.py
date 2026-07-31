@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from synth_lib.backtester.backtest import get_daily_miner_pool_usd, get_rewards_history
+from synth_lib.backtester.loading import get_daily_miner_pool_usd, get_rewards_history
 from synth_lib.backtester.scripts.validate_earnings_formula import (
     COMPETITION_SLUGS,
     compute_actual_usd,

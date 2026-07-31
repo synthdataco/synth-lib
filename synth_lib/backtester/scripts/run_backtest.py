@@ -25,6 +25,9 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 from synth.validator.competition_config import (
     ALL_COMPETITIONS,
     COM_EQU_24H,
@@ -32,8 +35,14 @@ from synth.validator.competition_config import (
     CRYPTO_24H,
     CompetitionConfig,
 )
-from synth_lib.backtester.backtest import _OFFLINE_ENV_VAR, slug_for
+from synth_lib.backtester.config import _OFFLINE_ENV_VAR, slug_for
+from synth_lib.backtester.loading import download_price_data, get_miner_scores
 from synth_lib.backtester.scripts.build_offline_bundle import build_bundle
+from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS
+from synth_lib.preparation.realized_path_store import (
+    RealizedPathStore,
+    prefetch_realized_paths,
+)
 
 UTC = timezone.utc
 NUM_SIMULATIONS = 100
@@ -62,8 +71,6 @@ def _generate_random_prediction(
     time_increment: int,
 ) -> dict:
     """Generate random-walk price paths from current_price."""
-    import numpy as np
-
     num_steps = time_length // time_increment
     returns = np.random.normal(0, 0.001, size=(NUM_SIMULATIONS, num_steps))
     cumulative = np.cumsum(returns, axis=1)
@@ -88,8 +95,6 @@ def _generate_random_predictions(
     time_increment: int,
 ) -> None:
     """Fetch scored prompt times from the API, generate random predictions into output_dir."""
-    from synth_lib.backtester.backtest import download_price_data, get_miner_scores
-
     now = datetime.now(UTC)
     query_start = now - timedelta(days=days)
 
@@ -116,12 +121,32 @@ def _generate_random_predictions(
     price_end = max(start_times) + timedelta(seconds=time_length) + timedelta(hours=1)
     prices = download_price_data(price_start, price_end, asset, freq="1min")
 
-    generated = 0
-    for st in start_times:
-        ts = st.to_pydatetime().replace(tzinfo=UTC)
+    def _local_start_price(ts: datetime) -> float:
         try:
-            current_price = float(prices.loc[:ts].iloc[-1]["close"])
+            value = prices.loc[:ts].iloc[-1]["close"]
         except (IndexError, KeyError):
+            return float("nan")
+        # Older object-dtype partitions read back as None, which float() rejects.
+        return float(value) if pd.notna(value) else float("nan")
+
+    prompt_times = [st.to_pydatetime().replace(tzinfo=UTC) for st in start_times]
+
+    # Beyond Hyperliquid's ~3.5-day retention the start price comes from the
+    # realized path's first point. Only prompts missing locally are fetched.
+    realized: RealizedPathStore | None = None
+    unpriced = [ts for ts in prompt_times if not np.isfinite(_local_start_price(ts))]
+    if unpriced and asset in HYPERLIQUID_SYMBOLS:
+        realized = RealizedPathStore(asset, time_length, time_increment)
+        prefetch_realized_paths(realized, unpriced, verbose=False)
+
+    generated = 0
+    for ts in prompt_times:
+        current_price = _local_start_price(ts)
+        if not np.isfinite(current_price) and realized is not None:
+            series = realized.get(ts)
+            if series is not None:
+                current_price = float(series.iloc[0])
+        if not np.isfinite(current_price):
             continue
 
         filename = ts.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{asset}_{time_length}.json"
@@ -208,12 +233,10 @@ def _run(
 ) -> None:
     """Run each filtered competition (parallel if >1) and emit grand-total charts when ≥2 produced data."""
     import pandas as pd
-    from synth_lib.backtester.backtest import (
-        BacktestResult,
-        plot_grand_total_earnings,
-        plot_grand_total_rank_evolution,
-        run_backtest,
-    )
+    from synth_lib.backtester.orchestration import run_backtest
+    from synth_lib.backtester.plots.earnings import plot_grand_total_earnings
+    from synth_lib.backtester.plots.rank import plot_grand_total_rank_evolution
+    from synth_lib.backtester.result import BacktestResult
 
     results_by_competition: dict[str, list[BacktestResult]] = {}
     combined_by_competition: dict[str, pd.DataFrame] = {}
