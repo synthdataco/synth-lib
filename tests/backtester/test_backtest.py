@@ -1,4 +1,4 @@
-"""Tests for synth_lib.backtester.backtest — run with: uv run pytest synth_lib/backtester/test_backtest.py -v"""
+"""Tests for the synth_lib.backtester package — run with: uv run pytest tests/backtester/ -v"""
 
 from __future__ import annotations
 
@@ -7,35 +7,46 @@ import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from synth_lib.backtester.backtest import (
-    BacktestResult,
+from synth_lib.backtester.caveats import _maybe_warn_hf_crps_formula_change
+from synth_lib.backtester.config import (
     HF_CRPS_FORMULA_CHANGE_DATE,
-    _BacktestMinerDataHandler,
-    _find_prediction_file,
-    _maybe_warn_hf_crps_formula_change,
-    _parse_prediction_filename_time,
-    _score_single_prompt,
-    backtest,
     competition_for,
     slug_for,
-    _compute_prompt_scores_for_group,
-    _compute_relative_crps,
-    calculate_smoothed_scores,
-    compute_combined_smoothed_scores,
+)
+from synth_lib.backtester.loading import (
     download_price_data,
+    get_miner_scores,
     load_prediction,
+)
+from synth_lib.backtester.miner_data_handler import _BacktestMinerDataHandler
+from synth_lib.backtester.orchestration import backtest
+from synth_lib.backtester.plots.crps import (
+    _compute_relative_crps,
     plot_crps_by_day,
     plot_crps_by_hour,
     plot_crps_over_time,
     plot_crps_ratio_distribution,
-    plot_total_rank_evolution,
     plot_weekly_percentile,
+)
+from synth_lib.backtester.plots.rank import plot_total_rank_evolution
+from synth_lib.backtester.preparation import (
+    _fill_gaps_from_realized_paths,
+    _find_prediction_file,
+    _parse_prediction_filename_time,
+    _slice_real_prices,
+)
+from synth_lib.backtester.result import BacktestResult, NoScoresAvailable
+from synth_lib.backtester.scoring import (
+    _compute_prompt_scores_for_group,
+    _score_single_prompt,
+    calculate_smoothed_scores,
+    compute_combined_smoothed_scores,
 )
 from synth.validator.competition_config import (
     COM_EQU_24H,
@@ -294,10 +305,10 @@ FAKE_CRPS = 42.0
 # Full backtest() pipeline with mocked external I/O (Synth API, price data, CRPS).
 # Verifies that predictions are discovered, scored, and aggregated into a valid BacktestResult.
 class TestBacktestIntegration:
-    @patch("synth_lib.backtester.backtest.calculate_crps_for_miner")
-    @patch("synth_lib.backtester.backtest.download_price_data")
-    @patch("synth_lib.backtester.backtest.get_rewards_history")
-    @patch("synth_lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
     def test_full_pipeline(
         self,
         mock_scores: object,
@@ -349,10 +360,10 @@ class TestBacktestIntegration:
 
     # -- Partial predictions fill with crps=-1 --
 
-    @patch("synth_lib.backtester.backtest.calculate_crps_for_miner")
-    @patch("synth_lib.backtester.backtest.download_price_data")
-    @patch("synth_lib.backtester.backtest.get_rewards_history")
-    @patch("synth_lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
     def test_partial_predictions_fill_crps_minus_one(
         self,
         mock_scores: object,
@@ -382,10 +393,10 @@ class TestBacktestIntegration:
 
     # -- Task 5: Price data gap raises ValueError --
 
-    @patch("synth_lib.backtester.backtest.calculate_crps_for_miner")
-    @patch("synth_lib.backtester.backtest.download_price_data")
-    @patch("synth_lib.backtester.backtest.get_rewards_history")
-    @patch("synth_lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
     def test_price_data_gap_raises_valueerror(
         self,
         mock_scores: object,
@@ -415,10 +426,10 @@ class TestBacktestIntegration:
 class TestRewardSlug:
     """backtest() must request rewards by competition slug, not legacy low/high."""
 
-    @patch("synth_lib.backtester.backtest.calculate_crps_for_miner")
-    @patch("synth_lib.backtester.backtest.download_price_data")
-    @patch("synth_lib.backtester.backtest.get_rewards_history")
-    @patch("synth_lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
     def test_com_equ_asset_requests_com_equ_slug(
         self, mock_scores, mock_rewards, mock_prices, mock_crps, tmp_path
     ) -> None:
@@ -646,9 +657,9 @@ class TestScoreSinglePrompt:
 class TestBacktestParallelScoring:
     """Verify backtest() produces identical results with and without scoring_executor."""
 
-    @patch("synth_lib.backtester.backtest.download_price_data")
-    @patch("synth_lib.backtester.backtest.get_rewards_history")
-    @patch("synth_lib.backtester.backtest.get_miner_scores")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
     def test_parallel_matches_sequential(
         self,
         mock_scores: object,
@@ -739,7 +750,7 @@ class TestDownloadPriceDataPerAsset:
 class TestGetDailyMinerPoolUsd:
     """Parses /rewards/historical response into a date-indexed USD series."""
 
-    @patch("synth_lib.backtester.backtest._http_get")
+    @patch("synth_lib.backtester.loading._http_get")
     def test_empty_response_returns_empty_series(self, mock_get: object) -> None:
         class FakeResponse:
             status_code = 200
@@ -752,7 +763,7 @@ class TestGetDailyMinerPoolUsd:
 
         mock_get.return_value = FakeResponse()  # type: ignore[attr-defined]
 
-        from synth_lib.backtester.backtest import get_daily_miner_pool_usd
+        from synth_lib.backtester.loading import get_daily_miner_pool_usd
 
         result = get_daily_miner_pool_usd(
             datetime(2026, 4, 10, tzinfo=UTC),
@@ -762,7 +773,7 @@ class TestGetDailyMinerPoolUsd:
         assert isinstance(result, pd.Series)
         assert len(result) == 0
 
-    @patch("synth_lib.backtester.backtest._http_get")
+    @patch("synth_lib.backtester.loading._http_get")
     def test_paginates_multi_chunk_window(self, mock_get: object) -> None:
         """A window longer than API_POOL_PAGE_SIZE_DAYS (300 days) paginates into
         multiple 300-day chunks; rows ({date, usd}) merge into a sorted Series."""
@@ -787,7 +798,7 @@ class TestGetDailyMinerPoolUsd:
             FakeResponse([_row("2026-11-15", 3500.0)]),
         ]
 
-        from synth_lib.backtester.backtest import get_daily_miner_pool_usd
+        from synth_lib.backtester.loading import get_daily_miner_pool_usd
 
         result = get_daily_miner_pool_usd(
             datetime(2026, 1, 1, tzinfo=UTC),
@@ -859,7 +870,7 @@ class TestComputeCombinedSmoothedScores:
         )
 
     def test_spyx_dominance_over_xau(self) -> None:
-        from synth_lib.backtester.backtest import compute_combined_smoothed_scores
+        from synth_lib.backtester.scoring import compute_combined_smoothed_scores
         updated = pd.Timestamp("2026-07-01 12:00:00", tz="UTC")
         st = datetime(2026, 7, 1, 10, 0, 0, tzinfo=UTC)
         r_xau = self._make_result("XAU", {1: 100.0, 2: 500.0}, st, updated)
@@ -873,7 +884,7 @@ class TestComputeCombinedSmoothedScores:
     def test_output_columns_and_sums(self) -> None:
         """reward_weight across miners at a single timestamp sums to
         SMOOTHED_SCORE_COEFFICIENT (1/3)."""
-        from synth_lib.backtester.backtest import compute_combined_smoothed_scores
+        from synth_lib.backtester.scoring import compute_combined_smoothed_scores
 
         updated = pd.Timestamp("2026-04-15 12:00:00", tz="UTC")
         st = datetime(2026, 4, 15, 10, 0, 0, tzinfo=UTC)
@@ -958,7 +969,7 @@ class TestComputeEarningsDf:
     """usd_per_round = reward_weight * daily_pool / rounds_per_day * emission_factor."""
 
     def test_formula(self) -> None:
-        from synth_lib.backtester.backtest import _compute_earnings_df
+        from synth_lib.backtester.earnings import _compute_earnings_df
         combined = pd.DataFrame([
             {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
             {"updated_at": pd.Timestamp("2026-06-25 16:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.2},
@@ -970,7 +981,7 @@ class TestComputeEarningsDf:
         assert earnings["usd_cumulative"].tolist() == pytest.approx([250.0, 750.0, 950.0])
 
     def test_emission_factor_scales_usd(self) -> None:
-        from synth_lib.backtester.backtest import _compute_earnings_df
+        from synth_lib.backtester.earnings import _compute_earnings_df
         combined = pd.DataFrame([
             {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
         ])
@@ -979,7 +990,7 @@ class TestComputeEarningsDf:
         assert earnings["usd_per_round"].tolist() == pytest.approx([250.0])
 
     def test_drops_rounds_on_missing_pool_days(self, capsys: pytest.CaptureFixture[str]) -> None:
-        from synth_lib.backtester.backtest import _compute_earnings_df
+        from synth_lib.backtester.earnings import _compute_earnings_df
         combined = pd.DataFrame([
             {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
             {"updated_at": pd.Timestamp("2026-06-26 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.2},
@@ -1036,12 +1047,10 @@ class TestPlotEstimatedEarnings:
             },
         )
 
-    @patch("synth_lib.backtester.backtest.get_daily_miner_pool_usd")
+    @patch("synth_lib.backtester.plots.earnings.get_daily_miner_pool_usd")
     def test_saves_png(self, mock_pool: object, tmp_path: Path) -> None:
-        from synth_lib.backtester.backtest import (
-            compute_combined_smoothed_scores,
-            plot_estimated_earnings,
-        )
+        from synth_lib.backtester.plots.earnings import plot_estimated_earnings
+        from synth_lib.backtester.scoring import compute_combined_smoothed_scores
 
         mock_pool.return_value = pd.Series(
             {  # type: ignore[attr-defined]
@@ -1065,13 +1074,11 @@ class TestPlotEstimatedEarnings:
         assert chart_path.suffix == ".png"
         assert "estimated_earnings_crypto-24h" in chart_path.name
 
-    @patch("synth_lib.backtester.backtest.get_daily_miner_pool_usd")
+    @patch("synth_lib.backtester.plots.earnings.get_daily_miner_pool_usd")
     def test_partial_coverage_warning(self, mock_pool: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """Backtesting fewer assets than the competition's asset_list prints a partial-coverage tag."""
-        from synth_lib.backtester.backtest import (
-            compute_combined_smoothed_scores,
-            plot_estimated_earnings,
-        )
+        from synth_lib.backtester.plots.earnings import plot_estimated_earnings
+        from synth_lib.backtester.scoring import compute_combined_smoothed_scores
 
         mock_pool.return_value = pd.Series(
             {  # type: ignore[attr-defined]
@@ -1174,7 +1181,8 @@ class TestHFCrpsFormulaWarning:
 
 class TestSplitWarning:
     def test_pre_split_window_warns(self) -> None:
-        from synth_lib.backtester.backtest import _maybe_warn_competition_split, COMPETITION_SPLIT_DATE
+        from synth_lib.backtester.caveats import _maybe_warn_competition_split
+        from synth_lib.backtester.config import COMPETITION_SPLIT_DATE
         with pytest.warns(UserWarning, match="before the 3-competition split"):
             _maybe_warn_competition_split(
                 competition=CRYPTO_24H, n_backtest_days=30,
@@ -1183,7 +1191,8 @@ class TestSplitWarning:
             )
 
     def test_post_split_window_silent(self) -> None:
-        from synth_lib.backtester.backtest import _maybe_warn_competition_split, COMPETITION_SPLIT_DATE
+        from synth_lib.backtester.caveats import _maybe_warn_competition_split
+        from synth_lib.backtester.config import COMPETITION_SPLIT_DATE
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             _maybe_warn_competition_split(
@@ -1207,50 +1216,204 @@ class TestCliSelection:
 
 
 
-class TestGetRealizedPath:
-    """GET /validation/realized-path — per-request realized paths."""
+class TestNoScoresAvailable:
+    """A retired asset (SPYX) has no scored prompts — a skip, not a failure."""
 
-    @patch("synth_lib.backtester.backtest._http_get")
-    def test_returns_indexed_series(self, mock_get: object) -> None:
-        class FakeResponse:
-            status_code = 200
+    @patch("synth_lib.backtester.loading._http_get")
+    def test_404_page_is_treated_as_empty(self, mock_get: MagicMock) -> None:
+        """404 = no scores in range; raising there hard-failed mid-pagination."""
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.raise_for_status.side_effect = AssertionError("must not raise on 404")
+        mock_get.return_value = resp
 
-            def raise_for_status(self) -> None:
-                pass
+        df = get_miner_scores(
+            datetime(2026, 7, 25, tzinfo=UTC),
+            datetime(2026, 7, 27, tzinfo=UTC),
+            "SPYX",
+            86_400,
+            300,
+        )
 
-            def json(self) -> dict:
-                return {
-                    "start_time": "2026-07-22T17:05:00Z",
-                    "asset": "HYPE",
-                    "time_increment": 60,
-                    "time_length": 180,
-                    "real_prices": [58.1, 58.2, 58.3, 58.4],
-                }
+        assert df.empty
 
-        mock_get.return_value = FakeResponse()  # type: ignore[attr-defined]
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
+    def test_backtest_raises_no_scores_available(
+        self, mock_scores: MagicMock, tmp_path: Path
+    ) -> None:
+        """Must not degrade to a bare RuntimeError — run_backtest keys SKIPPED off it."""
+        mock_scores.return_value = pd.DataFrame()
+        predictions = tmp_path / "predictions"
+        predictions.mkdir()
+        (predictions / "2026-07-25_00:00:00Z_SPYX_86400.json").write_text(
+            json.dumps({"paths": [[1.0, 2.0]], "start_timestamp": 0})
+        )
 
-        from synth_lib.backtester.backtest import get_realized_path
+        with pytest.raises(NoScoresAvailable, match="no scored prompts"):
+            backtest(
+                miner_name="m",
+                asset="SPYX",
+                time_length=86_400,
+                time_increment=300,
+                predictions_dir=predictions,
+                competition=COM_EQU_24H,
+            )
 
-        s = get_realized_path("HYPE", datetime(2026, 7, 22, 17, 5, tzinfo=UTC), 180, 60)
-        assert s is not None
-        assert len(s) == 4
-        assert s.index[0] == pd.Timestamp("2026-07-22T17:05:00Z")
-        assert s.index[-1] == pd.Timestamp("2026-07-22T17:08:00Z")
-        assert float(s.iloc[-1]) == 58.4
 
-    @patch("synth_lib.backtester.backtest._http_get")
-    def test_unavailable_returns_none(self, mock_get: object) -> None:
-        class FakeResponse:
-            status_code = 200
+class TestSliceRealPrices:
+    @staticmethod
+    def _frame(n_minutes: int, gap_at: int | None = None) -> pd.DataFrame:
+        closes = [100.0 + i for i in range(n_minutes)]
+        if gap_at is not None:
+            closes[gap_at] = float("nan")
+        index = pd.date_range("2026-07-20T00:00:00Z", periods=n_minutes, freq="1min")
+        return pd.DataFrame({"close": closes}, index=index)
 
-            def raise_for_status(self) -> None:
-                pass
+    def test_slices_at_the_time_increment(self) -> None:
+        prices = _slice_real_prices(self._frame(61), pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300)
 
-            def json(self) -> dict:
-                return {"message": "No realized path available"}
+        assert len(prices) == 13  # 3600 / 300 + 1
+        assert prices[0] == 100.0
+        assert prices[1] == 105.0
 
-        mock_get.return_value = FakeResponse()  # type: ignore[attr-defined]
+    def test_object_dtype_partitions_coerce_to_nan(self) -> None:
+        """Object-dtype partitions read back as None; np.isfinite rejects it.
+        Crashed a live com-equ backtest on 2026-07-31."""
+        index = pd.date_range("2026-07-20T00:00:00Z", periods=61, freq="1min")
+        prices = pd.DataFrame({"close": [None] * 61}, index=index, dtype=object)
 
-        from synth_lib.backtester.backtest import get_realized_path
+        real_prices = _slice_real_prices(prices, pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300)
 
-        assert get_realized_path("HYPE", datetime(2026, 3, 25, 2, 39, tzinfo=UTC), 3600, 60) is None
+        assert len(real_prices) == 13
+        assert np.isnan(real_prices).all()  # must not raise on object/None input
+
+    def test_nan_minutes_survive_the_slice(self) -> None:
+        """NaN is repairable by the fallback, so the slice must pass it through."""
+        prices = _slice_real_prices(
+            self._frame(61, gap_at=5), pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300
+        )
+
+        assert np.isnan(prices[1])
+
+    def test_short_window_raises(self) -> None:
+        """A length mismatch means the local frame doesn't span the prompt at
+        all — no fallback can repair that, so it must fail loudly."""
+        with pytest.raises(ValueError, match="Price data length mismatch"):
+            _slice_real_prices(self._frame(10), pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300)
+
+
+class TestFillGapsFromRealizedPaths:
+    """Past Hyperliquid's ~3.5-day retention, prompts arrive NaN-holed and must
+    be scored from the validator's stored path."""
+
+    START = pd.Timestamp("2026-05-02T01:03:00Z")
+
+    def _prompt(self, real_prices: list[float]) -> dict:
+        return {
+            "file_path": Path("pred.json"),
+            "start_time": self.START,
+            "asset": "XAU",
+            "scored_time": self.START + pd.Timedelta(seconds=86_400),
+            "time_length": 86_400,
+            "time_increment": 300,
+            "real_prices": real_prices,
+        }
+
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_substitutes_the_validator_path(
+        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
+    ) -> None:
+        expected_steps = 86_400 // 300 + 1
+        path = pd.Series(
+            [float(i) for i in range(expected_steps)],
+            index=pd.date_range(self.START, periods=expected_steps, freq="5min"),
+        )
+        mock_store_cls.return_value.get.return_value = path
+        prompts = [self._prompt([float("nan")] * expected_steps)]
+
+        assert _fill_gaps_from_realized_paths(prompts, "[test]") == 1
+        assert prompts[0]["real_prices"] == path.to_list()
+        mock_prefetch.assert_called_once()
+
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_detects_gaps_in_object_dtype_prices(
+        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
+    ) -> None:
+        """Gap detection must survive None from object-dtype partitions."""
+        expected_steps = 86_400 // 300 + 1
+        mock_store_cls.return_value.get.return_value = pd.Series(
+            [1.0] * expected_steps,
+            index=pd.date_range(self.START, periods=expected_steps, freq="5min"),
+        )
+        prompts = [self._prompt([None] * expected_steps)]
+
+        assert _fill_gaps_from_realized_paths(prompts, "[test]") == 1
+
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_complete_local_prices_are_left_alone(
+        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
+    ) -> None:
+        prompts = [self._prompt([1.0, 2.0, 3.0])]
+
+        assert _fill_gaps_from_realized_paths(prompts, "[test]") == 0
+        assert prompts[0]["real_prices"] == [1.0, 2.0, 3.0]
+        mock_prefetch.assert_not_called()
+        mock_store_cls.assert_not_called()
+
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_unscored_prompts_are_not_fetched(
+        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
+    ) -> None:
+        """A prompt with no matching prediction file scores as crps=-1 anyway."""
+        prompt = self._prompt([])
+        prompt["file_path"] = None
+
+        assert _fill_gaps_from_realized_paths([prompt], "[test]") == 0
+        mock_prefetch.assert_not_called()
+
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_warns_when_a_gap_cannot_be_repaired(
+        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
+    ) -> None:
+        mock_store_cls.return_value.get.return_value = None
+        prompts = [self._prompt([float("nan"), 2.0, 3.0])]
+
+        with pytest.warns(UserWarning, match="no stored realized path"):
+            assert _fill_gaps_from_realized_paths(prompts, "[test]") == 0
+
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_wrong_length_path_is_rejected(
+        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
+    ) -> None:
+        """A wrong-length path is a different prompt config — would mis-score."""
+        mock_store_cls.return_value.get.return_value = pd.Series(
+            [1.0, 2.0], index=pd.date_range(self.START, periods=2, freq="5min")
+        )
+        prompts = [self._prompt([float("nan"), 2.0, 3.0])]
+
+        with pytest.warns(UserWarning):
+            assert _fill_gaps_from_realized_paths(prompts, "[test]") == 0
+        assert np.isnan(prompts[0]["real_prices"][0])
+
+    @patch("synth_lib.backtester.preparation._offline_root")
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_offline_mode_reads_the_warmed_store_without_fetching(
+        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock, mock_offline: MagicMock
+    ) -> None:
+        mock_offline.return_value = Path("offline_data/com-equ-24h")
+        expected_steps = 86_400 // 300 + 1
+        mock_store_cls.return_value.get.return_value = pd.Series(
+            [1.0] * expected_steps,
+            index=pd.date_range(self.START, periods=expected_steps, freq="5min"),
+        )
+        prompts = [self._prompt([float("nan")] * expected_steps)]
+
+        assert _fill_gaps_from_realized_paths(prompts, "[test]") == 1
+        mock_prefetch.assert_not_called()

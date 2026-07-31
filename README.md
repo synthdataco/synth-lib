@@ -102,6 +102,30 @@ market_data/
 Each parquet contains `timestamp`, `close`, `source`, `ingested_at`, and
 `is_final` columns. Rows are minute-aligned UTC; gaps are stored as NaN.
 
+### Assets with no deep history (Hyperliquid)
+
+Hyperliquid serves only ~5000 candles per interval, so **1-minute history is
+unreachable beyond ~3.5 days** for every Hyperliquid-routed asset: `HYPE` and
+all of `com-equ-24h` (`XAU`, `NVDAX`, `TSLAX`, `AAPLX`, `GOOGLX`, `SP500`,
+`SPCX`, `WTIOIL`). Older days ingest as NaN, which would score as NaN CRPS.
+
+The backtester repairs this automatically: for every prompt whose local price
+slice has holes it fetches `/validation/realized-path` — the array the
+validator's own CRPS consumed — and scores against that, so the result matches
+the live network exactly. Paths are cached per prompt under
+
+```
+market_data/realized/{ASSET}/{time_length}_{time_increment}/date=YYYY-MM-DD.parquet
+```
+
+and skipped on re-run, so an interrupted backfill resumes. Nothing needs
+pre-downloading. Binance-routed assets (`BTC`, `ETH`, `SOL`, `XRP`) are
+unaffected — they have full 1-minute history since listing.
+
+Caveat: such a window is scoring-grade but not context-grade.
+`get_context_window` and `get_real_price_path` raise on NaN, so model training
+over an old Hyperliquid window is still not possible.
+
 ## 2. Run a backtest
 
 A backtest compares a miner's prediction files to real prices, computes CRPS
@@ -300,11 +324,16 @@ SYNTH_BACKTESTER_OFFLINE_DATA_ROOT=offline_data/crypto-24h \
     --miner-name my_agent --competition crypto-24h --days 30
 ```
 
+For Hyperliquid-routed assets the builder also caches the realized path of
+every bundled prompt into `market_data/realized/` (pass `--no-realized-paths`
+to skip), since those windows have no local minute prices to score against.
+
 With `SYNTH_BACKTESTER_OFFLINE_DATA_ROOT` set, `get_miner_scores`,
 `get_rewards_history`, and `get_daily_miner_pool_usd` read the bundled
-parquets instead of calling `api.synthdata.co`. This also makes runs
-reproducible and rate-limit-proof (prices still come from the local
-`market_data/` parquets either way). Bundle layout under the root:
+parquets instead of calling `api.synthdata.co`, and the realized-path fallback
+reads the warmed cache without fetching. This also makes runs reproducible and
+rate-limit-proof (prices still come from the local `market_data/` parquets
+either way). Bundle layout under the root:
 
 ```
 miner_scores_{ASSET}_{competition}.parquet
@@ -412,3 +441,8 @@ uv run pytest tests/backtester/
   Make sure the relevant `market_data/pyth/{ASSET}/1m/` directory is populated
   (see section 1) — the `crypto-1h` competition needs coverage up to today
   since its prompt window is only 1h.
+- Prompts older than Hyperliquid's ~3.5-day retention are scored from the
+  validator's realized paths instead (see "Assets with no deep history"). The
+  no-auth API endpoints are rate-limited to a couple of requests per second, so
+  the first long Hyperliquid backtest spends a while warming that cache; later
+  runs reuse it.

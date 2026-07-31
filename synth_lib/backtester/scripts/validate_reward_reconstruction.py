@@ -38,13 +38,12 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from synth_lib.backtester.backtest import (
-    SLUG_TO_COMPETITION,
-    BacktestResult,
+from synth_lib.backtester.config import SLUG_TO_COMPETITION
+from synth_lib.backtester.loading import get_miner_scores, get_rewards_history
+from synth_lib.backtester.result import BacktestResult
+from synth_lib.backtester.scoring import (
     _compute_prompt_score_stats_for_group,
     compute_combined_smoothed_scores,
-    get_miner_scores,
-    get_rewards_history,
 )
 
 UTC = timezone.utc

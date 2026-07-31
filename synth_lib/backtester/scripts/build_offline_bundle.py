@@ -11,7 +11,9 @@ backtester's offline mode (SYNTH_BACKTESTER_OFFLINE_DATA_ROOT) expects:
 
 Prices are not bundled: the backtester reads them from the local
 market_data/pyth/{asset}/1m parquets (see synth_lib/preparation/market_data.py
-to pre-download them).
+to pre-download them). Hyperliquid-routed assets have no minute history beyond
+~3.5 days, so each bundled prompt's realized path is cached under
+market_data/realized/ instead.
 
 Already-written parquets are skipped, so an interrupted run can be resumed.
 
@@ -36,11 +38,17 @@ from typing import Callable
 import pandas as pd
 import requests
 
-from synth_lib.backtester.backtest import (
-    SLUG_TO_COMPETITION,
+from synth.validator.competition_config import CompetitionConfig
+from synth_lib.backtester.config import SLUG_TO_COMPETITION
+from synth_lib.backtester.loading import (
     get_daily_miner_pool_usd,
     get_miner_scores,
     get_rewards_history,
+)
+from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS
+from synth_lib.preparation.realized_path_store import (
+    RealizedPathStore,
+    prefetch_realized_paths,
 )
 
 UTC = timezone.utc
@@ -90,6 +98,19 @@ def fetch_chunked(
     return pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
 
 
+def bundle_realized_paths(asset: str, competition: CompetitionConfig, scores: pd.DataFrame) -> None:
+    """Cache the realized path of every bundled prompt for a Hyperliquid asset.
+
+    Those assets have no local minute prices beyond ~3.5 days, so a long backtest
+    cannot score without these.
+    """
+    if scores.empty:
+        return
+    store = RealizedPathStore(asset, competition.time_length, competition.time_increment)
+    mapping = prefetch_realized_paths(store, sorted(scores["start_time"].unique()))
+    print(f"realized paths/{asset}: {len(mapping)} prompts cached under {store.root}")
+
+
 def build_bundle(
     slug: str,
     days: int,
@@ -97,6 +118,7 @@ def build_bundle(
     assets: list[str],
     chunk_days: float,
     out: Path,
+    realized_paths: bool = True,
 ) -> None:
     competition = SLUG_TO_COMPETITION[slug]
     out.mkdir(parents=True, exist_ok=True)
@@ -109,17 +131,20 @@ def build_bundle(
         path = out / f"miner_scores_{asset}_{slug}.parquet"
         if path.exists():
             print(f"skip {path} (exists)")
-            continue
-        df = fetch_chunked(
-            lambda s, e, a=asset: get_miner_scores(s, e, a, competition.time_length, competition.time_increment),
-            scores_start,
-            eval_end,
-            chunk_days,
-            f"scores/{asset}",
-        )
-        df.to_parquet(path, index=False)
-        prompts = df["scored_time"].nunique() if not df.empty else 0
-        print(f"wrote {path}: {len(df)} rows, {prompts} prompts")
+            df = pd.read_parquet(path)
+        else:
+            df = fetch_chunked(
+                lambda s, e, a=asset: get_miner_scores(s, e, a, competition.time_length, competition.time_increment),
+                scores_start,
+                eval_end,
+                chunk_days,
+                f"scores/{asset}",
+            )
+            df.to_parquet(path, index=False)
+            prompts = df["scored_time"].nunique() if not df.empty else 0
+            print(f"wrote {path}: {len(df)} rows, {prompts} prompts")
+        if realized_paths and asset in HYPERLIQUID_SYMBOLS:
+            bundle_realized_paths(asset, competition, df)
 
     path = out / f"rewards_history_{slug}.parquet"
     if path.exists():
@@ -181,6 +206,12 @@ def main() -> None:
         default=None,
         help="bundle directory (default: offline_data/{competition})",
     )
+    parser.add_argument(
+        "--no-realized-paths",
+        action="store_true",
+        help="skip caching realized paths for Hyperliquid assets (they have no minute history "
+        "beyond ~3.5 days, so those windows will score as NaN CRPS without them)",
+    )
     args = parser.parse_args()
 
     if args.eval_end is not None:
@@ -192,7 +223,15 @@ def main() -> None:
     assets = args.assets if args.assets is not None else list(competition.asset_list)
     out = Path(args.out) if args.out is not None else Path("offline_data") / args.competition
 
-    build_bundle(args.competition, args.days, eval_end, assets, args.chunk_days, out)
+    build_bundle(
+        args.competition,
+        args.days,
+        eval_end,
+        assets,
+        args.chunk_days,
+        out,
+        realized_paths=not args.no_realized_paths,
+    )
 
 
 if __name__ == "__main__":

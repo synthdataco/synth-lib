@@ -27,14 +27,16 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from synth_lib.backtester.backtest import (
+from synth_lib.backtester.config import (
     API_SCORES_PAGE_SIZE_DAYS,
     EMISSION_NORMALIZATION_FACTOR,
-    SYNTHDATA_API_BASE,
+)
+from synth_lib.backtester.loading import (
     _http_get,
     get_daily_miner_pool_usd,
     get_rewards_history,
 )
+from synth_lib.preparation.config import SYNTHDATA_API_BASE
 
 UTC = timezone.utc
 
@@ -198,7 +200,7 @@ def compute_backtester_usd(
 ) -> pd.DataFrame:
     """Compute per-miner per-day backtester-formula USD.
 
-    Mirrors synth_lib.backtester.backtest._compute_earnings_df exactly,
+    Mirrors synth_lib.backtester.earnings._compute_earnings_df exactly,
     including the per-miner `rounds_per_day` grouping (backtest.py:1446),
     but for ALL miners in one pass.
 
