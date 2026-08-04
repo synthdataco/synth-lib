@@ -10,7 +10,7 @@ backtester's offline mode (SYNTH_BACKTESTER_OFFLINE_DATA_ROOT) expects:
     {out}/miner_pool_usd.parquet
 
 Prices are not bundled: the backtester reads them from the local
-market_data/pyth/{asset}/1m parquets (see synth_lib/preparation/market_data.py
+market_data/prices/{asset}/1m parquets (see synth_lib/preparation/market_data.py
 to pre-download them). Hyperliquid-routed assets have no minute history beyond
 ~3.5 days, so each bundled prompt's realized path is cached under
 market_data/realized/ instead.
