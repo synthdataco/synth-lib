@@ -29,7 +29,8 @@ SCORING_INTERVALS: dict[str, int] = {
     "24hour_abs": 86_400,
 }
 DEFAULT_MINER_OUTPUT_ROOT = Path("miner_outputs")
-DEFAULT_MARKET_DATA_ROOT = Path("market_data/pyth/BTC/1m")
+# Unused; MinutePriceStore resolves its own root (preparation.config.default_store_root).
+DEFAULT_MARKET_DATA_ROOT = Path("market_data/prices/BTC/1m")
 _LEGACY_FALLBACK_WINDOW_DAYS = 10  # only used when no competition is in scope
 _COMBINED_EMPTY_COLS = [
     "updated_at",
@@ -95,7 +96,7 @@ PREDICTION_MATCH_TOLERANCE_MINUTES = 30
 #   miner_scores_{asset}_{slug}.parquet          # slug = competition slug
 #   rewards_history_{slug}.parquet               # slug = competition slug
 #   miner_pool_usd.parquet                       # columns: date, usd
-#   market_data/pyth/{asset}/1m/date=*.parquet   # daily price partitions
+#   market_data/prices/{asset}/1m/date=*.parquet  # daily price partitions (legacy: pyth/)
 _OFFLINE_ENV_VAR = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
 
 # comp.label -> API slug used by /rewards/scores?prompt_name=. synth does not

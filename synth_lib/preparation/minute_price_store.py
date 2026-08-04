@@ -12,6 +12,7 @@ from synth_lib.preparation.config import (
     CONTEXT_WINDOW_MINUTES,
     MINUTES_PER_DAY,
     UTC,
+    default_store_root,
     utc_datetime,
 )
 from synth_lib.preparation.price_client import PriceClient
@@ -23,7 +24,7 @@ class MinutePriceStore:
 
     def __init__(self, asset: str, root: Path | None = None, client: PriceClient | None = None):
         self.asset = asset
-        self.root = Path(root or Path(f"market_data/pyth/{asset}/1m")).expanduser()
+        self.root = Path(root or default_store_root(asset)).expanduser()
         self.client = client or PythHistoryClient()
 
     def day_path(self, day: date) -> Path:
