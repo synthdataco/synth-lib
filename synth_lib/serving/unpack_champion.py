@@ -2,11 +2,17 @@
 
 Takes a leg from a results archive — either an unpacked `champion/` source tree (how the public
 results repo publishes them) or a `workspace.bundle` checked out at `CHAMPION.sha`, so the
-deployed code is provably the nominated code — copies `<agent_dir>/modeling.py` verbatim, and
-generates the thin serving shell: `miner.py` (a `ChampionMiner` subclass), `entrypoint.sh`,
-`PROVENANCE.md`. Champions are single-file by contract (modeling.py imports nothing outside
-numpy/pandas/stdlib), so nothing else is copied; a champion carrying weights ships them alongside
-and needs its own copy step.
+deployed code is provably the nominated code — copies that tree verbatim and adds the thin serving
+shell: `miner.py` (a `ChampionMiner` subclass), `entrypoint.sh`, `PROVENANCE.md`. The bundle itself
+is copied in too when the leg publishes one, so the deployed champion carries the history that
+proves it: `git clone workspace.bundle` and check the sha.
+
+The whole tree, not just `modeling.py`. A champion's code is one module by contract, but its
+*calibration* is not in the code: fitted tables, innovation pools and weights sit beside it, loaded
+relative to `__file__`, and a tree missing them serves an uncalibrated model that still passes every
+gate. Copying everything also keeps the research scripts and journal that explain a constant next to
+the constant. `runtime_data_status` then reports which data files the module names are actually
+there; a gap stops the unpack unless `--allow-missing-data` says the reference is dead code.
 
 Self-verifying: before anything is written, the champion is run through the LIVE validator
 contract (`validate_responses`) on a synthetic context, once per nominated profile. A champion
@@ -18,6 +24,7 @@ that fails the gate is not unpacked.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import stat
 import subprocess
@@ -52,7 +59,9 @@ import time
 
 from synth_lib.serving.champion_miner import ChampionMiner
 
-from .modeling import simulate
+# Absolute, not relative: entrypoint.sh runs this file as a script, so there is no parent package
+# and `from .modeling import ...` cannot resolve. As a script, its own directory is sys.path[0].
+from modeling import simulate
 
 
 class $class_name(ChampionMiner):
@@ -101,7 +110,11 @@ PROVENANCE_TEMPLATE = Template(
 
 - Campaign: `$campaign`, leg `$leg`
 - Champion sha: `$sha` (from `campaign_results/$campaign/$leg/CHAMPION`)
-- Source: `modeling.py` copied verbatim from the champion's `$agent_dir/modeling.py` at that sha
+- Source: the champion's whole `$agent_dir/` tree at that sha, copied verbatim
+- Runtime data present: $runtime_data
+- Referenced but absent: $missing_data
+- Added by the unpacker: $added (nothing else was modified)
+- History: $bundle
 - Profiles: $profiles
 - Unpacked: $date
 - Contract gate at unpack: PASSED (`validate_responses` == CORRECT per profile, synthetic context)
@@ -149,6 +162,12 @@ def contract_gate(modeling_path: Path, profiles: tuple[str, ...]) -> None:
             raise RuntimeError(f"contract gate failed for profile {profile}: {verdict}")
 
 
+# What the unpacker writes into the tree. Never overwritten: if a champion happens to carry a file
+# of the same name, the unpack refuses rather than silently shipping the agent's version.
+BUNDLE_NAME = "workspace.bundle"
+GENERATED = ("miner.py", "entrypoint.sh", "PROVENANCE.md", BUNDLE_NAME)
+
+
 def champion_source(leg_dir: Path, champion: Champion, tmp: Path) -> Path:
     """Directory holding the champion's modeling.py: the published `champion/` tree if present,
     otherwise a clone of `workspace.bundle` checked out at CHAMPION.sha."""
@@ -157,9 +176,9 @@ def champion_source(leg_dir: Path, champion: Champion, tmp: Path) -> Path:
         return unpacked
     if (leg_dir / "champion" / "modeling.py").exists():  # published flat
         return leg_dir / "champion"
-    bundle = leg_dir / "workspace.bundle"
+    bundle = leg_dir / BUNDLE_NAME
     if not bundle.exists():
-        raise FileNotFoundError(f"no champion source in {leg_dir}: expected champion/ or workspace.bundle")
+        raise FileNotFoundError(f"no champion source in {leg_dir}: expected champion/ or {BUNDLE_NAME}")
     clone = tmp / "clone"
     run(["git", "clone", "-q", str(bundle), str(clone)], f"clone {bundle}")
     run(["git", "-C", str(clone), "checkout", "-q", champion.sha], f"checkout {champion.sha}")
@@ -167,10 +186,51 @@ def champion_source(leg_dir: Path, champion: Champion, tmp: Path) -> Path:
 
 
 def class_name_for(name: str) -> str:
-    return "".join(part.capitalize() for part in name.split("_")) + "Miner"
+    """A valid Python class name from a free-text `--name` (`campaign-2` -> `Campaign2Miner`).
+
+    Splitting on `_` alone produced `Campaign-2Miner`, which does not compile — and the failure
+    surfaced only when the miner was launched, long after the unpack reported success.
+    """
+    parts = [p for p in re.split(r"[^A-Za-z0-9]+", name) if p]
+    stem = "".join(p[:1].upper() + p[1:] for p in parts)
+    return f"Champion{stem}Miner" if not stem or stem[0].isdigit() else f"{stem}Miner"
 
 
-def unpack(campaign: str, leg: str, name: str | None, results_dir: Path, dest_root: Path) -> Path:
+# Extensions a champion loads at runtime.
+RUNTIME_DATA_SUFFIXES = frozenset({".npz", ".npy", ".parquet", ".csv", ".json", ".pt", ".safetensors", ".pkl"})
+
+
+def runtime_data_status(dest: Path) -> tuple[list[str], list[str]]:
+    """(data files present, data filenames modeling.py names but the tree does not have).
+
+    Absence usually does not raise in the champion itself — loaders fall back to an empty dict or a
+    caught exception — so an incomplete tree can serve an UNCALIBRATED model that passes every gate
+    and looks healthy. Only committed files travel in a bundle, hence the check.
+
+    Being named is not the same as being needed: a reference can sit behind a branch the champion
+    does not take (an env-var-gated experiment it discarded), which is what `--allow-missing-data`
+    is for. This reads text, not reachability, so it cannot tell the two apart.
+    """
+    present = {p.name for p in dest.rglob("*") if p.is_file()}
+    referenced = {
+        match
+        for match in re.findall(r"[\w.-]+", (dest / "modeling.py").read_text())
+        if Path(match).suffix in RUNTIME_DATA_SUFFIXES
+    }
+    return (
+        sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file() and p.suffix in RUNTIME_DATA_SUFFIXES),
+        sorted(name for name in referenced if name not in present),
+    )
+
+
+def unpack(
+    campaign: str,
+    leg: str,
+    name: str | None,
+    results_dir: Path,
+    dest_root: Path,
+    allow_missing_data: bool = False,
+) -> Path:
     leg_dir = results_dir / campaign / leg
     champion: Champion = parse_champion(leg_dir / "CHAMPION")
     name = name or f"{campaign.replace('-', '_')}_{leg}"
@@ -181,8 +241,35 @@ def unpack(campaign: str, leg: str, name: str | None, results_dir: Path, dest_ro
     with tempfile.TemporaryDirectory(prefix="unpack-") as tmp:
         source = champion_source(leg_dir, champion, Path(tmp))
         contract_gate(source / "modeling.py", champion.profiles)  # gate BEFORE writing anything
-        dest.mkdir(parents=True)
-        shutil.copy(source / "modeling.py", dest / "modeling.py")
+        # The champion's whole agent tree, verbatim: the same content the results repo publishes as
+        # `champion_source/`, so what serves is what was scored, and the fitting scripts and journal
+        # that explain a constant travel with it.
+        # ignore: the contract gate imported modeling.py from this tree a moment ago, which leaves a
+        # __pycache__ the champion never committed.
+        shutil.copytree(source, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".git"))
+        try:
+            collisions = sorted(name for name in GENERATED if (dest / name).exists())
+            if collisions:
+                raise RuntimeError(
+                    f"champion tree already contains {', '.join(collisions)} — the generated serving "
+                    f"shell would overwrite the agent's own file. Rename theirs, or unpack by hand."
+                )
+            # The bundle travels with the champion: without it, a deployed copy cannot be checked
+            # back against the sha it claims. `git clone <bundle>` + `rev-parse` is the whole proof.
+            bundle = leg_dir / BUNDLE_NAME
+            if bundle.exists():
+                shutil.copy(bundle, dest / BUNDLE_NAME)
+            runtime_data, missing = runtime_data_status(dest)
+            if missing and not allow_missing_data:
+                raise RuntimeError(
+                    f"modeling.py names data files the tree at {champion.sha} does not carry: "
+                    f"{', '.join(missing)}. Either they were never committed — only committed files "
+                    f"travel in a bundle — or the reference sits behind a code path the champion does "
+                    f"not take. Check which, then pass --allow-missing-data to unpack anyway."
+                )
+        except Exception:
+            shutil.rmtree(dest)  # same rule as the gate: never leave a half-unpacked champion
+            raise
 
     substitutions = {
         "name": name,
@@ -192,9 +279,23 @@ def unpack(campaign: str, leg: str, name: str | None, results_dir: Path, dest_ro
         "sha": champion.sha,
         "agent_dir": champion.agent_dir,
         "profiles": ", ".join(champion.profiles),
+        "runtime_data": ", ".join(f"`{p}`" for p in runtime_data) if runtime_data else "none (code-only champion)",
+        "added": ", ".join(f"`{f}`" for f in GENERATED if (dest / f).exists()),
+        "bundle": (
+            f"`{BUNDLE_NAME}` — the champion's own git history. Verify this tree against the sha it "
+            f"claims:\n  `git clone {BUNDLE_NAME} /tmp/verify && git -C /tmp/verify rev-parse {champion.sha}`"
+            if (dest / BUNDLE_NAME).exists()
+            else "not published for this leg — the source was an already-unpacked tree, so the sha "
+            "above cannot be re-verified from here"
+        ),
+        "missing_data": (
+            f"**{', '.join(f'`{m}`' for m in missing)}** — unpacked with `--allow-missing-data`. "
+            f"Whatever the champion does when they are absent is what this miner will serve."
+            if missing
+            else "none"
+        ),
         "date": datetime.now(tz=UTC).date().isoformat(),
     }
-    (dest / "__init__.py").write_text("")
     (dest / "miner.py").write_text(MINER_TEMPLATE.substitute(substitutions))
     entrypoint = dest / "entrypoint.sh"
     entrypoint.write_text(ENTRYPOINT_TEMPLATE.substitute(substitutions))
@@ -210,8 +311,14 @@ def main() -> None:
     ap.add_argument("--name", default=None, help="default: <campaign>_<leg> with dashes underscored")
     ap.add_argument("--results-dir", type=Path, default=Path("campaign_results"))
     ap.add_argument("--dest", type=Path, default=Path("champions"))
+    ap.add_argument(
+        "--allow-missing-data",
+        action="store_true",
+        help="unpack even when modeling.py names a data file the tree lacks (e.g. weights for a "
+        "branch the champion does not take); recorded in PROVENANCE.md",
+    )
     args = ap.parse_args()
-    dest = unpack(args.campaign, args.leg, args.name, args.results_dir, args.dest)
+    dest = unpack(args.campaign, args.leg, args.name, args.results_dir, args.dest, args.allow_missing_data)
     print(f"unpacked -> {dest} (contract gate: CORRECT)")
 
 
