@@ -93,7 +93,10 @@ def create_workspace(cfg: CampaignConfig, model: ModelSpec, data_md: str | None 
             f"workspace already present and non-empty: {ws} — clean it up with `rm -rf {ws}` before rerunning"
         )
     ws.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(SCAFFOLD_DIR, ws)
+    # dirs_exist_ok: an EMPTY leftover directory passes the guard above (a setup that died before
+    # writing anything leaves one), and copytree would then raise FileExistsError instead — a worse
+    # error than the actionable one above.
+    shutil.copytree(SCAFFOLD_DIR, ws, dirs_exist_ok=True)
     # Shipped as gitignore.tmpl because a packaged dotfile is easily lost by build backends;
     # written out under its real name here, the same post-processing the pyproject gets below.
     tmpl = ws / "gitignore.tmpl"
