@@ -12,7 +12,7 @@ from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS, utc_datetime
 
 
 class HyperliquidClient:
-    """Wrapper around synth's PriceDataProvider matching PythHistoryClient's interface."""
+    """Wrapper around synth's PriceDataProvider implementing the PriceClient protocol."""
 
     source_name = "hyperliquid"
 

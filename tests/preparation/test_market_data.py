@@ -28,12 +28,11 @@ from synth_lib.preparation.config import (
     ALL_SYMBOLS,
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
-    PYTH_SYMBOLS,
+    RETIRED_SYMBOLS,
 )
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.preparation.price_client import build_price_client
-from synth_lib.preparation.pyth_client import PythHistoryClient
 from synth_lib.preparation.realized_path_store import (
     RealizedPathStore,
     prefetch_realized_paths,
@@ -51,7 +50,7 @@ class TestAssetRouting:
     def test_sp500_routed_to_hyperliquid(self) -> None:
         assert HYPERLIQUID_SYMBOLS.get("SP500") == "xyz:SP500"
         assert "SP500" not in BINANCE_SYMBOLS
-        assert "SP500" not in PYTH_SYMBOLS
+        assert "SP500" not in RETIRED_SYMBOLS
         assert isinstance(build_price_client("SP500"), HyperliquidClient)
 
     def test_backtest_price_store_uses_hyperliquid_for_sp500(self) -> None:
@@ -68,14 +67,17 @@ class TestAssetRouting:
         for asset in ("BTC", "ETH", "SOL", "XRP"):
             assert isinstance(build_price_client(asset), BinanceClient)
 
-    def test_spyx_routed_to_pyth(self) -> None:
-        assert PYTH_SYMBOLS.get("SPYX") == "Crypto.SPYX/USD"
-        assert isinstance(build_price_client("SPYX"), PythHistoryClient)
+    def test_retired_feed_asset_raises_instead_of_routing(self) -> None:
+        """SPYX was Pyth-only and Pyth is gone. Routing must refuse rather than hand back a client
+        that fetches nothing: empty partitions look exactly like real coverage downstream."""
+        assert RETIRED_SYMBOLS.get("SPYX") == "Crypto.SPYX/USD"
+        with pytest.raises(ValueError, match="retired"):
+            build_price_client("SPYX")
 
-    def test_maps_are_disjoint_and_union_is_all(self) -> None:
-        b, h, p = set(BINANCE_SYMBOLS), set(HYPERLIQUID_SYMBOLS), set(PYTH_SYMBOLS)
-        assert b.isdisjoint(h) and b.isdisjoint(p) and h.isdisjoint(p)
-        assert set(ALL_SYMBOLS) == b | h | p
+    def test_maps_are_disjoint_and_fetchable_union_excludes_retired(self) -> None:
+        b, h, r = set(BINANCE_SYMBOLS), set(HYPERLIQUID_SYMBOLS), set(RETIRED_SYMBOLS)
+        assert b.isdisjoint(h) and b.isdisjoint(r) and h.isdisjoint(r)
+        assert set(ALL_SYMBOLS) == b | h, "ALL_SYMBOLS is what can be fetched; retired feeds are not"
 
     def test_unknown_asset_raises(self) -> None:
         with pytest.raises(ValueError, match="Unsupported asset"):
@@ -147,84 +149,6 @@ class TestIngestSourceLabel:
         assert set(df["source"].unique()) == {"binance"}
 
 
-def _response(payload: dict) -> MagicMock:
-    resp = MagicMock()
-    resp.raise_for_status = MagicMock()
-    resp.json.return_value = payload
-    return resp
-
-
-def _ok_payload(start_ts: int, n_bars: int) -> dict:
-    ts = [start_ts + 60 * i for i in range(n_bars)]
-    return {"s": "ok", "t": ts, "c": [100.0 + i for i in range(n_bars)]}
-
-
-class TestPythHistoryClientPagination:
-    @patch("synth_lib.preparation.pyth_client.requests.get")
-    def test_seven_day_range_is_paginated_under_the_shim_cap(self, mock_get: MagicMock) -> None:
-        """A 7-day request must split into <= MAX_DAYS_PER_REQUEST slices (the
-        shim errors above ~10k bars) and concat to one contiguous frame."""
-        start = datetime(2026, 7, 15, tzinfo=UTC)
-        end = datetime(2026, 7, 22, tzinfo=UTC)
-
-        def per_chunk(url, params, timeout):
-            n_bars = (params["to"] - params["from"]) // 60
-            assert n_bars <= PythHistoryClient.MAX_DAYS_PER_REQUEST * 24 * 60, "chunk exceeds the shim cap"
-            return _response(_ok_payload(params["from"], n_bars))
-
-        mock_get.side_effect = per_chunk
-        frame = PythHistoryClient().fetch_range("SPYX", start, end)
-
-        assert mock_get.call_count == 2  # 5d + 2d
-        assert len(frame) == 7 * 24 * 60
-        assert frame["timestamp"].is_monotonic_increasing
-        assert not frame["timestamp"].duplicated().any()
-
-    @patch("synth_lib.preparation.pyth_client.requests.get")
-    def test_boundary_duplicates_are_dropped(self, mock_get: MagicMock) -> None:
-        """Chunks sharing a boundary timestamp must not duplicate that bar."""
-        start = datetime(2026, 7, 15, tzinfo=UTC)
-        end = datetime(2026, 7, 21, tzinfo=UTC)
-
-        def per_chunk(url, params, timeout):
-            # Emit one extra bar at the chunk end == next chunk's first bar.
-            n_bars = (params["to"] - params["from"]) // 60 + 1
-            return _response(_ok_payload(params["from"], n_bars))
-
-        mock_get.side_effect = per_chunk
-        frame = PythHistoryClient().fetch_range("SPYX", start, end)
-        assert not frame["timestamp"].duplicated().any()
-
-    @patch("synth_lib.preparation.pyth_client.time.sleep")
-    @patch("synth_lib.preparation.pyth_client.requests.get")
-    def test_shim_error_status_raises_instead_of_returning_empty(
-        self, mock_get: MagicMock, mock_sleep: MagicMock
-    ) -> None:
-        """s=error with empty t must raise (after retries), never masquerade
-        as a data gap — the silent-empty behavior is what broke SPYX serving."""
-        mock_get.return_value = _response({"s": "error", "errmsg": "range too large", "t": [], "c": []})
-        with pytest.raises(RuntimeError, match="Pyth API failed"):
-            PythHistoryClient(max_retries=2).fetch_range(
-                "SPYX", datetime(2026, 7, 21, tzinfo=UTC), datetime(2026, 7, 22, tzinfo=UTC)
-            )
-
-    @patch("synth_lib.preparation.pyth_client.requests.get")
-    def test_no_data_status_returns_empty_frame(self, mock_get: MagicMock) -> None:
-        """s=no_data (e.g. closed market) is a legitimate empty response."""
-        mock_get.return_value = _response({"s": "no_data", "t": [], "c": []})
-        frame = PythHistoryClient().fetch_range(
-            "SPYX", datetime(2026, 7, 21, tzinfo=UTC), datetime(2026, 7, 22, tzinfo=UTC)
-        )
-        assert isinstance(frame, pd.DataFrame)
-        assert frame.empty
-        assert mock_get.call_count == 1  # no retries for a legitimate empty
-
-
-# ---------------------------------------------------------------------------
-# Realized paths — the fallback for assets with no reachable minute history
-# ---------------------------------------------------------------------------
-
-
 def _api_response(payload: dict, status_code: int = 200) -> MagicMock:
     resp = MagicMock()
     resp.status_code = status_code
@@ -279,9 +203,7 @@ class TestGetPromptStartTimes:
     def test_paginates_and_dedupes(self, mock_get: MagicMock) -> None:
         """The endpoint caps ranges at 60 days, so a 120-day window must page,
         and overlapping pages must not duplicate a start_time."""
-        mock_get.return_value = _api_response(
-            {"start_times": ["2026-06-01T00:01:00Z", "2026-06-01T01:03:00Z"]}
-        )
+        mock_get.return_value = _api_response({"start_times": ["2026-06-01T00:01:00Z", "2026-06-01T01:03:00Z"]})
         starts = get_prompt_start_times(
             "XAU", 86_400, 300, datetime(2026, 4, 1, tzinfo=UTC), datetime(2026, 7, 30, tzinfo=UTC)
         )
@@ -293,9 +215,12 @@ class TestGetPromptStartTimes:
     def test_empty_range_returns_empty_list(self, mock_get: MagicMock) -> None:
         mock_get.return_value = _api_response({"start_times": None})
 
-        assert get_prompt_start_times(
-            "XAU", 86_400, 300, datetime(2026, 7, 1, tzinfo=UTC), datetime(2026, 7, 2, tzinfo=UTC)
-        ) == []
+        assert (
+            get_prompt_start_times(
+                "XAU", 86_400, 300, datetime(2026, 7, 1, tzinfo=UTC), datetime(2026, 7, 2, tzinfo=UTC)
+            )
+            == []
+        )
 
 
 class TestSnapToPromptStart:
@@ -353,9 +278,7 @@ class TestRealizedPathStore:
 
     @patch("synth_lib.preparation.realized_path_store.time.sleep")
     @patch("synth_lib.preparation.realized_path_store.get_realized_path")
-    def test_prefetch_skips_cached_prompts(
-        self, mock_fetch: MagicMock, mock_sleep: MagicMock, tmp_path
-    ) -> None:
+    def test_prefetch_skips_cached_prompts(self, mock_fetch: MagicMock, mock_sleep: MagicMock, tmp_path) -> None:
         """Already-cached prompts are not re-fetched, so a long backfill resumes."""
         mock_fetch.return_value = pd.Series([1.0], index=[self.START])
         self._store(tmp_path).prefetch([self.START])
@@ -365,9 +288,7 @@ class TestRealizedPathStore:
 
     @patch("synth_lib.preparation.realized_path_store.time.sleep")
     @patch("synth_lib.preparation.realized_path_store.get_realized_path")
-    def test_unavailable_prompt_is_not_cached(
-        self, mock_fetch: MagicMock, mock_sleep: MagicMock, tmp_path
-    ) -> None:
+    def test_unavailable_prompt_is_not_cached(self, mock_fetch: MagicMock, mock_sleep: MagicMock, tmp_path) -> None:
         mock_fetch.return_value = None
         store = self._store(tmp_path)
 

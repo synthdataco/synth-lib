@@ -9,22 +9,22 @@ from synth.validator.price_data_provider import PriceDataProvider
 
 UTC = timezone.utc
 
-PYTH_HISTORY_URL = "https://benchmarks.pyth.network/v1/shims/tradingview/history"
 SYNTHDATA_API_BASE = "https://api.synthdata.co"
 
-# Provider symbol maps, mirrored 1:1 from synth-subnet. The validator's fetch_data
-# routes each asset by precedence Binance -> Hyperliquid -> Pyth, and
-# build_price_client() mirrors that. Crypto majors (BTC/ETH/SOL/XRP) come from
-# Binance; HYPE plus every commodity/equity from Hyperliquid; only the deprecated
-# SPYX tail from Pyth.
+# Provider symbol maps, mirrored 1:1 from synth-subnet. The validator's fetch_data routes each
+# asset by precedence Binance -> Hyperliquid, and build_price_client() mirrors that: crypto majors
+# (BTC/ETH/SOL/XRP) from Binance, HYPE plus every commodity/equity from Hyperliquid.
+# RETIRED_SYMBOLS is the third map the validator still carries — assets that were served by Pyth.
+# That feed is gone, so they are unfetchable rather than merely unusual; kept here so routing can
+# say why instead of "unsupported asset".
 BINANCE_SYMBOLS: dict[str, str] = dict(PriceDataProvider.BINANCE_ASSET_MAP)
 HYPERLIQUID_SYMBOLS: dict[str, str] = dict(PriceDataProvider.HYPERLIQUID_ASSET_MAP)
-PYTH_SYMBOLS: dict[str, str] = dict(PriceDataProvider.PYTH_SYMBOL_MAP)
-ALL_SYMBOLS: dict[str, str] = {**BINANCE_SYMBOLS, **HYPERLIQUID_SYMBOLS, **PYTH_SYMBOLS}
+RETIRED_SYMBOLS: dict[str, str] = dict(PriceDataProvider.PYTH_SYMBOL_MAP)
+ALL_SYMBOLS: dict[str, str] = {**BINANCE_SYMBOLS, **HYPERLIQUID_SYMBOLS}
 
 # Local price store layout. `prices` is the canonical directory; `pyth` is what it was called
 # before the Pyth exit, and the name never meant anything about the source anyway — each partition's
-# `source` column records provenance (pyth / binance / hyperliquid / gcs / ...). Kept as a fallback
+# `source` column records provenance (binance / hyperliquid / an archive / ...). Kept as a fallback
 # so an existing store does not have to be moved; see default_store_root.
 MARKET_DATA_DIR = Path("market_data")
 STORE_SUBDIR = "prices"

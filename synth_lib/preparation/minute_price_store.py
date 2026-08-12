@@ -15,8 +15,7 @@ from synth_lib.preparation.config import (
     default_store_root,
     utc_datetime,
 )
-from synth_lib.preparation.price_client import PriceClient
-from synth_lib.preparation.pyth_client import PythHistoryClient
+from synth_lib.preparation.price_client import PriceClient, build_price_client
 
 
 class MinutePriceStore:
@@ -25,7 +24,9 @@ class MinutePriceStore:
     def __init__(self, asset: str, root: Path | None = None, client: PriceClient | None = None):
         self.asset = asset
         self.root = Path(root or default_store_root(asset)).expanduser()
-        self.client = client or PythHistoryClient()
+        # Route by asset rather than defaulting to one venue: a store built with the wrong
+        # client silently fetches nothing for assets that venue does not serve.
+        self.client = client or build_price_client(asset)
 
     def day_path(self, day: date) -> Path:
         """Return the daily parquet path."""
@@ -75,7 +76,7 @@ class MinutePriceStore:
         frame["close"] = (
             fetched["close"].reindex(expected_index) if not fetched.empty else float("nan")
         )
-        frame["source"] = getattr(self.client, "source_name", "pyth")
+        frame["source"] = getattr(self.client, "source_name", "unknown")
         frame["ingested_at"] = datetime.now(tz=UTC).replace(microsecond=0)
         frame["is_final"] = bool(is_final)
         frame = frame.reset_index(names="timestamp")
