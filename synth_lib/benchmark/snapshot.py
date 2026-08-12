@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from synth_lib.preparation.config import STORE_SUBDIR
+
 
 def sha256_file(path: Path) -> str:
     """SHA256 digest of a file, in chunks.
@@ -83,12 +85,11 @@ def render_data_md(snapshot_root: Path) -> str:
         "| asset | first day | last day | real days | nan% total | nan% first 30d | nan% last 30d |",
         "|---|---|---|---|---|---|---|",
     ]
-    stores = [d for d in (snapshot_root / "prices", snapshot_root / "pyth") if d.is_dir()]
-    for store in stores:
-        for asset_dir in sorted(store.iterdir()):
-            row = _coverage_row(asset_dir)
-            if row is not None:
-                lines.append(row)
+    store = snapshot_root / STORE_SUBDIR
+    for asset_dir in sorted(store.iterdir()) if store.is_dir() else ():
+        row = _coverage_row(asset_dir)
+        if row is not None:
+            lines.append(row)
     lines += _offline_bundle_lines(snapshot_root / "offline_data")
     return "\n".join(lines) + "\n"
 

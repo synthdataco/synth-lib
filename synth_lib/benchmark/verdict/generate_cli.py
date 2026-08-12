@@ -9,7 +9,6 @@ from pathlib import Path
 import pandas as pd
 
 from synth_lib.preparation.config import (  # type: ignore[import-untyped]
-    LEGACY_STORE_SUBDIR,
     STORE_SUBDIR,
 )
 from synth_lib.preparation.minute_price_store import MinutePriceStore  # type: ignore[import-untyped]
@@ -56,13 +55,11 @@ def main() -> None:
 
     start = _to_utc(args.window_start)
     end = _to_utc(args.window_end)
-    # Canonical `prices/` subdir, legacy `pyth/` when that is what the snapshot holds. Not
-    # hardcoded: a snapshot built from a freshly ingested store uses the new name, and a hardcoded
-    # path would silently read nothing. default_store_root() cannot be reused here — it resolves
-    # relative to the cwd, and --data-root is operator-supplied.
+    # STORE_SUBDIR, the one layout the benchmark reads: generate_predictions.py — which scores the
+    # same predictions in the sandbox — requires it, so accepting a second layout here would only
+    # move the failure later. default_store_root() cannot be reused: it resolves relative to the
+    # cwd, and --data-root is operator-supplied.
     root = args.data_root / STORE_SUBDIR / args.asset / "1m"
-    if not root.exists():
-        root = args.data_root / LEGACY_STORE_SUBDIR / args.asset / "1m"
     store = MinutePriceStore(args.asset, root=root)
     # load_range() returns a DataFrame with a "timestamp" column (default RangeIndex,
     # not time-indexed — verified at runtime): we re-index it ourselves before

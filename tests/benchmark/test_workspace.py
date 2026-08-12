@@ -212,7 +212,7 @@ def test_scaffolded_predict_anchors_paths_to_workspace_not_cwd(tmp_path, monkeyp
     root = captured["root"]
     assert root is not None and Path(root).is_absolute(), f"cwd-relative root: {root}"
     assert ws in Path(root).parents, f"root outside the workspace: {root}"
-    assert Path(root) == ws / "market_data" / "pyth" / "BTC" / "1m"
+    assert Path(root) == ws / "market_data" / "prices" / "BTC" / "1m"
 
 
 def _scaffold_and_import(tmp_path, monkeypatch):
@@ -269,7 +269,7 @@ def test_predict_coverage_passes_when_partitions_present(tmp_path, monkeypatch):
     from datetime import datetime, timezone
 
     ws, predict = _scaffold_and_import(tmp_path, monkeypatch)
-    root = ws / "market_data" / "pyth" / "BTC" / "1m"
+    root = ws / "market_data" / "prices" / "BTC" / "1m"
     root.mkdir(parents=True)
     for day in ("2026-07-10", "2026-07-11", "2026-07-12"):
         (root / f"date={day}.parquet").write_bytes(b"x")

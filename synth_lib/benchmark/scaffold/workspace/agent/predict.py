@@ -23,7 +23,7 @@ from pathlib import Path
 import pandas as pd
 
 from synth_lib.backtester.orchestration import backtest
-from synth_lib.preparation.config import LEGACY_STORE_SUBDIR, STORE_SUBDIR
+from synth_lib.preparation.config import STORE_SUBDIR
 from synth_lib.preparation.market_data import MinutePriceStore
 
 # All paths are resolved from the location of THIS file, never from the cwd: the
@@ -55,14 +55,9 @@ def store_root(asset: str) -> Path:
 
     Resolved by synth-lib rather than hardcoded: the canonical directory is `market_data/prices/`,
     with a fallback to the legacy `market_data/pyth/` when that is what the snapshot contains. Do
-    NOT hardcode either name — a snapshot built from a freshly ingested store uses the new one and a
-    hardcoded path would silently find nothing.
-
-    Anchored on WORKSPACE, not the cwd — synth-lib's default_store_root() does its existence check
-    relative to the cwd, which would break the invariant this file relies on everywhere else."""
-    base = WORKSPACE / "market_data"
-    root = base / STORE_SUBDIR / asset / "1m"
-    return root if root.exists() else base / LEGACY_STORE_SUBDIR / asset / "1m"
+    Anchored on WORKSPACE, not the cwd — synth-lib's default_store_root() resolves relative to the
+    cwd, which would break the invariant this file relies on everywhere else."""
+    return WORKSPACE / "market_data" / STORE_SUBDIR / asset / "1m"
 
 
 def check_snapshot_coverage(asset: str, start: datetime, end: datetime) -> None:
