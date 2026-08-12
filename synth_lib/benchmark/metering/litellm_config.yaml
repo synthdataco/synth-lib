@@ -4,7 +4,8 @@
 # Custom prices go under model_info, NOT litellm_params: that is the documented location
 # (docs.litellm.ai/docs/proxy/custom_pricing), and the litellm_params path is the one where
 # cache_read_input_token_cost is silently ignored and cached tokens bill at the full input rate
-# (github.com/BerriAI/litellm/issues/27191 — cost us a smoke leg, see PROXY_COMPAT.md).
+# (github.com/BerriAI/litellm/issues/27191). A cached-token rate that silently falls back to the full
+# input rate overstates an agentic leg's cost several-fold.
 model_list:
   - model_name: claude-model
     litellm_params:
@@ -15,7 +16,7 @@ model_list:
       model: anthropic/claude-opus-5
       api_key: os.environ/ANTHROPIC_API_KEY
   # Alias must be a REAL model id: codex looks its context metadata up by name and
-  # logs "Model metadata for <alias> not found" for invented names (PROXY_COMPAT.md).
+  # logs "Model metadata for <alias> not found" for invented names — cosmetic.
   - model_name: gpt-5
     litellm_params:
       model: openai/gpt-5
@@ -75,7 +76,7 @@ model_list:
   # Prices = OpenAI list for gpt-5 (gateway passes them through; a custom-base model has no
   # built-in litellm price and would meter as zero spend otherwise).
   # codex's "Model metadata for <name> not found" warning fires for this alias exactly as it
-  # already does for the plain `gpt-5` alias — cosmetic, see PROXY_COMPAT.md.
+  # already does for the plain `gpt-5` alias — cosmetic.
   - model_name: gateway-gpt-5
     litellm_params:
       model: openai/openai/gpt-5

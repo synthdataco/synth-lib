@@ -43,7 +43,7 @@ Each layer can pass while the next fails, so check all three:
 nvidia-smi                                                   # 1. host driver
 nvidia-ctk --version                                         # 2. container toolkit
 docker run --rm --gpus all nvidia/cuda:12.6.3-runtime-ubuntu24.04 nvidia-smi   # 3. containers
-docker run --rm --gpus all synth-bench-sandbox "nvidia-smi -L"                 # 4. our image
+docker run --rm --gpus all synth-bench-sandbox "nvidia-smi -L"                 # 4. the image
 ```
 
 ## Network

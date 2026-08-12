@@ -25,7 +25,7 @@ class ModelSpec:
     id: str
     cli: str
     model: str
-    wire_api: str = "responses"  # codex only — "chat" removed in 0.145.0 (PROXY_COMPAT.md)
+    wire_api: str = "responses"  # codex only — "chat" was removed in 0.145.0
 
 
 @dataclass(frozen=True)

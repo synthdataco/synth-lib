@@ -1,10 +1,10 @@
 # First-contact probe for a new CLI or provider
 
 Run this before a new CLI or a new model alias ever carries a real campaign leg. It costs cents and
-answers the questions that are version-dependent — every one of them has broken a leg at some point:
+answers the questions that are version-dependent, each of them enough to break a leg on its own:
 does the CLI accept the proxy as its endpoint, does headless mode work, does it resume, which wire
 protocol does it speak, is the spend actually metered, and what does the proxy return when the budget
-runs out. Record what you find in `PROXY_COMPAT.md`; the CLI adapters are written from it.
+runs out. Keep the answers next to your campaign configs — the CLI adapters are written from them.
 
 Prerequisite: `cp .env.proxy.example .env.proxy`, fill in the master key and the provider keys you
 need, never commit it.
@@ -76,7 +76,7 @@ BURN=$(curl -s -X POST http://localhost:4000/key/generate -H "Authorization: Bea
   -H "Content-Type: application/json" -d '{"key_alias":"burn","max_budget":0.000001}' \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['key'])")
 # make two calls with $BURN: note the exact HTTP status of the second (400 and 429 both occur,
-# by version) and the body — `budget_exceeded` means our proxy, not the provider.
+# by version) and the body — `budget_exceeded` means the proxy, not the provider.
 ```
 
 ## 5. Cached-token pricing

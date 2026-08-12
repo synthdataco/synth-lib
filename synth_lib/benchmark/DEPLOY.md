@@ -23,7 +23,7 @@ docker build -t synth-bench-sandbox <pkg>/sandbox/
 The proxy's model list is `metering/litellm_config.yaml`. Every alias a campaign names must exist
 there; the file ships with examples for several providers, and each one you add needs explicit
 prices under `model_info` (a model with no price meters as **zero spend**, which silently disables
-the budget cap). Read `metering/PROXY_COMPAT.md` before adding a provider or a CLI.
+the budget cap). Probe any new provider or CLI with `metering/spike_runbook.md` first.
 
 ## 2. Data
 

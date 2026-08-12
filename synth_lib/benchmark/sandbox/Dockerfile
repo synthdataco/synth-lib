@@ -11,10 +11,10 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
 # sandbox_cmd mounts the per-run HOME over — a symlink from /usr/local/bin dangles at runtime
 # and every leg re-discovers "uv missing" and self-installs.
 RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
-# The 3 CLIs (versions pinned at build time; document in PROXY_COMPAT.md)
-# PINNED. Unpinned installs meant every rebuild silently changed the experiment's subjects:
-# a rebuild that moved codex 0.145->0.146 changed its resume-flag parsing and killed a paid leg.
-# Bump deliberately, one at a time, and re-run a smoke campaign after.
+# The 3 CLIs, versions pinned at build time
+# PINNED, because the CLI is the experiment's subject: an unpinned rebuild changes it silently.
+# A patch release is enough — resume-flag parsing has changed between adjacent versions, which
+# breaks a leg the driver cannot then land. Bump deliberately, one at a time, and smoke after.
 RUN npm install -g @anthropic-ai/claude-code@2.1.221 @openai/codex@0.146.0 @google/gemini-cli@0.53.1
 # Kimi Code is not on npm. KIMI_INSTALL_DIR=/usr/local: the default ($HOME/.kimi-code) would be
 # hidden at runtime — sandbox_cmd mounts the per-run HOME over /root.

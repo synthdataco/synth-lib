@@ -309,7 +309,7 @@ class ModelRun:
         Only committed work is captured: the driver kills mid-turn, so anything the agent left
         unstaged is lost, which the constitution already accounts for by requiring CHAMPION.sha
         to be an existing commit.
-        Best-effort by design: a bundle failure must never cost us the deliverables above."""
+        Best-effort by design: a bundle failure must never cost the deliverables above."""
         # resolve(): `git -C <workspace>` resolves a relative bundle path UNDER the workspace,
         # so the real campaign (artifacts_dir relative to the repo root) wrote into
         # runs/<model>/campaign_runs/... and failed. Absolute-tmp_path tests never caught it.

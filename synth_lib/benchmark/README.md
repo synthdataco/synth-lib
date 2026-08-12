@@ -34,8 +34,8 @@ that stops with `agent/CHAMPION` present is done and forfeits the rest of its en
 
 **Metering.** All model traffic goes through a LiteLLM proxy (`metering/`), one budget-capped
 virtual key per leg, so every model is measured with the same instrument and the ledger is the
-single source of truth for spend. `metering/PROXY_COMPAT.md` is the accumulated ledger of
-provider/CLI quirks — read it before adding a model.
+single source of truth for spend. Probe any new provider or CLI with `metering/spike_runbook.md`
+before it carries a real leg, and keep the answers: the adapters are written from them.
 
 **Sandbox.** `sandbox/` builds one image with the pinned CLIs; each leg runs in a container with its
 workspace, a read-only price snapshot at `/workspace/market_data`, a per-run HOME, capped CPU/RAM,

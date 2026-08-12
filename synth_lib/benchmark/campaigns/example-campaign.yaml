@@ -4,7 +4,7 @@ objective: >-
   (e.g. a parameter), journal it, then land immediately (report.md + CHAMPION).
 models:
   - {id: claude, cli: claude-code, model: claude-model}
-  - {id: codex, cli: codex, model: gpt-5, wire_api: responses}   # per PROXY_COMPAT.md
+  - {id: codex, cli: codex, model: gpt-5, wire_api: responses}   # newer codex speaks Responses
   - {id: gemini, cli: gemini-cli, model: gemini-3.1-pro-preview}   # real Google id: goes in the URL path
   - {id: engy, cli: claude-code, model: engy-glm-5.2}   # engy.ai glm-5.2 via the Anthropic API
   - {id: kimi, cli: kimi-code, model: engy-kimi-k3}   # Kimi K3, engy serving

@@ -175,7 +175,7 @@ def run_all(
         elif hasattr(admin, "generate_key"):
             # Passthrough-driven legs get an UNCAPPED proxy key: LiteLLM's budget reservation
             # leaks exactly max_budget on the /gemini passthrough, so any cap rejects everything
-            # after the first call (PROXY_COMPAT.md "Phantom budget 429", litellm#27639). The
+            # after the first call (litellm#27639 — a phantom budget 429). The
             # driver still enforces the real budget — BudgetTracker uses cfg.budget_usd_per_model
             # and true /key/info spend, never the key's own cap. Cost: no dead-driver backstop
             # for these legs, until the upstream fix lands.
@@ -196,7 +196,7 @@ def run_all(
         workspace = (state.dir / "runs" / model.id).resolve()
         agent_dir = workspace / "agent"
         # Dedicated HOME per run (NOT under /tmp — codex refuses to create its helper
-        # binaries there, cf. PROXY_COMPAT.md), provisioned BEFORE launch.
+        # binaries there), provisioned BEFORE launch.
         home = state.dir / "runs" / f"{model.id}-home"
         home.mkdir(parents=True, exist_ok=True)
         provision_home(adapter, home)
