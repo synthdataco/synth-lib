@@ -46,8 +46,7 @@ class HyperliquidClient:
         timestamps = pd.date_range(start_time, end_time, freq="1min", tz="UTC")
         if len(timestamps) != len(closes):
             raise RuntimeError(
-                f"Hyperliquid timestamp/close length mismatch for {asset}: "
-                f"{len(timestamps)} vs {len(closes)}"
+                f"Hyperliquid timestamp/close length mismatch for {asset}: " f"{len(timestamps)} vs {len(closes)}"
             )
         frame = pd.DataFrame({"timestamp": timestamps, "close": pd.Series(closes, dtype="float64")})
         return frame.dropna(subset=["close"]).reset_index(drop=True)

@@ -73,9 +73,7 @@ class MinutePriceStore:
         frame = pd.DataFrame(index=expected_index)
         # float NaN, not pd.NA: a scalar pd.NA makes the column object dtype,
         # which reads back as None and breaks float()/np.isfinite() consumers.
-        frame["close"] = (
-            fetched["close"].reindex(expected_index) if not fetched.empty else float("nan")
-        )
+        frame["close"] = fetched["close"].reindex(expected_index) if not fetched.empty else float("nan")
         frame["source"] = getattr(self.client, "source_name", "unknown")
         frame["ingested_at"] = datetime.now(tz=UTC).replace(microsecond=0)
         frame["is_final"] = bool(is_final)
