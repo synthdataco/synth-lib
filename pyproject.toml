@@ -21,20 +21,23 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.8",
+    "pandas>=2.2",
     "pyarrow>=24.0.0",
+    "requests>=2.32",
     "seaborn>=0.13.2",
     "synth-subnet",
+    "tenacity>=8.0",
 ]
 
 # An EXTRA, not a dependency-group: groups are invisible to a consumer that depends on this
 # library by git URL, so `synth-lib[benchmark]` is the only way a downstream benchmark repo can
-# install what the harness needs.
+# install what the harness needs. Only what the HARNESS alone needs belongs here — pandas,
+# requests and tenacity are imported by the backtester and preparation, so a plain
+# `pip install synth-lib` must already have them; they were reaching those modules by luck
+# (seaborn pulls pandas transitively), which breaks the day a transitive dep drops them.
 [project.optional-dependencies]
 benchmark = [
     "pyyaml>=6.0",
-    "requests>=2.32",
-    "tenacity>=8.0",
-    "pandas>=2.2",
 ]
 
 [dependency-groups]
