@@ -268,11 +268,7 @@ def unpack(
             if bundle.exists():
                 shutil.copy(bundle, dest / BUNDLE_NAME)
             # An agent that nominated by committing `<agent_dir>/CHAMPION` wrote a file naming the
-            # commit that existed BEFORE the one adding it — a commit cannot contain its own sha — so
-            # the copied tree's CHAMPION is always at least one commit stale. It arrives at exactly
-            # the path a leg-level CHAMPION occupies, where run_verdict reads the sha to score, so
-            # leaving it in place scores the wrong code. Keep it as CHAMPION.agent for the record and
-            # write the archive's, which the harness re-derived at collection.
+            # commit that existed BEFORE the one adding it.
             if (dest / CHAMPION_NAME).exists():
                 (dest / CHAMPION_NAME).rename(dest / AGENT_CHAMPION_NAME)
             shutil.copy(leg_dir / CHAMPION_NAME, dest / CHAMPION_NAME)
