@@ -2,7 +2,7 @@
 
 Kept as the CLI's home (`uv run synth_lib/preparation/market_data.py`) because that
 path is documented in the miner tutorial. The pieces live in sibling modules:
-config, {pyth,hyperliquid,binance}_client, price_client, validator_api,
+config, {hyperliquid,binance}_client, price_client, validator_api,
 minute_price_store, realized_path_store.
 """
 

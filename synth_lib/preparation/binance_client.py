@@ -12,7 +12,7 @@ from synth_lib.preparation.config import BINANCE_SYMBOLS, utc_datetime
 
 
 class BinanceClient:
-    """Wrapper around synth's PriceDataProvider matching PythHistoryClient's interface."""
+    """Wrapper around synth's PriceDataProvider implementing the PriceClient protocol."""
 
     source_name = "binance"
 
@@ -45,8 +45,7 @@ class BinanceClient:
         timestamps = pd.date_range(start_time, end_time, freq="1min", tz="UTC")
         if len(timestamps) != len(closes):
             raise RuntimeError(
-                f"Binance timestamp/close length mismatch for {asset}: "
-                f"{len(timestamps)} vs {len(closes)}"
+                f"Binance timestamp/close length mismatch for {asset}: " f"{len(timestamps)} vs {len(closes)}"
             )
         frame = pd.DataFrame({"timestamp": timestamps, "close": pd.Series(closes, dtype="float64")})
         return frame.dropna(subset=["close"]).reset_index(drop=True)

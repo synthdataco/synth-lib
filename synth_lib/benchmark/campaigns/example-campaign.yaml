@@ -1,0 +1,23 @@
+name: smoke
+objective: >-
+  Smoke campaign: make ONE single trivial micro-improvement to the model in your agent folder
+  (e.g. a parameter), journal it, then land immediately (report.md + CHAMPION).
+models:
+  - {id: claude, cli: claude-code, model: claude-model}
+  - {id: codex, cli: codex, model: gpt-5, wire_api: responses}   # newer codex speaks Responses
+  - {id: gemini, cli: gemini-cli, model: gemini-3.1-pro-preview}   # real Google id: goes in the URL path
+  - {id: engy, cli: claude-code, model: engy-glm-5.2}   # engy.ai glm-5.2 via the Anthropic API
+  - {id: kimi, cli: kimi-code, model: engy-kimi-k3}   # Kimi K3, engy serving
+budget_usd_per_model: 2.0
+deadline_hours_per_model: 0.5
+data_cutoff: 2026-07-29  # last settled day: eval_end must be <= now - (horizon + 1d)
+forward_window_days: 1
+baselines:
+  - {name: synth_default, module: synth_lib/benchmark/verdict/baseline_default.py}
+hardware: "GCP n2-standard-16: 16 vCPU / 64GB RAM, NO GPU. Your sandbox is capped at 12 CPU / 12GB."
+proxy_url: http://localhost:4000
+gpu: false  # smoke doesn't train anything; nvidia-docker toolkit not yet validated
+sandbox_memory_gb: 12  # host must have at least this; keep `hardware:` above in sync
+sandbox_cpus: 12
+poll_seconds: 30  # faster cadence for a 30-min test (default 300 = too slow)
+landing_grace_seconds: 120

@@ -26,10 +26,11 @@ uv sync
 
 ## 1. Download market data
 
-Data is fetched from Pyth (spot equities, commodities, majors) or Hyperliquid
-(perps) depending on the asset, and cached under
-`market_data/pyth/{ASSET}/1m/date=YYYY-MM-DD.parquet`. Existing finalised
-partitions are skipped unless `--force-refresh` is passed.
+Data is fetched from Binance (crypto majors) or Hyperliquid (perps, including
+the tokenised equities and commodities) depending on the asset, and cached under
+`market_data/prices/{ASSET}/1m/date=YYYY-MM-DD.parquet`. Existing finalised
+partitions are skipped unless `--force-refresh` is passed. A store still laid out
+under the legacy `market_data/pyth/` name keeps being read in place.
 
 ### All supported assets, default 15-month window
 
@@ -91,7 +92,7 @@ download_all_assets(days=30)
 
 ```
 market_data/
-└── pyth/
+└── prices/
     └── BTC/
         └── 1m/
             ├── date=2025-01-15.parquet
@@ -408,15 +409,15 @@ values (mean absolute error 1.45e-3; crypto-24h, 2026-07-05). The small residual
 is attributable to a 1-day CRPS window truncating the 10-day smoothing lookback,
 not to tapering.
 
-**Pyth Pro feed + settled-witness.** The settled-witness (waiting for the candle
+**Price source + settled-witness.** The settled-witness (waiting for the candle
 to close) is moot for historical backtests, since past candles are already
-settled. The backtester scores our miner against the free Pyth benchmarks
-endpoint rather than the validator's Pyth Pro feed; a small absolute-CRPS
-divergence is possible but was **not** directly measured (we lack other miners'
-raw predictions to recompute their CRPS). It does not affect rank / relative
-performance or the reward-weight reconstruction (which uses the API's own CRPS),
-so keeping the free endpoint is the recommendation — revisit only if
-absolute-CRPS calibration is ever required.
+settled. The backtester scores our miner against venue candles from the local
+store, which need not be bar-for-bar identical to the feed the validator read at
+prompt time; a small absolute-CRPS divergence is possible but was **not**
+directly measured (we lack other miners' raw predictions to recompute their
+CRPS). It does not affect rank / relative performance or the reward-weight
+reconstruction (which uses the API's own CRPS) — revisit only if absolute-CRPS
+calibration is ever required.
 
 Two scripts back these checks:
 [`scripts/validate_earnings_formula.py`](synth_lib/backtester/scripts/validate_earnings_formula.py)
@@ -438,7 +439,7 @@ uv run pytest tests/backtester/
   `https://api.synthdata.co`. The Synth API rate-limits; requests are retried
   with exponential backoff. Long multi-asset runs take a while.
 - `download_price_data` reads exclusively from local parquet partitions.
-  Make sure the relevant `market_data/pyth/{ASSET}/1m/` directory is populated
+  Make sure the relevant `market_data/prices/{ASSET}/1m/` directory is populated
   (see section 1) — the `crypto-1h` competition needs coverage up to today
   since its prompt window is only 1h.
 - Prompts older than Hyperliquid's ~3.5-day retention are scored from the

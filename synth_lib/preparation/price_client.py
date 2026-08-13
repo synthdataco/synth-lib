@@ -12,10 +12,9 @@ from synth_lib.preparation.config import (
     ALL_SYMBOLS,
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
-    PYTH_SYMBOLS,
+    RETIRED_SYMBOLS,
 )
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
-from synth_lib.preparation.pyth_client import PythHistoryClient
 
 
 class PriceClient(Protocol):
@@ -27,13 +26,15 @@ class PriceClient(Protocol):
 def build_price_client(asset: str) -> PriceClient:
     """Return the price client for an asset, mirroring the validator's routing.
 
-    Precedence matches PriceDataProvider.fetch_data: Binance, then Hyperliquid,
-    then Pyth.
+    Precedence matches PriceDataProvider.fetch_data: Binance, then Hyperliquid.
     """
     if asset in BINANCE_SYMBOLS:
         return BinanceClient()
     if asset in HYPERLIQUID_SYMBOLS:
         return HyperliquidClient()
-    if asset in PYTH_SYMBOLS:
-        return PythHistoryClient()
+    if asset in RETIRED_SYMBOLS:
+        raise ValueError(
+            f"{asset} was served by Pyth, which is retired: no client can fetch it. Supply its "
+            f"history from an archive, or exclude it."
+        )
     raise ValueError(f"Unsupported asset: {asset}. Supported: {list(ALL_SYMBOLS.keys())}")

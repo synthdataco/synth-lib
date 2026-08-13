@@ -1,0 +1,9 @@
+# The agent is told to commit often, so anything huge and regenerable must be excluded here:
+# a `git add -A` would otherwise commit a multi-GB .venv (torch + CUDA on GPU campaigns) and
+# 1000-path prediction files at ~5.5MB each. Committed weights are the exception — the champion
+# must stay runnable offline, so DO NOT add model artifacts to this list.
+.venv/
+__pycache__/
+*.pyc
+miner_outputs/
+market_data/

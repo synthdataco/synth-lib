@@ -3105,9 +3105,17 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "matplotlib" },
+    { name = "pandas" },
     { name = "pyarrow" },
+    { name = "requests" },
     { name = "seaborn" },
     { name = "synth-subnet" },
+    { name = "tenacity" },
+]
+
+[package.optional-dependencies]
+benchmark = [
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -3118,10 +3126,15 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.8" },
+    { name = "pandas", specifier = ">=2.2" },
     { name = "pyarrow", specifier = ">=24.0.0" },
+    { name = "pyyaml", marker = "extra == 'benchmark'", specifier = ">=6.0" },
+    { name = "requests", specifier = ">=2.32" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "synth-subnet", git = "https://github.com/synthdataco/synth-subnet?rev=0d014cbcec376b28e887403b84025ebf1a89f60e" },
+    { name = "tenacity", specifier = ">=8.0" },
 ]
+provides-extras = ["benchmark"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.3" }]

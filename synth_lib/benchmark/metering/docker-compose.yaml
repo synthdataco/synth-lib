@@ -1,0 +1,19 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: litellm-local
+    volumes: ["litellm-db:/var/lib/postgresql/data"]
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    depends_on: [db]
+    ports: ["4000:4000"]
+    env_file: [.env.proxy]
+    environment:
+      DATABASE_URL: postgresql://litellm:litellm-local@db:5432/litellm
+    volumes: ["./litellm_config.yaml:/app/config.yaml"]
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+volumes:
+  litellm-db:
