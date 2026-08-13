@@ -247,6 +247,33 @@ def test_allow_missing_data_unpacks_a_dead_reference_and_discloses_it(tmp_path):
     assert "artifacts/kept.npz" in provenance, "what IS present must still be listed"
 
 
+def test_unpack_writes_the_archives_champion_and_keeps_the_agents(tmp_path):
+    """An agent-committed CHAMPION names the commit BEFORE the one adding it — a commit cannot carry
+    its own sha — and it lands exactly where a leg-level CHAMPION lives, which is where run_verdict
+    reads the sha to score. The archive's must win; the agent's is kept for the record."""
+    results_dir = _make_bundle(tmp_path, extra={"CHAMPION": "sha: 0000000\nagent_dir: agent\nprofiles: [high]\n"})
+    leg_dir = results_dir / "test-camp" / "fake"
+    real_sha = (leg_dir / "CHAMPION").read_text().split("sha:")[1].split()[0]
+
+    dest = unpack("test-camp", "fake", "shadowed", results_dir, tmp_path / "champions")
+
+    assert (dest / "CHAMPION").read_text() == (leg_dir / "CHAMPION").read_text()
+    assert real_sha in (dest / "CHAMPION").read_text()
+    assert "0000000" in (dest / "CHAMPION.agent").read_text(), "the agent's file must survive verbatim"
+    provenance = (dest / "PROVENANCE.md").read_text()
+    assert "CHAMPION.agent" in provenance and real_sha[:7] in provenance
+
+
+def test_unpack_writes_a_champion_even_when_the_tree_had_none(tmp_path):
+    """Two legs' agents never committed a nomination file; their unpacked trees were left with no
+    CHAMPION at all, which run_verdict reads as 'no champion here' and skips."""
+    results_dir = _make_bundle(tmp_path)
+    dest = unpack("test-camp", "fake", "nofile", results_dir, tmp_path / "champions")
+    assert (dest / "CHAMPION").exists()
+    assert not (dest / "CHAMPION.agent").exists()
+    assert "committed no nomination file" in (dest / "PROVENANCE.md").read_text()
+
+
 def test_unpack_refuses_to_overwrite_a_champions_own_file(tmp_path):
     """The generated shell must never silently replace something the agent wrote."""
     results_dir = _make_bundle(tmp_path, extra={"miner.py": "# the agent's own miner\n"})

@@ -14,6 +14,11 @@ gate. Copying everything also keeps the research scripts and journal that explai
 the constant. `runtime_data_status` then reports which data files the module names are actually
 there; a gap stops the unpack unless `--allow-missing-data` says the reference is dead code.
 
+One file is deliberately not verbatim: a `CHAMPION` committed by the agent names the commit *before*
+the one adding it, so it is kept as `CHAMPION.agent` and the archive's — the sha the harness
+re-derived at collection — is written in its place. Every tool that reads `<leg>/CHAMPION` for a sha,
+`run_verdict` included, then scores the code that was actually nominated.
+
 Self-verifying: before anything is written, the champion is run through the LIVE validator
 contract (`validate_responses`) on a synthetic context, once per nominated profile. A champion
 that fails the gate is not unpacked.
@@ -114,6 +119,7 @@ PROVENANCE_TEMPLATE = Template(
 - Runtime data present: $runtime_data
 - Referenced but absent: $missing_data
 - Added by the unpacker: $added (nothing else was modified)
+- Nomination: `CHAMPION` is the archive's, the sha above. $agent_champion
 - History: $bundle
 - Profiles: $profiles
 - Unpacked: $date
@@ -165,7 +171,9 @@ def contract_gate(modeling_path: Path, profiles: tuple[str, ...]) -> None:
 # What the unpacker writes into the tree. Never overwritten: if a champion happens to carry a file
 # of the same name, the unpack refuses rather than silently shipping the agent's version.
 BUNDLE_NAME = "workspace.bundle"
-GENERATED = ("miner.py", "entrypoint.sh", "PROVENANCE.md", BUNDLE_NAME)
+CHAMPION_NAME = "CHAMPION"
+AGENT_CHAMPION_NAME = "CHAMPION.agent"
+GENERATED = ("miner.py", "entrypoint.sh", "PROVENANCE.md", BUNDLE_NAME, AGENT_CHAMPION_NAME)
 
 
 def champion_source(leg_dir: Path, champion: Champion, tmp: Path) -> Path:
@@ -232,7 +240,7 @@ def unpack(
     allow_missing_data: bool = False,
 ) -> Path:
     leg_dir = results_dir / campaign / leg
-    champion: Champion = parse_champion(leg_dir / "CHAMPION")
+    champion: Champion = parse_champion(leg_dir / CHAMPION_NAME)
     name = name or f"{campaign.replace('-', '_')}_{leg}"
     dest = dest_root / name
     if dest.exists():
@@ -259,6 +267,11 @@ def unpack(
             bundle = leg_dir / BUNDLE_NAME
             if bundle.exists():
                 shutil.copy(bundle, dest / BUNDLE_NAME)
+            # An agent that nominated by committing `<agent_dir>/CHAMPION` wrote a file naming the
+            # commit that existed BEFORE the one adding it.
+            if (dest / CHAMPION_NAME).exists():
+                (dest / CHAMPION_NAME).rename(dest / AGENT_CHAMPION_NAME)
+            shutil.copy(leg_dir / CHAMPION_NAME, dest / CHAMPION_NAME)
             runtime_data, missing = runtime_data_status(dest)
             if missing and not allow_missing_data:
                 raise RuntimeError(
@@ -280,7 +293,13 @@ def unpack(
         "agent_dir": champion.agent_dir,
         "profiles": ", ".join(champion.profiles),
         "runtime_data": ", ".join(f"`{p}`" for p in runtime_data) if runtime_data else "none (code-only champion)",
-        "added": ", ".join(f"`{f}`" for f in GENERATED if (dest / f).exists()),
+        # Static for the files always written (they do not exist yet at substitution time) plus the
+        # two that depend on the leg.
+        "added": ", ".join(
+            f"`{f}`"
+            for f in (CHAMPION_NAME, "miner.py", "entrypoint.sh", "PROVENANCE.md")
+            + tuple(f for f in (BUNDLE_NAME, AGENT_CHAMPION_NAME) if (dest / f).exists())
+        ),
         "bundle": (
             f"`{BUNDLE_NAME}` — the champion's own git history. Verify this tree against the sha it "
             f"claims:\n  `git clone {BUNDLE_NAME} /tmp/verify && git -C /tmp/verify rev-parse {champion.sha}`"
@@ -293,6 +312,12 @@ def unpack(
             f"Whatever the champion does when they are absent is what this miner will serve."
             if missing
             else "none"
+        ),
+        "agent_champion": (
+            f"The agent's own nomination file is kept verbatim as `{AGENT_CHAMPION_NAME}`; it names an "
+            f"earlier commit, because a commit cannot contain its own sha."
+            if (dest / AGENT_CHAMPION_NAME).exists()
+            else "This agent committed no nomination file of its own."
         ),
         "date": datetime.now(tz=UTC).date().isoformat(),
     }
