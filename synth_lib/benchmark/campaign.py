@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -28,10 +29,33 @@ class ModelSpec:
     wire_api: str = "responses"  # codex only — "chat" was removed in 0.145.0
 
 
+PACKAGED_BASELINE = "synth_lib.benchmark.verdict.baseline_default"
+
+
 @dataclass(frozen=True)
 class BaselineSpec:
+    """A control to score alongside the champions.
+
+    `module` is a dotted import path OR a filesystem path to a file exposing `simulate()`. It used to
+    be repo-relative only, which had no valid value once the engine became an installed package: the
+    default baseline ships inside it, so a campaign could either name a path into site-packages or
+    declare no baseline at all. Resolve it with `baseline_modeling_path`."""
+
     name: str
-    module: str  # repo-relative path to a file exposing simulate()
+    module: str = PACKAGED_BASELINE
+
+
+def baseline_modeling_path(module: str) -> Path:
+    """Filesystem path of a baseline's `simulate()` file, from a dotted module or a path."""
+    if "/" in module or module.endswith(".py"):
+        return Path(module)
+    try:
+        spec = importlib.util.find_spec(module)
+    except ModuleNotFoundError as exc:  # a missing PARENT package raises instead of returning None
+        raise ValueError(f"baseline module {module!r} is not importable and is not a path") from exc
+    if spec is None or spec.origin is None:
+        raise ValueError(f"baseline module {module!r} is not importable and is not a path")
+    return Path(spec.origin)
 
 
 @dataclass(frozen=True)
@@ -77,7 +101,7 @@ def _as_date(value: object) -> date | None:
 def load_campaign(path: Path | str) -> CampaignConfig:
     raw = yaml.safe_load(Path(path).read_text())
     models = tuple(ModelSpec(**m) for m in raw.pop("models"))
-    baselines = tuple(BaselineSpec(**b) for b in raw.pop("baselines"))
+    baselines = tuple(BaselineSpec(**b) for b in raw.pop("baselines", []) or [])
     # yaml already gives a date for an unquoted YYYY-MM-DD; normalise the quoted form too, so a
     # stray string cannot reach the date comparisons in build_snapshot.
     cutoff = _as_date(raw.pop("data_cutoff"))

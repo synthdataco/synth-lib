@@ -38,7 +38,8 @@ import pandas as pd
 from synth.validator.competition_config import ALL_COMPETITIONS  # type: ignore[import-untyped]
 
 from synth_lib.benchmark.nomination import parse_champion
-from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, sandbox_cmd
+from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
+from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
 from synth_lib.benchmark.verdict.evaluate import evaluate_candidate, prepare_offline_bundle
 
 GENERATE_SCRIPT = Path(__file__).resolve().parents[1] / "generate_predictions.py"
@@ -200,6 +201,7 @@ def verdict_payload(result: dict, sha: str | None, window: tuple[str, str]) -> d
             "data cutoff, but agents had live field-API access during their runs",
         },
         "champion_sha": sha,
+        "sandbox_image": image_identity(SANDBOX_IMAGE),
         "cadence_minutes": CADENCE_MINUTES,
         "num_simulations": 1000,
     }
@@ -221,6 +223,11 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     )
     ap.add_argument("--force", action="store_true", help="rescore legs whose verdict.json already exists")
     ap.add_argument("--skip-baseline", action="store_true")
+    ap.add_argument(
+        "--baseline-module",
+        default=PACKAGED_BASELINE,
+        help="dotted module path or file path exposing simulate() (default: the packaged control)",
+    )
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--keep-work", action="store_true", help="keep clones + predictions for inspection")
     args = ap.parse_args()
@@ -273,7 +280,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     if not args.skip_baseline and baseline_out.exists() and not args.force:
         print(f"[baseline] {verdict_name} already exists — SKIPPING (pass --force to rescore)", flush=True)
     elif not args.skip_baseline:
-        baseline_modeling = Path(__file__).parent / "baseline_default.py"
+        baseline_modeling = baseline_modeling_path(args.baseline_module)
         predictions = work / "baseline-predictions"
         print("[baseline] generating (host)", flush=True)
         generate_baseline(baseline_modeling, data_root, predictions, window)

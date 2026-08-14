@@ -89,3 +89,30 @@ def test_empty_models_rejected(tmp_path):
     )
     with pytest.raises(ValueError, match="models"):
         load_campaign(_write(tmp_path, bad))
+
+
+def test_baseline_module_defaults_to_the_packaged_control(tmp_path):
+    """`module` used to be repo-relative, which had no valid value once the engine became an
+    installed package: the default baseline ships inside it."""
+    from synth_lib.benchmark.campaign import PACKAGED_BASELINE, BaselineSpec, baseline_modeling_path
+
+    assert BaselineSpec(name="synth_default").module == PACKAGED_BASELINE
+    resolved = baseline_modeling_path(PACKAGED_BASELINE)
+    assert resolved.name == "baseline_default.py" and resolved.exists()
+    assert baseline_modeling_path("agent/mine.py") == Path("agent/mine.py")  # a path still works
+    with pytest.raises(ValueError, match="not importable"):
+        baseline_modeling_path("no.such.module")
+
+
+def test_campaign_without_a_baselines_key_loads(tmp_path):
+    """A campaign that names no control is legal — the key was required, so `baselines: []` was the
+    only honest value a public yaml could give."""
+    from synth_lib.benchmark.campaign import load_campaign
+
+    text = tmp_path / "c.yaml"
+    text.write_text(
+        "name: nobase\nobjective: x\nmodels:\n  - {id: a, cli: fake, model: m}\n"
+        "budget_usd_per_model: 1\ndeadline_hours_per_model: 1\ndata_cutoff: 2026-08-01\n"
+        "forward_window_days: 1\nhardware: h\nproxy_url: http://localhost:4000\n"
+    )
+    assert load_campaign(text).baselines == ()

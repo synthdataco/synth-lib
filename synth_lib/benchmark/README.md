@@ -34,8 +34,8 @@ that stops with `agent/CHAMPION` present is done and forfeits the rest of its en
 
 **Metering.** All model traffic goes through a LiteLLM proxy (`metering/`), one budget-capped
 virtual key per leg, so every model is measured with the same instrument and the ledger is the
-single source of truth for spend. Probe any new provider or CLI with `metering/spike_runbook.md`
-before it carries a real leg, and keep the answers: the adapters are written from them.
+single source of truth for spend. Probe any new provider or CLI before it carries a real leg (the
+deployment repo has the runbook) and keep the answers: the adapters are written from them.
 
 **Sandbox.** `sandbox/` builds one image with the pinned CLIs; each leg runs in a container with its
 workspace, a read-only price snapshot at `/workspace/market_data`, a per-run HOME, capped CPU/RAM,
@@ -92,14 +92,24 @@ mean rank for "where the strength actually is".
 | `snapshot.py` | freezes `market_data` at the cutoff (hard links + manifest) and renders `DATA.md` |
 | `nomination.py` | the `CHAMPION` contract and the `simulate()` interface probe |
 | `cli_adapters.py` | per-CLI argv/env, including a `fake` CLI for zero-cost dry runs |
-| `sandbox/` | the container image and `docker run` construction |
-| `metering/` | LiteLLM proxy compose, model list, virtual keys, provider quirks |
+| `sandbox/` | `docker run` construction (mounts, caps, network, GPU) |
+| `metering/` | the LiteLLM admin client: one budget-capped virtual key per leg |
 | `verdict/` | prediction generation and scoring of an archived champion |
 | `generate_predictions.py` | the generation core; copied into champion clones, so numpy/pandas/stdlib only |
 
-Operator docs: [PROVISIONING.md](PROVISIONING.md) (a box to run on), [DEPLOY.md](DEPLOY.md) (install
-→ data → smoke → campaign → verdict), [OPERATIONS.md](OPERATIONS.md) (what to run while a campaign
-is live).
+## What this package does NOT ship
+
+Everything you deploy or edit per box and per campaign — the sandbox `Dockerfile`, the metering
+proxy's compose file and model list, `.env.proxy`, campaign yamls, and the operator runbooks
+(provision → install → run → operate) — lives in the reference deployment, [synth-bench](https://github.com/synthdataco/synth-bench),
+which is also where results are published. Nothing here reads those files; shipping them in a wheel
+only meant copying them back out of site-packages. What stays is what the engine imports or reads:
+the constitution template, the workspace scaffold, `generate_predictions.py`, the baseline, and the
+`fake` CLI.
+
+The image *name* is still the engine's business — `SYNTH_BENCH_SANDBOX_IMAGE`, default
+`synth-bench-sandbox` — because the runner passes it to `docker run`; the recipe that builds it is
+not.
 
 ## Not a general-purpose agent runner
 

@@ -70,7 +70,7 @@ class ModelRun:
         self.cmd_wrapper = cmd_wrapper or (lambda cmd: cmd)
         # Continue transcript numbering after any existing files: a rerun used to restart at 0
         # and OVERWRITE the previous attempt's transcripts one by one (the stale-transcript trap,
-        # OPERATIONS.md) — now each attempt appends to the leg's audit trail instead.
+        # the restart runbook) — now each attempt appends to the leg's audit trail instead.
         existing = [
             int(m.group(1))
             for p in artifacts_dir.glob("transcript-*.log")

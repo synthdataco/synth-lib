@@ -38,7 +38,7 @@ def test_mini_campaign_end_to_end(tmp_path, monkeypatch):
     (repo / "market_data" / "pyth" / "BTC" / "1m" / "date=2026-07-10.parquet").write_bytes(b"x")
     campaign_file = _write_campaign(tmp_path, repo)
 
-    state = setup_campaign(campaign_file, repo_root=repo, campaigns_root=tmp_path / "campaigns")
+    state = setup_campaign(campaign_file, data_root=repo, campaigns_root=tmp_path / "campaigns")
     assert (state.dir / "snapshot" / "manifest.json").exists()
     assert (state.dir / "runs" / "f1").exists() and (state.dir / "runs" / "f2").exists()
 
@@ -63,7 +63,7 @@ def test_rerun_does_not_move_forward_window(tmp_path):
     (repo / "market_data" / "pyth" / "BTC" / "1m" / "date=2026-07-10.parquet").write_bytes(b"x")
     campaign_file = _write_campaign(tmp_path, repo)
 
-    state = setup_campaign(campaign_file, repo_root=repo, campaigns_root=tmp_path / "campaigns")
+    state = setup_campaign(campaign_file, data_root=repo, campaigns_root=tmp_path / "campaigns")
     run_all(
         state,
         admin=HoldAdmin(spend=8.6),
