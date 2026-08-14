@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from synth_lib.benchmark.sandbox.run_sandbox import sandbox_cmd
 
@@ -76,3 +77,26 @@ def test_relative_paths_are_absolutized(tmp_path, monkeypatch):
     joined = " ".join(cmd)
     assert f"-v {tmp_path}/rel/ws:/workspace:rw" in joined
     assert f"-v {tmp_path}/rel/snap:/workspace/market_data:ro" in joined
+
+
+def test_image_identity_survives_a_missing_daemon(monkeypatch):
+    """Provenance metadata must never fail a campaign: no daemon, or an image not built yet, yields
+    None fields rather than an exception."""
+    from synth_lib.benchmark.sandbox import run_sandbox
+
+    monkeypatch.setattr(
+        run_sandbox.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="nope")
+    )
+    assert run_sandbox.image_identity("img") == {"name": "img", "id": None, "digest": None}
+
+    monkeypatch.setattr(
+        run_sandbox.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="sha256:abc|repo/img@sha256:def\n", stderr=""),
+    )
+    assert run_sandbox.image_identity("img") == {"name": "img", "id": "sha256:abc", "digest": "repo/img@sha256:def"}
+
+    monkeypatch.setattr(
+        run_sandbox.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="sha256:abc|\n", stderr="")
+    )
+    assert run_sandbox.image_identity("img")["digest"] is None, "a locally built image has no RepoDigest"

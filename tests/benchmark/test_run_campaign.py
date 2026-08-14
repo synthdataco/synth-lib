@@ -270,7 +270,7 @@ def test_setup_accepts_campaign_file_already_in_place(tmp_path):
     }
     f = camp_dir / "campaign.yaml"
     f.write_text(yaml.safe_dump(cfg))
-    state = setup_campaign(f, repo_root=repo, campaigns_root=tmp_path / "campaigns")
+    state = setup_campaign(f, data_root=repo, campaigns_root=tmp_path / "campaigns")
     assert (state.dir / "campaign.yaml").exists() and (state.dir / "snapshot" / "manifest.json").exists()
 
 
@@ -315,7 +315,7 @@ def test_virtual_key_persisted_and_reused_across_reruns(tmp_path):
     }
     f = tmp_path / "campaign.yaml"
     f.write_text(_yaml.safe_dump(camp))
-    state = setup_campaign(f, repo_root=repo, campaigns_root=tmp_path / "campaigns")
+    state = setup_campaign(f, data_root=repo, campaigns_root=tmp_path / "campaigns")
     admin = CountingAdmin()
     import sys
 
