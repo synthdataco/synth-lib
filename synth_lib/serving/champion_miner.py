@@ -7,9 +7,13 @@ champion's output to the live validator contract.
 
 No guards: an unservable asset, a data hole, or an exploding path crashes the request so it
 shows up in monitoring instead of silently degrading.
-"""
 
-from __future__ import annotations
+Deliberately NO `from __future__ import annotations` here. bittensor's `axon.attach` discovers the
+request type by reading the first parameter's annotation off `forward_miner` and calling
+`issubclass()` on it. Under PEP 563 that annotation is the *string* `"Simulation"`, so attach dies
+with `TypeError: issubclass() arg 1 must be a class` and the miner cannot start at all. Keep the
+annotations in this module evaluated.
+"""
 
 import logging
 import threading
