@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["synth_lib"]
 
-# The benchmark subpackage ships non-Python payload the harness needs at runtime: the constitution
-# template, the agent workspace scaffold, the sandbox Dockerfile and the proxy configs. Hatchling
-# includes package data by default, so no force-include is needed — but a DOTFILE would be lost,
-# which is why the scaffold's .gitignore ships as `gitignore.tmpl` and is renamed at workspace
-# creation. Verify after any packaging change:
-#   uv build && python -m zipfile -l dist/*.whl | grep -E "CAMPAIGN.md.tmpl|Dockerfile|gitignore.tmpl"
+# The benchmark subpackage ships the non-Python payload the ENGINE reads at runtime: the constitution
+# template and the agent workspace scaffold. Deployment payload (Dockerfile, proxy configs, campaign
+# yamls) is not here — see synth_lib/benchmark/README.md. Hatchling includes package data by default,
+# so no force-include is needed — but a DOTFILE would be lost, which is why the scaffold's .gitignore
+# ships as `gitignore.tmpl` and is renamed at workspace creation. Verify after any packaging change:
+#   uv build && python -m zipfile -l dist/*.whl | grep -E "CAMPAIGN.md.tmpl|gitignore.tmpl"
 
 
 [project]

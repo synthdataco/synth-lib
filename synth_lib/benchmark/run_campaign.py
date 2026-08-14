@@ -45,7 +45,7 @@ def offline_bundle_env(snapshot: Path) -> dict[str, str]:
     """Point synth-lib's offline mode at a bundle inside the snapshot, when one is present.
 
     The bundle's scores/rewards/pool parquets are not date partitions, so build_snapshot does not
-    link them — the operator builds them straight into <snapshot>/offline_data (see DEPLOY.md, the data section). With
+    link them — the operator builds them straight into <snapshot>/offline_data. With
     this set, the agent reads field scores from disk instead of paginating api.synthdata.co one day
     at a time (three concurrent agents would rate-limit each other); without it, synth-lib falls
     back to the live API, which works on the bridge network. It is NOT optional for the verdict,
