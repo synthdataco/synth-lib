@@ -26,3 +26,11 @@ dev/
 market_data
 miner_outputs
 offline_data/
+
+# Secrets. This repo is public, and a committed key is burned even if the commit is reverted —
+# history is forever. Nothing here reads a .env today (the metering proxy and its .env.proxy live
+# in the deployment repo), which is exactly why the guard belongs here before something does.
+.env
+.env.*
+!.env.example
+!.env.*.example
