@@ -17,6 +17,16 @@ from synth_lib.preparation.config import (
 )
 from synth_lib.preparation.price_client import PriceClient, build_price_client
 
+# How far back from now the current day's fetch window has to end.
+#
+# Both venue providers prove a window is settled by finding a candle whose open time is strictly
+# GREATER than the requested end (`saw_settled_witness` in synth's price_data_provider); without one
+# they raise, and the clients turn that into "no data". Asking for the current day as
+# 00:00..23:59 therefore returns NOTHING — the end is in the future, so no witness can exist — and
+# the whole day persists as NaN. Two minutes guarantees at least one fully-closed candle after the
+# window, one to close the last requested minute and one to witness it.
+CURRENT_DAY_SETTLE_MARGIN_MINUTES = 2
+
 
 class MinutePriceStore:
     """Append-only local price store backed by daily parquet partitions."""
@@ -66,7 +76,22 @@ class MinutePriceStore:
 
         day_start = datetime.combine(day, time.min, tzinfo=UTC)
         day_end = datetime.combine(day, time.max, tzinfo=UTC).replace(second=0, microsecond=0)
-        fetched = self.client.fetch_range(self.asset, day_start, day_end)
+        if not is_final:
+            # The current day is still running: clamp the window to the last settled minute rather
+            # than asking for 23:59, which no venue can witness yet. Without this the day comes back
+            # empty and persists as 1440 NaN rows — invisible in a backtest (which reads settled days
+            # only) and fatal when serving, where it silently ages every context by up to 24 hours.
+            settled_end = datetime.now(tz=UTC).replace(second=0, microsecond=0) - timedelta(
+                minutes=CURRENT_DAY_SETTLE_MARGIN_MINUTES
+            )
+            day_end = min(day_end, settled_end)
+
+        if day_end < day_start:
+            # Within the settle margin of midnight: nothing has settled today yet. Persist the empty
+            # grid so the partition exists, and let the next refresh fill it.
+            fetched = pd.DataFrame(columns=["timestamp", "close"])
+        else:
+            fetched = self.client.fetch_range(self.asset, day_start, day_end)
         expected_index = pd.date_range(day_start, periods=MINUTES_PER_DAY, freq="1min", tz="UTC")
         if not fetched.empty:
             fetched = fetched.set_index("timestamp")
