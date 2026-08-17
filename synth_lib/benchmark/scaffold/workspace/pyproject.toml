@@ -5,4 +5,4 @@ requires-python = ">=3.12,<3.14"
 dependencies = ["synth-lib", "numpy>=2.2", "pandas>=2.3"]
 
 [tool.uv.sources]
-synth-lib = { git = "https://github.com/synthdataco/synth-lib", rev = "f94ee3197afb18460c5edf0054a6d151006f0a95" }
+synth-lib = { git = "https://github.com/synthdataco/synth-lib", rev = "1c5921fe540c8b1971f192fbe463bf2ecc5b190c" }
