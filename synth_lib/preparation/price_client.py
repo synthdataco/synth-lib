@@ -12,7 +12,6 @@ from synth_lib.preparation.config import (
     ALL_SYMBOLS,
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
-    RETIRED_SYMBOLS,
 )
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 
@@ -32,9 +31,4 @@ def build_price_client(asset: str) -> PriceClient:
         return BinanceClient()
     if asset in HYPERLIQUID_SYMBOLS:
         return HyperliquidClient()
-    if asset in RETIRED_SYMBOLS:
-        raise ValueError(
-            f"{asset} was served by Pyth, which is retired: no client can fetch it. Supply its "
-            f"history from an archive, or exclude it."
-        )
     raise ValueError(f"Unsupported asset: {asset}. Supported: {list(ALL_SYMBOLS.keys())}")

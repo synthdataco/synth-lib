@@ -28,7 +28,6 @@ from synth_lib.preparation.config import (
     ALL_SYMBOLS,
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
-    RETIRED_SYMBOLS,
 )
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 from synth_lib.preparation.minute_price_store import MinutePriceStore
@@ -50,7 +49,6 @@ class TestAssetRouting:
     def test_sp500_routed_to_hyperliquid(self) -> None:
         assert HYPERLIQUID_SYMBOLS.get("SP500") == "xyz:SP500"
         assert "SP500" not in BINANCE_SYMBOLS
-        assert "SP500" not in RETIRED_SYMBOLS
         assert isinstance(build_price_client("SP500"), HyperliquidClient)
 
     def test_backtest_price_store_uses_hyperliquid_for_sp500(self) -> None:
@@ -70,14 +68,13 @@ class TestAssetRouting:
     def test_retired_feed_asset_raises_instead_of_routing(self) -> None:
         """SPYX was Pyth-only and Pyth is gone. Routing must refuse rather than hand back a client
         that fetches nothing: empty partitions look exactly like real coverage downstream."""
-        assert RETIRED_SYMBOLS.get("SPYX") == "Crypto.SPYX/USD"
-        with pytest.raises(ValueError, match="retired"):
+        with pytest.raises(ValueError, match="Unsupported asset"):
             build_price_client("SPYX")
 
-    def test_maps_are_disjoint_and_fetchable_union_excludes_retired(self) -> None:
-        b, h, r = set(BINANCE_SYMBOLS), set(HYPERLIQUID_SYMBOLS), set(RETIRED_SYMBOLS)
-        assert b.isdisjoint(h) and b.isdisjoint(r) and h.isdisjoint(r)
-        assert set(ALL_SYMBOLS) == b | h, "ALL_SYMBOLS is what can be fetched; retired feeds are not"
+    def test_maps_are_disjoint(self) -> None:
+        b, h = set(BINANCE_SYMBOLS), set(HYPERLIQUID_SYMBOLS)
+        assert b.isdisjoint(h)
+        assert set(ALL_SYMBOLS) == b | h, "ALL_SYMBOLS is what can be fetched"
 
     def test_unknown_asset_raises(self) -> None:
         with pytest.raises(ValueError, match="Unsupported asset"):

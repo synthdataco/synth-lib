@@ -14,12 +14,8 @@ SYNTHDATA_API_BASE = "https://api.synthdata.co"
 # Provider symbol maps, mirrored 1:1 from synth-subnet. The validator's fetch_data routes each
 # asset by precedence Binance -> Hyperliquid, and build_price_client() mirrors that: crypto majors
 # (BTC/ETH/SOL/XRP) from Binance, HYPE plus every commodity/equity from Hyperliquid.
-# RETIRED_SYMBOLS is the third map the validator still carries — assets that were served by Pyth.
-# That feed is gone, so they are unfetchable rather than merely unusual; kept here so routing can
-# say why instead of "unsupported asset".
 BINANCE_SYMBOLS: dict[str, str] = dict(PriceDataProvider.BINANCE_ASSET_MAP)
 HYPERLIQUID_SYMBOLS: dict[str, str] = dict(PriceDataProvider.HYPERLIQUID_ASSET_MAP)
-RETIRED_SYMBOLS: dict[str, str] = dict(PriceDataProvider.PYTH_SYMBOL_MAP)
 ALL_SYMBOLS: dict[str, str] = {**BINANCE_SYMBOLS, **HYPERLIQUID_SYMBOLS}
 
 # Local price store layout. `prices` is the canonical directory; `pyth` is what it was called
