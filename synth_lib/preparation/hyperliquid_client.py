@@ -5,9 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 
 import pandas as pd
-import requests
 
-from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS, OHLCV_COLUMNS, utc_datetime
+from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS, OHLCV_COLUMNS, utc_datetime, venue_session
 
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 
@@ -23,6 +22,9 @@ class HyperliquidClient:
 
     source_name = "hyperliquid"
 
+    def __init__(self) -> None:
+        self._session = venue_session()
+
     def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         start_time = utc_datetime(start_time)
         end_time = utc_datetime(end_time)
@@ -30,7 +32,7 @@ class HyperliquidClient:
             raise ValueError(f"Unsupported Hyperliquid asset: {asset}")
 
         end_ms = int(end_time.timestamp() * 1000)
-        response = requests.post(
+        response = self._session.post(
             HYPERLIQUID_INFO_URL,
             json={
                 "type": "candleSnapshot",

@@ -95,8 +95,8 @@ class TestNoDataGraceful:
     def test_hyperliquid_not_yet_settled_returns_empty(self) -> None:
         """Candles inside the window but none after it: nothing proves the last minute closed."""
         inside = [{"t": 1783382400000, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1}]
-        with patch("synth_lib.preparation.hyperliquid_client.requests.post") as post:
-            post.return_value = _api_response(inside)
+        with patch("synth_lib.preparation.hyperliquid_client.venue_session") as session:
+            session.return_value.post.return_value = _api_response(inside)
             df = HyperliquidClient().fetch_range(
                 "SP500",
                 datetime(2026, 7, 10, tzinfo=UTC),
@@ -107,8 +107,8 @@ class TestNoDataGraceful:
 
     def test_binance_not_yet_settled_returns_empty(self) -> None:
         inside = [[1783382400000, "1", "1", "1", "1", "1", 0, "0", 1, "0", "0", "0"]]
-        with patch("synth_lib.preparation.binance_client.requests.get") as get:
-            get.return_value = _api_response(inside)
+        with patch("synth_lib.preparation.binance_client.venue_session") as session:
+            session.return_value.get.return_value = _api_response(inside)
             df = BinanceClient().fetch_range(
                 "BTC",
                 datetime(2026, 7, 10, tzinfo=UTC),

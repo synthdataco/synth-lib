@@ -62,37 +62,54 @@ def download_all_assets(
     force_refresh: bool = False,
     assets: list[str] | None = None,
     days: int | None = None,
+    start: date | None = None,
+    end: date | None = None,
 ) -> dict[str, Path]:
-    """Download data for Synth Subnet assets.
+    """Download data for Synth Subnet assets, one day at a time across every asset.
 
     Parameters
     ----------
     assets : list of asset names to download. Defaults to all supported assets.
-    days : if set, download this many days ending today (ignores
-        total_months / heldout_months).
+    days : if set, download this many days ending today (ignores total_months / heldout_months).
+    start, end : explicit inclusive bounds, which is what makes a crashed run resumable — restart
+        from the day it stopped instead of re-fetching the days already written.
+
+    The outer loop is the day and the inner loop is the asset, so an interrupted run leaves every
+    asset complete up to the same date. Iterating assets outermost instead would leave a ragged
+    edge that only a per-asset survey could describe.
     """
     asset_list = assets if assets is not None else list(ALL_SYMBOLS.keys())
 
-    if days is not None:
-        utc_now = datetime.now(tz=UTC)
-        end_day = utc_now.date()
+    if start is not None or end is not None:
+        if start is None or end is None:
+            raise ValueError("start and end must be given together")
+        start_day, end_day = start, end
+    elif days is not None:
+        end_day = datetime.now(tz=UTC).date()
         start_day = end_day - timedelta(days=days)
     else:
         start_day, end_day = _compute_date_range(total_months, heldout_months)
 
-    print(f"Downloading {len(asset_list)} assets: {start_day} to {end_day}")
-    results: dict[str, Path] = {}
+    stores: dict[str, MinutePriceStore] = {}
     for asset in asset_list:
         try:
             client = build_price_client(asset)
         except ValueError:
             print(f"  Skipping unsupported asset: {asset}")
             continue
-        store = MinutePriceStore(asset, client=client)
-        store.ingest_range(start_day, end_day, force_refresh=force_refresh)
-        results[asset] = store.root
+        stores[asset] = MinutePriceStore(asset, client=client)
+
+    total_days = (end_day - start_day).days + 1
+    print(f"Downloading {len(stores)} assets: {start_day} to {end_day} ({total_days} days)")
+    cursor = start_day
+    while cursor <= end_day:
+        for asset, store in stores.items():
+            store.ensure_root()
+            store.ingest_day(cursor, force_refresh=force_refresh)
+        print(f"  {cursor.isoformat()} done ({len(stores)} assets)", flush=True)
+        cursor += timedelta(days=1)
     print("Done.")
-    return results
+    return {asset: store.root for asset, store in stores.items()}
 
 
 def sha256_file(path: Path) -> str:
@@ -116,10 +133,20 @@ if __name__ == "__main__":
         help="If set, download this many days ending today (includes today; ignores --months/--heldout-months)",
     )
     parser.add_argument("--force-refresh", action="store_true", help="Re-download existing partitions")
+    parser.add_argument("--start", type=date.fromisoformat, default=None, metavar="YYYY-MM-DD")
+    parser.add_argument(
+        "--end",
+        type=date.fromisoformat,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="with --start, an explicit inclusive window; restart a crashed run from where it stopped",
+    )
     args = parser.parse_args()
 
     download_all_assets(
         assets=[args.asset] if args.asset else None,
         days=args.days,
         force_refresh=args.force_refresh,
+        start=args.start,
+        end=args.end,
     )

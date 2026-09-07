@@ -7,9 +7,8 @@ import time
 from datetime import datetime
 
 import pandas as pd
-import requests
 
-from synth_lib.preparation.config import BINANCE_SYMBOLS, OHLCV_COLUMNS, utc_datetime
+from synth_lib.preparation.config import BINANCE_SYMBOLS, OHLCV_COLUMNS, utc_datetime, venue_session
 
 # BINANCE_API_HOST is a process-env escape hatch, read at import time: api.binance.com answers
 # HTTP 451 from geo-restricted regions (US-hosted CI runners use data-api.binance.vision).
@@ -30,6 +29,9 @@ class BinanceClient:
     """Minute OHLCV from Binance spot, implementing the PriceClient protocol."""
 
     source_name = "binance"
+
+    def __init__(self) -> None:
+        self._session = venue_session()
 
     def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         start_time = utc_datetime(start_time)
@@ -65,7 +67,7 @@ class BinanceClient:
         settled = False
         cursor = start_ms
         while cursor <= end_ms:
-            response = requests.get(
+            response = self._session.get(
                 BINANCE_SPOT_URL,
                 params={
                     "symbol": symbol,

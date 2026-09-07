@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+from requests.adapters import HTTPAdapter
 from synth.validator.price_data_provider import PriceDataProvider
+from urllib3.util.retry import Retry
 
 UTC = timezone.utc
 
@@ -49,6 +52,28 @@ def utc_datetime(value: datetime) -> datetime:
 # The minute partition's market columns, in order. `close` is the scored series; the rest are
 # context the venues already publish per candle.
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "trade_count"]
+
+
+def venue_session() -> requests.Session:
+    """A session that retries transient venue failures.
+
+    A deep backfill is hundreds of requests per asset, so a connect timeout or a rate-limit reply
+    is a certainty rather than a risk, and an unretried one aborts the run partway through. Retries
+    cover connect and read failures as well as the status codes both venues use to shed load.
+    """
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=1.5,
+        status_forcelist=(418, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
 
 
 def default_store_root(asset: str) -> Path:
