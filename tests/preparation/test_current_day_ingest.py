@@ -20,6 +20,7 @@ from datetime import UTC, datetime, time, timedelta
 import pandas as pd
 import pytest
 
+from synth_lib.preparation.config import OHLCV_COLUMNS
 from synth_lib.preparation.minute_price_store import (
     CURRENT_DAY_SETTLE_MARGIN_MINUTES,
     MinutePriceStore,
@@ -41,9 +42,13 @@ class FakeVenue:
         # strictly after end_time. No witness -> the provider raises and the client reports no data.
         newest_open = self.now.replace(second=0, microsecond=0) - timedelta(minutes=1)
         if end_time >= newest_open:
-            return pd.DataFrame(columns=["timestamp", "close"])
+            return pd.DataFrame(columns=["timestamp", *OHLCV_COLUMNS])
         index = pd.date_range(start_time, min(end_time, newest_open), freq="1min", tz="UTC")
-        return pd.DataFrame({"timestamp": index, "close": [100.0 + i for i in range(len(index))]})
+        closes = [100.0 + i for i in range(len(index))]
+        return pd.DataFrame(
+            {"timestamp": index, "open": closes, "high": closes, "low": closes,
+             "close": closes, "volume": 1.0, "trade_count": 1.0}
+        )
 
 
 @pytest.fixture

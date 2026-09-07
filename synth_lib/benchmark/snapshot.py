@@ -67,7 +67,8 @@ def render_data_md(snapshot_root: Path) -> str:
     lines = [
         "# DATA.md — the shape of your market data (generated from THIS snapshot at setup)",
         "",
-        "Each day is one parquet file, `date=YYYY-MM-DD.parquet`, a full 1440-row minute grid.",
+        "Each day is one parquet file, `date=YYYY-MM-DD.parquet`, a full 1440-row minute grid",
+        "with columns `open, high, low, close, volume, trade_count`. `close` is the scored series.",
         "Only `close` carries real data: the venue's 1-minute candle close (the last trade of",
         "that minute). `open/high/low/volume` columns may exist but are NA in this snapshot.",
         "`source`/`ingested_at`/`is_final` are ingestion provenance — ignore them. Semantics:",

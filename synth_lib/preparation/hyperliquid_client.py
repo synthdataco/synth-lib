@@ -1,23 +1,27 @@
-"""Hyperliquid minute-price client (delegates to synth.validator.price_data_provider)."""
+"""Hyperliquid minute-OHLCV client."""
 
 from __future__ import annotations
 
 from datetime import datetime
 
 import pandas as pd
+import requests
 
-from synth.validator.price_data_provider import PriceDataProvider
+from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS, OHLCV_COLUMNS, utc_datetime
 
-from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS, utc_datetime
+HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+
+# The venue serves at most this many candles per request, which is what bounds a Hyperliquid-routed
+# asset's history to roughly three and a half days at one-minute resolution.
+MAX_CANDLES = 5000
+
+EMPTY = pd.DataFrame(columns=["timestamp", *OHLCV_COLUMNS])
 
 
 class HyperliquidClient:
-    """Wrapper around synth's PriceDataProvider implementing the PriceClient protocol."""
+    """Minute OHLCV from Hyperliquid, implementing the PriceClient protocol."""
 
     source_name = "hyperliquid"
-
-    def __init__(self) -> None:
-        self._provider = PriceDataProvider()
 
     def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         start_time = utc_datetime(start_time)
@@ -25,28 +29,44 @@ class HyperliquidClient:
         if asset not in HYPERLIQUID_SYMBOLS:
             raise ValueError(f"Unsupported Hyperliquid asset: {asset}")
 
-        start_ts = int(start_time.timestamp())
-        end_ts = int(end_time.timestamp())
-        try:
-            closes = self._provider.download_hyperliquid_price_data(
-                beginning=start_ts,
-                end=end_ts,
-                symbol=asset,
-                time_increment=60,
-            )
-        except ValueError:
-            # No settled Hyperliquid candles for this window — e.g. the asset was
-            # not yet listed (SPCX before ~2026-07-19) or a market-closure gap.
-            # Treat as "no data" so the day ingests as NaN (downstream scoring
-            # tolerates NaN per-prompt) instead of crashing the backtest.
-            return pd.DataFrame(columns=["timestamp", "close"])
-        if not closes:
-            return pd.DataFrame(columns=["timestamp", "close"])
+        end_ms = int(end_time.timestamp() * 1000)
+        response = requests.post(
+            HYPERLIQUID_INFO_URL,
+            json={
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": HYPERLIQUID_SYMBOLS[asset],
+                    "interval": "1m",
+                    "startTime": int(start_time.timestamp() * 1000),
+                    # One minute past the window, so the settlement witness is in the same response.
+                    "endTime": end_ms + 60_000,
+                },
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        candles = response.json()
+        if not candles:
+            return EMPTY.copy()
 
-        timestamps = pd.date_range(start_time, end_time, freq="1min", tz="UTC")
-        if len(timestamps) != len(closes):
-            raise RuntimeError(
-                f"Hyperliquid timestamp/close length mismatch for {asset}: " f"{len(timestamps)} vs {len(closes)}"
-            )
-        frame = pd.DataFrame({"timestamp": timestamps, "close": pd.Series(closes, dtype="float64")})
-        return frame.dropna(subset=["close"]).reset_index(drop=True)
+        # No candle opens after the window, so nothing proves the last requested minute has closed.
+        # Report "no data" rather than a half-formed tail: the store persists that as NaN, which is
+        # recoverable, whereas a partial minute written as final is not.
+        if not any(int(candle["t"]) > end_ms for candle in candles):
+            return EMPTY.copy()
+        inside = [candle for candle in candles if int(candle["t"]) <= end_ms]
+        if not inside:
+            return EMPTY.copy()
+
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime([c["t"] for c in inside], unit="ms", utc=True),
+                "open": [float(c["o"]) for c in inside],
+                "high": [float(c["h"]) for c in inside],
+                "low": [float(c["l"]) for c in inside],
+                "close": [float(c["c"]) for c in inside],
+                "volume": [float(c["v"]) for c in inside],
+                "trade_count": [float(c["n"]) for c in inside],
+            }
+        )
+        return frame.dropna(subset=["close"]).drop_duplicates("timestamp").reset_index(drop=True)

@@ -28,6 +28,7 @@ from synth_lib.preparation.config import (
     ALL_SYMBOLS,
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
+    OHLCV_COLUMNS,
 )
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 from synth_lib.preparation.minute_price_store import MinutePriceStore
@@ -92,32 +93,29 @@ class TestNoDataGraceful:
     so unlisted-asset and gap days ingest as NaN (downstream tolerates NaN)."""
 
     def test_hyperliquid_not_yet_settled_returns_empty(self) -> None:
-        with patch.object(
-            PriceDataProvider,
-            "download_hyperliquid_price_data",
-            side_effect=ValueError("realized path not yet settled for asset SP500"),
-        ):
+        """Candles inside the window but none after it: nothing proves the last minute closed."""
+        inside = [{"t": 1783382400000, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1}]
+        with patch("synth_lib.preparation.hyperliquid_client.requests.post") as post:
+            post.return_value = _api_response(inside)
             df = HyperliquidClient().fetch_range(
                 "SP500",
                 datetime(2026, 7, 10, tzinfo=UTC),
                 datetime(2026, 7, 10, 23, 59, tzinfo=UTC),
             )
         assert df.empty
-        assert list(df.columns) == ["timestamp", "close"]
+        assert list(df.columns) == ["timestamp", *OHLCV_COLUMNS]
 
     def test_binance_not_yet_settled_returns_empty(self) -> None:
-        with patch.object(
-            PriceDataProvider,
-            "download_binance_price_data",
-            side_effect=ValueError("realized path not yet settled for asset BTC"),
-        ):
+        inside = [[1783382400000, "1", "1", "1", "1", "1", 0, "0", 1, "0", "0", "0"]]
+        with patch("synth_lib.preparation.binance_client.requests.get") as get:
+            get.return_value = _api_response(inside)
             df = BinanceClient().fetch_range(
                 "BTC",
                 datetime(2026, 7, 10, tzinfo=UTC),
                 datetime(2026, 7, 10, 23, 59, tzinfo=UTC),
             )
         assert df.empty
-        assert list(df.columns) == ["timestamp", "close"]
+        assert list(df.columns) == ["timestamp", *OHLCV_COLUMNS]
 
 
 class TestIngestSourceLabel:
@@ -131,7 +129,11 @@ class TestIngestSourceLabel:
 
             def fetch_range(self, asset, start, end):  # noqa: ANN001
                 idx = pd.date_range(start, periods=3, freq="1min", tz="UTC")
-                return pd.DataFrame({"timestamp": idx, "close": [1.0, 2.0, 3.0]})
+                closes = [1.0, 2.0, 3.0]
+                return pd.DataFrame(
+                    {"timestamp": idx, "open": closes, "high": closes, "low": closes,
+                     "close": closes, "volume": 1.0, "trade_count": 1.0}
+                )
 
         return _Stub()
 

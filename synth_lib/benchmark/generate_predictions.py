@@ -9,9 +9,9 @@ That is what lets it serve three duties with one implementation:
   - the CI contract gate runs it on the host against any miner exposing simulate();
   - an operator can run it standalone against any modeling.py.
 
-No-lookahead guarantee: for each prompt at time t the model receives ONLY prices <= t —
-`series.loc[t - 7d : t]` — regardless of how much data the frame holds. The model's sole market
-input is that Series; simulate() takes no data root.
+No-lookahead guarantee: for each prompt at time t the model receives ONLY minutes <= t —
+`frame.loc[t - 7d : t]` — regardless of how much data the frame holds. The model's sole market
+input is that DataFrame; simulate() takes no data root.
 
 Usage:
   python generate_predictions.py --modeling agent/modeling.py --asset BTC \\
@@ -32,6 +32,9 @@ from typing import Callable
 import pandas as pd
 
 CONTEXT_MINUTES = 7 * 24 * 60
+# Duplicated from synth_lib.preparation.config rather than imported: this file runs inside a
+# champion's own venv, which does not have synth_lib.
+OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "trade_count"]
 # The validator's real serving size (PromptConfig.num_simulations). Empirical CRPS is biased
 # upward for small N, so scoring at fewer paths than the field unfairly penalizes the candidate.
 DEFAULT_NUM_SIMULATIONS = 1000
@@ -53,8 +56,8 @@ def store_root(data_root: Path, asset: str) -> Path:
     return root
 
 
-def load_minute_prices(data_root: Path, asset: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
-    """Minute closes over [start, end] from daily partitions. Missing partitions raise: a silent
+def load_minute_prices(data_root: Path, asset: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Minute OHLCV over [start, end] from daily partitions. Missing partitions raise: a silent
     hole here would shrink every context that spans it without anyone noticing."""
     root = store_root(data_root, asset)
     frames = []
@@ -63,12 +66,12 @@ def load_minute_prices(data_root: Path, asset: str, start: pd.Timestamp, end: pd
         path = root / f"date={day.isoformat()}.parquet"
         if not path.exists():
             raise FileNotFoundError(f"missing partition {path}")
-        frames.append(pd.read_parquet(path, columns=["timestamp", "close"]))
+        frames.append(pd.read_parquet(path, columns=["timestamp", *OHLCV_COLUMNS]))
         day += timedelta(days=1)
     frame = pd.concat(frames, ignore_index=True)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    series = frame.set_index("timestamp")["close"].sort_index()
-    return series.loc[start:end]
+    frame = frame.set_index("timestamp").sort_index()
+    return frame.loc[start:end]
 
 
 def prompt_grid(window_start: pd.Timestamp, window_end: pd.Timestamp, cadence_minutes: int) -> list[pd.Timestamp]:
@@ -83,7 +86,7 @@ def generate(
     asset: str,
     window_start: pd.Timestamp,
     window_end: pd.Timestamp,
-    price_series: pd.Series,
+    price_frame: pd.DataFrame,
     out_dir: Path,
     cadence_minutes: int,
     time_increment: int,
@@ -93,8 +96,8 @@ def generate(
     out_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for t in prompt_grid(window_start, window_end, cadence_minutes):
-        # THE no-lookahead line: only prices <= t reach the model, whatever the frame holds.
-        context = price_series.loc[t - pd.Timedelta(minutes=CONTEXT_MINUTES) : t]
+        # THE no-lookahead line: only minutes <= t reach the model, whatever the frame holds.
+        context = price_frame.loc[t - pd.Timedelta(minutes=CONTEXT_MINUTES) : t]
         out = simulate_fn(
             asset=asset,
             start_time=t.isoformat(),
@@ -139,13 +142,13 @@ def main() -> None:
     args = ap.parse_args()
 
     start, end = _utc(args.window_start), _utc(args.window_end)
-    series = load_minute_prices(args.data_root, args.asset, start - pd.Timedelta(minutes=CONTEXT_MINUTES), end)
+    prices = load_minute_prices(args.data_root, args.asset, start - pd.Timedelta(minutes=CONTEXT_MINUTES), end)
     n = generate(
         load_simulate(args.modeling),
         args.asset,
         start,
         end,
-        series,
+        prices,
         args.out_dir,
         cadence_minutes=args.cadence_minutes,
         time_increment=args.time_increment,

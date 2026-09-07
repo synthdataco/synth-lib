@@ -46,6 +46,11 @@ def utc_datetime(value: datetime) -> datetime:
     return value.astimezone(UTC).replace(microsecond=0)
 
 
+# The minute partition's market columns, in order. `close` is the scored series; the rest are
+# context the venues already publish per candle.
+OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "trade_count"]
+
+
 def default_store_root(asset: str) -> Path:
     """Default MinutePriceStore root for `asset`: `market_data/prices/{asset}/1m`.
 

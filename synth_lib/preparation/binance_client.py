@@ -1,23 +1,35 @@
-"""Binance minute-price client (delegates to synth.validator.price_data_provider)."""
+"""Binance minute-OHLCV client."""
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime
 
 import pandas as pd
+import requests
 
-from synth.validator.price_data_provider import PriceDataProvider
+from synth_lib.preparation.config import BINANCE_SYMBOLS, OHLCV_COLUMNS, utc_datetime
 
-from synth_lib.preparation.config import BINANCE_SYMBOLS, utc_datetime
+# BINANCE_API_HOST is a process-env escape hatch, read at import time: api.binance.com answers
+# HTTP 451 from geo-restricted regions (US-hosted CI runners use data-api.binance.vision).
+BINANCE_SPOT_URL = os.environ.get("BINANCE_API_HOST", "https://api.binance.com") + "/api/v3/klines"
+
+MINUTE_MS = 60_000
+MAX_KLINES_PER_REQUEST = 1000
+REQUEST_SPACING_SECONDS = 0.2
+
+# Kline array positions. The endpoint returns 12 fields per candle.
+OPEN_TIME, OPEN, HIGH, LOW, CLOSE, VOLUME = 0, 1, 2, 3, 4, 5
+TRADE_COUNT = 8
+
+EMPTY = pd.DataFrame(columns=["timestamp", *OHLCV_COLUMNS])
 
 
 class BinanceClient:
-    """Wrapper around synth's PriceDataProvider implementing the PriceClient protocol."""
+    """Minute OHLCV from Binance spot, implementing the PriceClient protocol."""
 
     source_name = "binance"
-
-    def __init__(self) -> None:
-        self._provider = PriceDataProvider()
 
     def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         start_time = utc_datetime(start_time)
@@ -25,27 +37,59 @@ class BinanceClient:
         if asset not in BINANCE_SYMBOLS:
             raise ValueError(f"Unsupported Binance asset: {asset}")
 
-        start_ts = int(start_time.timestamp())
-        end_ts = int(end_time.timestamp())
-        try:
-            closes = self._provider.download_binance_price_data(
-                beginning=start_ts,
-                end=end_ts,
-                symbol=asset,
-                time_increment=60,
-            )
-        except ValueError:
-            # No settled Binance candles for this window (unsettled current day or
-            # a gap) — treat as "no data" so the day ingests as NaN instead of
-            # crashing, matching the Hyperliquid path.
-            return pd.DataFrame(columns=["timestamp", "close"])
-        if not closes:
-            return pd.DataFrame(columns=["timestamp", "close"])
+        start_ms = int(start_time.timestamp() * 1000)
+        end_ms = int(end_time.timestamp() * 1000)
+        klines, settled = self._download(BINANCE_SYMBOLS[asset], start_ms, end_ms)
+        # No candle opens after the window, so nothing proves the last requested minute has closed.
+        # Report "no data" rather than a half-formed tail: the store persists that as NaN, which is
+        # recoverable, whereas a partial minute written as final is not.
+        if not settled or not klines:
+            return EMPTY.copy()
 
-        timestamps = pd.date_range(start_time, end_time, freq="1min", tz="UTC")
-        if len(timestamps) != len(closes):
-            raise RuntimeError(
-                f"Binance timestamp/close length mismatch for {asset}: " f"{len(timestamps)} vs {len(closes)}"
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime([k[OPEN_TIME] for k in klines], unit="ms", utc=True),
+                "open": [float(k[OPEN]) for k in klines],
+                "high": [float(k[HIGH]) for k in klines],
+                "low": [float(k[LOW]) for k in klines],
+                "close": [float(k[CLOSE]) for k in klines],
+                "volume": [float(k[VOLUME]) for k in klines],
+                "trade_count": [float(k[TRADE_COUNT]) for k in klines],
+            }
+        )
+        return frame.dropna(subset=["close"]).drop_duplicates("timestamp").reset_index(drop=True)
+
+    def _download(self, symbol: str, start_ms: int, end_ms: int) -> tuple[list, bool]:
+        """Klines covering [start_ms, end_ms], plus whether a candle opens strictly after it."""
+        klines: list = []
+        settled = False
+        cursor = start_ms
+        while cursor <= end_ms:
+            response = requests.get(
+                BINANCE_SPOT_URL,
+                params={
+                    "symbol": symbol,
+                    "interval": "1m",
+                    "startTime": cursor,
+                    # One minute past the window, so the settlement witness is in the same response.
+                    "endTime": end_ms + MINUTE_MS,
+                    "limit": MAX_KLINES_PER_REQUEST,
+                },
+                timeout=30,
             )
-        frame = pd.DataFrame({"timestamp": timestamps, "close": pd.Series(closes, dtype="float64")})
-        return frame.dropna(subset=["close"]).reset_index(drop=True)
+            response.raise_for_status()
+            batch = response.json()
+            if not batch:
+                break
+            for kline in batch:
+                opened = int(kline[OPEN_TIME])
+                if opened > end_ms:
+                    settled = True
+                else:
+                    klines.append(kline)
+            last_opened = int(batch[-1][OPEN_TIME])
+            if last_opened < cursor:  # no forward progress; the venue has nothing more
+                break
+            cursor = last_opened + MINUTE_MS
+            time.sleep(REQUEST_SPACING_SECONDS)
+        return klines, settled

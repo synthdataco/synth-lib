@@ -25,7 +25,7 @@ def generate_predictions(
     window_start: pd.Timestamp,
     window_end: pd.Timestamp,
     out_dir: Path,
-    price_series: pd.Series,
+    price_frame: pd.DataFrame,
     cadence_minutes: int = 60,
     # 1000 is the validator's PromptConfig.num_simulations: the Synth field's CRPS was computed
     # from 1000 sampled paths, and empirical CRPS is biased upward for small N, so a lower
@@ -37,7 +37,7 @@ def generate_predictions(
     out_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for t in prompt_grid(window_start, window_end, cadence_minutes):
-        context = price_series.loc[t - pd.Timedelta(minutes=CONTEXT_MINUTES) : t]
+        context = price_frame.loc[t - pd.Timedelta(minutes=CONTEXT_MINUTES) : t]
         out = simulate_fn(
             asset=asset,
             start_time=t.isoformat(),

@@ -32,7 +32,7 @@ import pandas as pd
 from synth.simulation_input import SimulationInput  # type: ignore[import-untyped]
 from synth.validator.competition_config import ALL_COMPETITIONS  # type: ignore[import-untyped]
 
-from synth_lib.preparation.config import BINANCE_SYMBOLS, HYPERLIQUID_SYMBOLS
+from synth_lib.preparation.config import BINANCE_SYMBOLS, HYPERLIQUID_SYMBOLS, OHLCV_COLUMNS
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.preparation.price_client import build_price_client
 
@@ -89,8 +89,10 @@ def warm_up(assets: Sequence[str], days: int = WARMUP_DAYS) -> None:
             logger.warning("warm-up incomplete for %s: %s", asset, exc)
 
 
-def build_context(store: MinutePriceStore, start_time: datetime, window_minutes: int = CONTEXT_MINUTES) -> pd.Series:
-    """The 7-day minute context ending at `start_time`, lenient enough to serve from.
+def build_context(
+    store: MinutePriceStore, start_time: datetime, window_minutes: int = CONTEXT_MINUTES
+) -> pd.DataFrame:
+    """The 7-day minute OHLCV context ending at `start_time`, lenient enough to serve from.
 
     Deliberately not `MinutePriceStore.get_context_window`, which is strict (it raises on a missing
     day or a short window) — correct for backtesting, fatal on the request path, where a single
@@ -98,6 +100,9 @@ def build_context(store: MinutePriceStore, start_time: datetime, window_minutes:
     minute grid, fill internal gaps, and DROP a trailing run of missing bars so the series ends on
     the last real print. Ending on ffilled bars would show the model zero recent volatility and
     collapse its fan.
+
+    Only `close` is filled. A carried-forward high/low would assert a range that no candle traded,
+    so the other columns stay NaN on minutes the venue did not report.
     """
     context_start = start_time - timedelta(minutes=window_minutes)
     frames = []
@@ -105,7 +110,7 @@ def build_context(store: MinutePriceStore, start_time: datetime, window_minutes:
     while day <= start_time.date():
         path = store.day_path(day)
         if path.exists():
-            frames.append(pd.read_parquet(path, columns=["timestamp", "close"]))
+            frames.append(pd.read_parquet(path, columns=["timestamp", *OHLCV_COLUMNS]))
         day += timedelta(days=1)
     if not frames:
         raise ValueError(f"no partitions for {store.asset} in {context_start.isoformat()}..{start_time.isoformat()}")
@@ -114,21 +119,20 @@ def build_context(store: MinutePriceStore, start_time: datetime, window_minutes:
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     frame = frame.sort_values("timestamp").drop_duplicates("timestamp")
     grid = pd.date_range(context_start, start_time, freq="1min", tz="UTC")
-    raw = pd.to_numeric(frame.set_index("timestamp")["close"], errors="coerce").reindex(grid)
+    raw = frame.set_index("timestamp")[OHLCV_COLUMNS].apply(pd.to_numeric, errors="coerce").reindex(grid)
 
-    coverage = float(raw.notna().mean())
+    coverage = float(raw["close"].notna().mean())
     if coverage < 0.70:
         logger.warning("low real-bar coverage for %s: %.1f%% — CRPS quality degraded", store.asset, coverage * 100)
-    last_real = raw.last_valid_index()
+    last_real = raw["close"].last_valid_index()
     trimmed = raw if last_real is None else raw.loc[:last_real]
     if len(trimmed) < MIN_REAL_BARS:
         trimmed = raw
-    close = trimmed.ffill().bfill()
-    if close.isna().any():
+    trimmed = trimmed.copy()
+    trimmed["close"] = trimmed["close"].ffill().bfill()
+    if trimmed["close"].isna().any():
         raise ValueError(f"no usable closes for {store.asset} ending {start_time.isoformat()}")
-    close.name = "close"
-    return close
-
+    return trimmed
 
 def serve_request(simulate_fn: Callable, store: MinutePriceStore, simulation_input: SimulationInput) -> tuple:
     """Build the live context, run the champion, adapt the output to the live contract."""

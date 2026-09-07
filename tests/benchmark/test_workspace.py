@@ -201,7 +201,10 @@ def test_scaffolded_predict_anchors_paths_to_workspace_not_cwd(tmp_path, monkeyp
 
         def load_range(self, start, end):
             idx = pd.date_range(start, end, freq="1min", tz="UTC")
-            return pd.DataFrame({"timestamp": idx, "close": 100.0})
+            return pd.DataFrame(
+                {"timestamp": idx, "open": 100.0, "high": 100.0, "low": 100.0,
+                 "close": 100.0, "volume": 1.0, "trade_count": 1.0}
+            )
 
     monkeypatch.setattr(predict, "MinutePriceStore", StubStore)
     start = datetime(2026, 7, 10, tzinfo=timezone.utc)
