@@ -281,6 +281,7 @@ def backtest(
             prompt["time_increment"],
             prompt["real_prices"],
             scoring_intervals,
+            competition.vol_scoring_blocks,
             miner_id,
         )
         for prompt in prompts
