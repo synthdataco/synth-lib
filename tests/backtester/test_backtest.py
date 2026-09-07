@@ -305,7 +305,7 @@ FAKE_CRPS = 42.0
 # Full backtest() pipeline with mocked external I/O (Synth API, price data, CRPS).
 # Verifies that predictions are discovered, scored, and aggregated into a valid BacktestResult.
 class TestBacktestIntegration:
-    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.scoring.calculate_total_score_for_miner")
     @patch("synth_lib.backtester.orchestration.download_price_data")
     @patch("synth_lib.backtester.orchestration.get_rewards_history")
     @patch("synth_lib.backtester.orchestration.get_miner_scores")
@@ -360,7 +360,7 @@ class TestBacktestIntegration:
 
     # -- Partial predictions fill with crps=-1 --
 
-    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.scoring.calculate_total_score_for_miner")
     @patch("synth_lib.backtester.orchestration.download_price_data")
     @patch("synth_lib.backtester.orchestration.get_rewards_history")
     @patch("synth_lib.backtester.orchestration.get_miner_scores")
@@ -393,7 +393,7 @@ class TestBacktestIntegration:
 
     # -- Task 5: Price data gap raises ValueError --
 
-    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.scoring.calculate_total_score_for_miner")
     @patch("synth_lib.backtester.orchestration.download_price_data")
     @patch("synth_lib.backtester.orchestration.get_rewards_history")
     @patch("synth_lib.backtester.orchestration.get_miner_scores")
@@ -426,7 +426,7 @@ class TestBacktestIntegration:
 class TestRewardSlug:
     """backtest() must request rewards by competition slug, not legacy low/high."""
 
-    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.scoring.calculate_total_score_for_miner")
     @patch("synth_lib.backtester.orchestration.download_price_data")
     @patch("synth_lib.backtester.orchestration.get_rewards_history")
     @patch("synth_lib.backtester.orchestration.get_miner_scores")
@@ -623,6 +623,7 @@ class TestScoreSinglePrompt:
             time_incr=TIME_INCREMENT,
             real_prices=real_prices,
             scoring_intervals={"5min": 300, "30min": 1800, "3hour": 10800, "24hour_abs": 86400},
+            vol_scoring_blocks={},
             miner_id=MINER_ID,
         )
 
@@ -643,10 +644,36 @@ class TestScoreSinglePrompt:
             time_incr=TIME_INCREMENT,
             real_prices=[],
             scoring_intervals={},
+            vol_scoring_blocks={},
             miner_id=MINER_ID,
         )
 
         assert result["crps"] == -1
+
+    def test_volatility_blocks_add_to_the_score(self, predictions_dir: Path) -> None:
+        """Scoring goes through the validator's total score, so configured volatility
+        blocks raise the CRPS above the price-only score (guards against scoring with
+        synth's price-half `calculate_crps_for_miner` again)."""
+        fname = T0.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{ASSET}_{TIME_LENGTH}.json"
+        # The fixture's simulated paths are flat, so a moving real path gives every
+        # block a realized volatility the ensemble misses.
+        common = dict(
+            file_path=predictions_dir / fname,
+            start_time=T0,
+            asset_val=ASSET,
+            scored_time=SCORED_T0,
+            time_len=TIME_LENGTH,
+            time_incr=TIME_INCREMENT,
+            real_prices=[100_000.0 + 50.0 * (i % 7) for i in range(NUM_STEPS + 1)],
+            scoring_intervals={"5min": 300},
+            miner_id=MINER_ID,
+        )
+
+        price_only = _score_single_prompt(vol_scoring_blocks={}, **common)
+        with_vol = _score_single_prompt(vol_scoring_blocks={"vol_20min": (TIME_INCREMENT * 4, 1.0)}, **common)
+
+        assert price_only["crps"] > 0
+        assert with_vol["crps"] > price_only["crps"]
 
 
 # ---------------------------------------------------------------------------

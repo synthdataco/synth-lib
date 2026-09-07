@@ -15,7 +15,7 @@ from synth.validator.competition_config import (
     SMOOTHED_SCORE_COEFFICIENT,
     CompetitionConfig,
 )
-from synth.validator.crps_calculation import calculate_crps_for_miner
+from synth.validator.crps_calculation import calculate_total_score_for_miner
 from synth.validator.moving_average import (
     compute_smoothed_score,
     prepare_df_for_moving_average,
@@ -228,6 +228,7 @@ def _score_single_prompt(
     time_incr: int,
     real_prices: list[float],
     scoring_intervals: dict[str, int],
+    vol_scoring_blocks: dict[str, tuple[int, float]],
     miner_id: int,
 ) -> dict:
     """Score a single prompt's prediction against real prices. Runs in a worker process.
@@ -249,8 +250,8 @@ def _score_single_prompt(
     llm_predictions_raw = load_prediction(file_path)
     simulation_runs = np.asarray(llm_predictions_raw["paths"], dtype=float)
     real_price_array = np.asarray(real_prices, dtype=float)
-    total_crps, _ = calculate_crps_for_miner(
-        simulation_runs, real_price_array, time_incr, scoring_intervals
+    total_crps, _ = calculate_total_score_for_miner(
+        simulation_runs, real_price_array, time_incr, scoring_intervals, vol_scoring_blocks
     )
 
     return {
