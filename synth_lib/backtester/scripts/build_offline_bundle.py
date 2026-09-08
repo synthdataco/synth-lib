@@ -114,9 +114,13 @@ def coerce_numeric_columns(frame: pd.DataFrame) -> pd.DataFrame:
         if frame[column].dtype != object:
             continue
         try:
-            frame[column] = pd.to_numeric(frame[column])
+            numeric = pd.to_numeric(frame[column])
         except (TypeError, ValueError):
-            continue
+            continue  # a genuinely textual column
+        # A value beyond int64 leaves to_numeric's result `object` rather than raising, and parquet
+        # then refuses it just the same. float64 is lossy there, which is the right trade for a
+        # number no honest score reaches.
+        frame[column] = numeric.astype("float64") if numeric.dtype == object else numeric
     return frame
 
 
