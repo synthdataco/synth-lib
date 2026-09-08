@@ -100,6 +100,26 @@ def fetch_chunked(
     return pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
 
 
+def coerce_numeric_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Give numeric-looking object columns a real numeric dtype before parquet.
+
+    A single score above 2**53 makes pandas type the whole column `object`, and pyarrow then
+    refuses the int -> double conversion as inexact and aborts the write — losing an otherwise
+    complete asset, and with it every asset after it in the run. Scores that large are pathological
+    to begin with, so the float64 they land on is no worse than the number itself.
+
+    Columns that are genuinely textual (asset, timestamps) fail the parse and are left alone.
+    """
+    for column in frame.columns:
+        if frame[column].dtype != object:
+            continue
+        try:
+            frame[column] = pd.to_numeric(frame[column])
+        except (TypeError, ValueError):
+            continue
+    return frame
+
+
 def bundle_realized_paths(asset: str, competition: CompetitionConfig, scores: pd.DataFrame) -> None:
     """Cache the realized path of every bundled prompt for a Hyperliquid asset.
 
@@ -142,6 +162,7 @@ def build_bundle(
                 chunk_days,
                 f"scores/{asset}",
             )
+            df = coerce_numeric_columns(df)
             df.to_parquet(path, index=False)
             prompts = df["scored_time"].nunique() if not df.empty else 0
             print(f"wrote {path}: {len(df)} rows, {prompts} prompts")
@@ -159,6 +180,7 @@ def build_bundle(
             chunk_days,
             "rewards",
         )
+        df = coerce_numeric_columns(df)
         df.to_parquet(path, index=False)
         rounds = df["updated_at"].nunique() if not df.empty else 0
         print(f"wrote {path}: {len(df)} rows, {rounds} update rounds")
