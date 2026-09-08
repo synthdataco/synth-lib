@@ -59,6 +59,8 @@ SCORES_PAD = timedelta(hours=1)
 REWARDS_PAD = timedelta(hours=25)
 MAX_RETRIES = 3
 
+REQUEST_SPACING_SECONDS = 0.2
+
 
 def fetch_chunked(
     fetch: Callable[[datetime, datetime], pd.DataFrame],
@@ -94,7 +96,7 @@ def fetch_chunked(
             frames.append(df)
         print(f"  {label} [{cursor:%m-%d} -> {chunk_end:%m-%d}]: {len(df)} rows", flush=True)
         cursor = chunk_end
-        sleep(2)
+        sleep(REQUEST_SPACING_SECONDS)
     return pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
 
 
