@@ -381,6 +381,23 @@ uv run synth_lib/backtester/scripts/run_backtest.py \
 
 The other competitions (`crypto-24h`, `com-equ-24h`) are unaffected.
 
+### crypto-1h volatility term
+
+A `crypto-1h` prompt score is `price CRPS + λ × vol CRPS` (λ = 5.25): on top of
+the CRPS on price changes, the validator scores the realized volatility of each
+consecutive block of the hour — one 60-minute, four 15-minute and twelve
+5-minute blocks — comparing the standard deviation of the 1-minute price
+changes inside each block to the realized one.
+
+The backtester rescores **your** predictions with that term included, but the
+competitor CRPS values it reads from the API for prompts scored before the
+validator switched to this formula do not include it. Over such a window your
+miner pays a volatility penalty the rest of the field never paid, so the ranks
+read pessimistically. Restrict the window to prompts scored after the switch,
+exactly as for the formula change above.
+
+The other competitions (`crypto-24h`, `com-equ-24h`) have no volatility term.
+
 ### 3-competition split on 2026-06-23
 
 The subnet split from the old 2-profile model (LOW/HIGH_FREQUENCY) into the
