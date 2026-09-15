@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
+from requests.adapters import HTTPAdapter
 from synth.validator.price_data_provider import PriceDataProvider
+from urllib3.util.retry import Retry
 
 UTC = timezone.utc
 
@@ -44,6 +47,49 @@ def utc_datetime(value: datetime) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
     return value.astimezone(UTC).replace(microsecond=0)
+
+
+# The minute partition's market columns, in order. `close` is the scored series; the rest are
+# context the venues already publish per candle.
+OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "trade_count"]
+
+
+def legacy_partition_error(path: object, missing: list[str] | None = None) -> str:
+    """Message for a partition written before the store carried OHLCV.
+
+    `ingest_day` returns early for a settled day whose file exists, so upgrading the library does
+    not rewrite what is already on disk: an old store keeps close-only partitions indefinitely and
+    every reader that selects the OHLCV columns by name fails on them. The remedy is a re-ingest,
+    which is not guessable from pyarrow's own "No match for FieldRef" error.
+    """
+    lacks = f" (missing {', '.join(missing)})" if missing else ""
+    return (
+        f"{path} predates the OHLCV columns{lacks}. Re-ingest the affected days with "
+        f"--force-refresh: ingest_day skips settled partitions that already exist, so upgrading "
+        f"alone leaves them close-only."
+    )
+
+
+def venue_session() -> requests.Session:
+    """A session that retries transient venue failures.
+
+    A deep backfill is hundreds of requests per asset, so a connect timeout or a rate-limit reply
+    is a certainty rather than a risk, and an unretried one aborts the run partway through. Retries
+    cover connect and read failures as well as the status codes both venues use to shed load.
+    """
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=1.5,
+        status_forcelist=(418, 429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
 
 
 def default_store_root(asset: str) -> Path:

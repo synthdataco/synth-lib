@@ -143,7 +143,12 @@ def contract_gate(modeling_path: Path, profiles: tuple[str, ...]) -> None:
     simulate = load_simulate(modeling_path)
     idx = pd.date_range("2026-01-01", periods=8 * 24 * 60, freq="1min", tz="UTC")
     rng = np.random.default_rng(7)
-    series = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 1e-4, len(idx)))), index=idx, name="close")
+    closes = 100.0 * np.exp(np.cumsum(rng.normal(0, 1e-4, len(idx))))
+    context = pd.DataFrame(
+        {"open": closes, "high": closes * 1.0001, "low": closes * 0.9999, "close": closes,
+         "volume": np.ones(len(idx)), "trade_count": np.ones(len(idx))},
+        index=idx,
+    )
     t = idx[-1]
     for profile in profiles:
         time_increment, time_length = PROFILE_SHAPES[profile]
@@ -160,7 +165,7 @@ def contract_gate(modeling_path: Path, profiles: tuple[str, ...]) -> None:
             time_increment=time_increment,
             time_length=time_length,
             num_simulations=4,
-            context_prices=series,
+            context_prices=context,
         )
         wrapped = wrap_output(raw, t.to_pydatetime(), time_increment)
         verdict = response_validation_v2.validate_responses(wrapped, simulation_input, process_time_str="1.0")

@@ -19,8 +19,9 @@ def simulate(
     context_prices=None,
 ):
     steps = time_length // time_increment + 1
-    last = float(context_prices.iloc[-1])
-    rets = np.diff(np.log(np.asarray(context_prices, dtype=float)))
+    closes = context_prices["close"].dropna()
+    last = float(closes.iloc[-1])
+    rets = np.diff(np.log(np.asarray(closes, dtype=float)))
     rets = rets[np.isfinite(rets)]
     per_step_sigma = float(np.std(rets)) * (time_increment / 60.0) ** 0.5 if rets.size > 10 else 1e-3
     rng = np.random.default_rng()

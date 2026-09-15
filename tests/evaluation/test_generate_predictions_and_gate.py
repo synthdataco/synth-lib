@@ -39,6 +39,15 @@ def _series(start: str, days: int) -> pd.Series:
     return pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 1e-4, len(idx)))), index=idx, name="close")
 
 
+def _frame(series: pd.Series) -> pd.DataFrame:
+    """The OHLCV context the loader hands simulate(), from a close series."""
+    closes = series.to_numpy()
+    return pd.DataFrame(
+        {"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1.0, "trade_count": 1.0},
+        index=series.index,
+    )
+
+
 # -- the no-lookahead guarantee ------------------------------------------------
 
 
@@ -52,14 +61,14 @@ def test_context_never_reaches_past_the_prompt(tmp_path):
         t = pd.Timestamp(start_time)
         seen.append((t, context_prices.index.min(), context_prices.index.max()))
         steps = time_length // time_increment + 1
-        return (start_time, time_increment, *[[float(context_prices.iloc[-1])] * steps] * num_simulations)
+        return (start_time, time_increment, *[[float(context_prices["close"].iloc[-1])] * steps] * num_simulations)
 
     n = generate(
         spy,
         "BTC",
         pd.Timestamp("2026-07-30", tz="UTC"),
         pd.Timestamp("2026-07-31", tz="UTC"),
-        series,
+        _frame(series),
         tmp_path,
         cadence_minutes=360,
         time_increment=300,
@@ -80,7 +89,7 @@ def test_prediction_file_format(tmp_path):
         "BTC",
         pd.Timestamp("2026-07-30", tz="UTC"),
         pd.Timestamp("2026-07-30 01:00", tz="UTC"),
-        series,
+        _frame(series),
         tmp_path,
         cadence_minutes=60,
         time_increment=300,
@@ -111,7 +120,9 @@ def test_load_minute_prices_raises_on_missing_partition(tmp_path):
     root = tmp_path / "prices" / "BTC" / "1m"
     root.mkdir(parents=True)
     idx = pd.date_range("2026-07-30", periods=1440, freq="1min", tz="UTC")
-    pd.DataFrame({"timestamp": idx, "close": 1.0}).to_parquet(root / "date=2026-07-30.parquet")
+    pd.DataFrame(
+        {"timestamp": idx, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0, "trade_count": 1.0}
+    ).to_parquet(root / "date=2026-07-30.parquet")
     with pytest.raises(FileNotFoundError, match="2026-07-31"):
         load_minute_prices(
             tmp_path, "BTC", pd.Timestamp("2026-07-30", tz="UTC"), pd.Timestamp("2026-07-31 04:00", tz="UTC")
@@ -141,7 +152,7 @@ def test_gate_scaffold_starter_raw_output_fails_the_live_contract():
         time_increment=300,
         time_length=86_400,
         num_simulations=4,
-        context_prices=series,
+        context_prices=_frame(series),
     )
     verdict = _gate(raw, sim_input)
     assert verdict != "CORRECT" and "incorrect" in verdict  # iso-string start slot already fails
@@ -162,7 +173,7 @@ def test_gate_wrapped_output_passes_the_live_contract():
         time_increment=300,
         time_length=86_400,
         num_simulations=4,
-        context_prices=series,
+        context_prices=_frame(series),
     )
     wrapped = (
         int(t.timestamp()),

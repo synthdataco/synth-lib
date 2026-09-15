@@ -8,7 +8,7 @@ from synth_lib.benchmark.verdict.evaluate import final_rank, write_verdict
 
 def _flat_simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100, context_prices=None):
     steps = time_length // time_increment + 1
-    base = float(context_prices.iloc[-1])
+    base = float(context_prices["close"].iloc[-1])
     return (start_time, time_increment, *[[base] * steps for _ in range(num_simulations)])
 
 
@@ -31,7 +31,11 @@ def test_prompt_grid_hourly():
 
 def test_generate_predictions_1h_shape(tmp_path):
     idx = pd.date_range("2026-07-25T00:00:00Z", "2026-08-01T04:00:00Z", freq="1min", tz="UTC")
-    prices = pd.Series(np.linspace(100.0, 110.0, len(idx)), index=idx)
+    closes = np.linspace(100.0, 110.0, len(idx))
+    prices = pd.DataFrame(
+        {"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1.0, "trade_count": 1.0},
+        index=idx,
+    )
     out = tmp_path / "predictions"
     n = generate_predictions(
         simulate_fn=_flat_simulate,
@@ -39,7 +43,7 @@ def test_generate_predictions_1h_shape(tmp_path):
         window_start=pd.Timestamp("2026-08-01T00:00:00Z"),
         window_end=pd.Timestamp("2026-08-01T02:00:00Z"),
         out_dir=out,
-        price_series=prices,
+        price_frame=prices,
         cadence_minutes=60,
         num_simulations=5,
         time_increment=60,
@@ -56,7 +60,11 @@ def test_generate_predictions_1h_shape(tmp_path):
 
 def test_generate_predictions_writes_standard_artifacts(tmp_path):
     idx = pd.date_range("2026-07-25T00:00:00Z", "2026-08-02T00:00:00Z", freq="1min", tz="UTC")
-    prices = pd.Series(np.linspace(100.0, 110.0, len(idx)), index=idx)
+    closes = np.linspace(100.0, 110.0, len(idx))
+    prices = pd.DataFrame(
+        {"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1.0, "trade_count": 1.0},
+        index=idx,
+    )
     out = tmp_path / "predictions"
     n = generate_predictions(
         simulate_fn=_flat_simulate,
@@ -64,7 +72,7 @@ def test_generate_predictions_writes_standard_artifacts(tmp_path):
         window_start=pd.Timestamp("2026-08-01T00:00:00Z"),
         window_end=pd.Timestamp("2026-08-01T03:00:00Z"),
         out_dir=out,
-        price_series=prices,
+        price_frame=prices,
         cadence_minutes=60,
         num_simulations=10,
     )
@@ -92,7 +100,11 @@ def test_generate_predictions_default_num_simulations_is_1000(tmp_path):
     biased upward for small N — scoring a champion with fewer paths than the field would
     unfairly penalize it in the verdict. Uses the 1h/61-point shape to keep this light."""
     idx = pd.date_range("2026-07-25T00:00:00Z", "2026-08-01T04:00:00Z", freq="1min", tz="UTC")
-    prices = pd.Series(np.linspace(100.0, 110.0, len(idx)), index=idx)
+    closes = np.linspace(100.0, 110.0, len(idx))
+    prices = pd.DataFrame(
+        {"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1.0, "trade_count": 1.0},
+        index=idx,
+    )
     out = tmp_path / "predictions"
     n = generate_predictions(
         simulate_fn=_flat_simulate,
@@ -100,7 +112,7 @@ def test_generate_predictions_default_num_simulations_is_1000(tmp_path):
         window_start=pd.Timestamp("2026-08-01T00:00:00Z"),
         window_end=pd.Timestamp("2026-08-01T01:00:00Z"),
         out_dir=out,
-        price_series=prices,
+        price_frame=prices,
         cadence_minutes=60,
         time_increment=60,
         time_length=3600,
@@ -333,3 +345,18 @@ def test_write_verdict_ranks_by_mean_percentile(tmp_path):
     data = json.loads(out.read_text())
     assert data["ranking"] == ["b", "a", "c"]
     assert data["candidates"][0]["per_competition"] == {"crypto-24h": {"rank": 1}}
+
+
+def test_generation_leads_in_by_one_horizon():
+    """The candidate must answer the window's earliest scored prompts, which start before it.
+
+    Without the lead-in its first scored_time is later than the field's, and
+    prepare_df_for_moving_average backfills every earlier round at the field's worst score.
+    """
+    from synth_lib.benchmark.verdict.run_verdict import generation_start
+
+    assert generation_start("2026-08-30", 86_400, True) == "2026-08-29T00:00:00Z"
+    assert generation_start("2026-08-30", 3_600, True) == "2026-08-29T23:00:00Z"
+    # Opt-out reproduces an old verdict exactly: generation starts with the window.
+    assert generation_start("2026-08-30", 86_400, False) == "2026-08-30T00:00:00Z"
+    assert generation_start("2026-08-30", 3_600, False) == "2026-08-30T00:00:00Z"

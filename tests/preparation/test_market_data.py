@@ -16,8 +16,10 @@ silently got no data and never answered SPYX prompts.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from unittest.mock import MagicMock, patch
+
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -25,9 +27,11 @@ import pytest
 from synth.validator.price_data_provider import PriceDataProvider
 from synth_lib.preparation.binance_client import BinanceClient
 from synth_lib.preparation.config import (
+    MINUTES_PER_DAY,
     ALL_SYMBOLS,
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
+    OHLCV_COLUMNS,
 )
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 from synth_lib.preparation.minute_price_store import MinutePriceStore
@@ -92,32 +96,29 @@ class TestNoDataGraceful:
     so unlisted-asset and gap days ingest as NaN (downstream tolerates NaN)."""
 
     def test_hyperliquid_not_yet_settled_returns_empty(self) -> None:
-        with patch.object(
-            PriceDataProvider,
-            "download_hyperliquid_price_data",
-            side_effect=ValueError("realized path not yet settled for asset SP500"),
-        ):
+        """Candles inside the window but none after it: nothing proves the last minute closed."""
+        inside = [{"t": 1783382400000, "o": "1", "h": "1", "l": "1", "c": "1", "v": "1", "n": 1}]
+        with patch("synth_lib.preparation.hyperliquid_client.venue_session") as session:
+            session.return_value.post.return_value = _api_response(inside)
             df = HyperliquidClient().fetch_range(
                 "SP500",
                 datetime(2026, 7, 10, tzinfo=UTC),
                 datetime(2026, 7, 10, 23, 59, tzinfo=UTC),
             )
         assert df.empty
-        assert list(df.columns) == ["timestamp", "close"]
+        assert list(df.columns) == ["timestamp", *OHLCV_COLUMNS]
 
     def test_binance_not_yet_settled_returns_empty(self) -> None:
-        with patch.object(
-            PriceDataProvider,
-            "download_binance_price_data",
-            side_effect=ValueError("realized path not yet settled for asset BTC"),
-        ):
+        inside = [[1783382400000, "1", "1", "1", "1", "1", 0, "0", 1, "0", "0", "0"]]
+        with patch("synth_lib.preparation.binance_client.venue_session") as session:
+            session.return_value.get.return_value = _api_response(inside)
             df = BinanceClient().fetch_range(
                 "BTC",
                 datetime(2026, 7, 10, tzinfo=UTC),
                 datetime(2026, 7, 10, 23, 59, tzinfo=UTC),
             )
         assert df.empty
-        assert list(df.columns) == ["timestamp", "close"]
+        assert list(df.columns) == ["timestamp", *OHLCV_COLUMNS]
 
 
 class TestIngestSourceLabel:
@@ -131,7 +132,11 @@ class TestIngestSourceLabel:
 
             def fetch_range(self, asset, start, end):  # noqa: ANN001
                 idx = pd.date_range(start, periods=3, freq="1min", tz="UTC")
-                return pd.DataFrame({"timestamp": idx, "close": [1.0, 2.0, 3.0]})
+                closes = [1.0, 2.0, 3.0]
+                return pd.DataFrame(
+                    {"timestamp": idx, "open": closes, "high": closes, "low": closes,
+                     "close": closes, "volume": 1.0, "trade_count": 1.0}
+                )
 
         return _Stub()
 
@@ -338,3 +343,39 @@ class TestRealizedPathStore:
         with patch("synth_lib.preparation.realized_path_store.get_prompt_start_times") as mock_prompts:
             assert prefetch_realized_paths(self._store(tmp_path), []) == {}
         mock_prompts.assert_not_called()
+
+
+class TestLegacyPartitions:
+    """A store written before the OHLCV columns must say so, not surface a pyarrow FieldRef error.
+
+    `ingest_day` returns early for a settled day whose file exists, so upgrading the library never
+    rewrites what is on disk: without this, an existing store fails every read with a message that
+    does not mention the re-ingest that fixes it.
+    """
+
+    @staticmethod
+    def _close_only(root: Path, day: date) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        idx = pd.date_range(datetime.combine(day, time.min, tzinfo=UTC), periods=MINUTES_PER_DAY, freq="1min")
+        path = root / f"date={day.isoformat()}.parquet"
+        pd.DataFrame(
+            {"timestamp": idx, "close": 1.0, "source": "binance", "ingested_at": idx[0], "is_final": True}
+        ).to_parquet(path, index=False)
+        return path
+
+    def test_load_range_names_the_remedy(self, tmp_path) -> None:
+        self._close_only(tmp_path, date(2026, 7, 21))
+        store = MinutePriceStore("BTC", root=tmp_path, client=None)
+        with pytest.raises(ValueError, match="force-refresh"):
+            store.load_range(
+                datetime(2026, 7, 21, 0, 0, tzinfo=UTC), datetime(2026, 7, 21, 0, 5, tzinfo=UTC)
+            )
+
+    def test_generation_loader_names_the_remedy(self, tmp_path) -> None:
+        from synth_lib.benchmark.generate_predictions import load_minute_prices
+
+        self._close_only(tmp_path / "prices" / "BTC" / "1m", date(2026, 7, 21))
+        with pytest.raises(ValueError, match="force-refresh"):
+            load_minute_prices(
+                tmp_path, "BTC", pd.Timestamp("2026-07-21", tz="UTC"), pd.Timestamp("2026-07-21 00:05", tz="UTC")
+            )

@@ -11,8 +11,10 @@ import pandas as pd
 from synth_lib.preparation.config import (
     CONTEXT_WINDOW_MINUTES,
     MINUTES_PER_DAY,
+    OHLCV_COLUMNS,
     UTC,
     default_store_root,
+    legacy_partition_error,
     utc_datetime,
 )
 from synth_lib.preparation.price_client import PriceClient, build_price_client
@@ -89,7 +91,7 @@ class MinutePriceStore:
         if day_end < day_start:
             # Within the settle margin of midnight: nothing has settled today yet. Persist the empty
             # grid so the partition exists, and let the next refresh fill it.
-            fetched = pd.DataFrame(columns=["timestamp", "close"])
+            fetched = pd.DataFrame(columns=["timestamp", *OHLCV_COLUMNS])
         else:
             fetched = self.client.fetch_range(self.asset, day_start, day_end)
         expected_index = pd.date_range(day_start, periods=MINUTES_PER_DAY, freq="1min", tz="UTC")
@@ -98,7 +100,8 @@ class MinutePriceStore:
         frame = pd.DataFrame(index=expected_index)
         # float NaN, not pd.NA: a scalar pd.NA makes the column object dtype,
         # which reads back as None and breaks float()/np.isfinite() consumers.
-        frame["close"] = fetched["close"].reindex(expected_index) if not fetched.empty else float("nan")
+        for column in OHLCV_COLUMNS:
+            frame[column] = fetched[column].reindex(expected_index) if not fetched.empty else float("nan")
         frame["source"] = getattr(self.client, "source_name", "unknown")
         frame["ingested_at"] = datetime.now(tz=UTC).replace(microsecond=0)
         frame["is_final"] = bool(is_final)
@@ -127,6 +130,9 @@ class MinutePriceStore:
             frames.append(pd.read_parquet(path))
             cursor += timedelta(days=1)
         frame = pd.concat(frames, ignore_index=True)
+        missing = [c for c in OHLCV_COLUMNS if c not in frame.columns]
+        if missing:
+            raise ValueError(legacy_partition_error(self.root, missing))
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
         frame = frame.sort_values("timestamp").drop_duplicates("timestamp")
         window = frame.loc[(frame["timestamp"] >= start_time) & (frame["timestamp"] <= end_time)].copy()
@@ -151,19 +157,15 @@ class MinutePriceStore:
             "is_contiguous": len(frame) == expected_rows and duplicate_count == 0,
         }
 
-    def get_context_window(self, start_time: datetime) -> pd.Series:
-        """Return the 7-day minute context ending at start_time."""
+    def get_context_window(self, start_time: datetime) -> pd.DataFrame:
+        """Return the 7-day minute OHLCV context ending at start_time."""
         start_time = utc_datetime(start_time)
         context_start = start_time - timedelta(minutes=CONTEXT_WINDOW_MINUTES)
         frame = self.load_range(context_start, start_time)
         expected_rows = CONTEXT_WINDOW_MINUTES + 1
         if len(frame) != expected_rows:
             raise ValueError(f"Expected {expected_rows} context rows, got {len(frame)}.")
-        return pd.Series(
-            frame["close"].to_numpy(dtype=float),
-            index=pd.DatetimeIndex(frame["timestamp"], tz="UTC"),
-            name="close",
-        )
+        return frame.set_index(pd.DatetimeIndex(frame["timestamp"], tz="UTC"))[OHLCV_COLUMNS].astype(float)
 
     def get_real_price_path(self, start_time: datetime) -> pd.Series:
         """Return the true 24-hour path at 5-minute resolution."""

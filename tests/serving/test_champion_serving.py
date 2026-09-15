@@ -33,10 +33,31 @@ def _store_with(tmp_path, series: pd.Series, asset: str = "BTC"):
     root = tmp_path / asset / "1m"
     root.mkdir(parents=True)
     for day, chunk in series.groupby(series.index.date):
-        pd.DataFrame({"timestamp": chunk.index, "close": chunk.to_numpy()}).to_parquet(
+        closes = chunk.to_numpy()
+        pd.DataFrame(
+            {
+                "timestamp": chunk.index,
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+                "volume": 1.0,
+                "trade_count": 1.0,
+            }
+        ).to_parquet(
             root / f"date={day.isoformat()}.parquet"
         )
     return MinutePriceStore(asset, root=root)
+
+
+def _context(series: pd.Series) -> pd.DataFrame:
+    """The OHLCV frame simulate() is handed, from a close series."""
+    closes = series.to_numpy()
+    return pd.DataFrame(
+        {"open": closes, "high": closes, "low": closes, "close": closes,
+         "volume": 1.0, "trade_count": 1.0},
+        index=series.index,
+    )
 
 
 def test_wrap_output_passes_the_live_contract():
@@ -49,7 +70,7 @@ def test_wrap_output_passes_the_live_contract():
         time_increment=300,
         time_length=86_400,
         num_simulations=4,
-        context_prices=series,
+        context_prices=_context(series),
     )
     sim_input = SimulationInput(
         asset="BTC", start_time=t.isoformat(), time_increment=300, time_length=86_400, num_simulations=4

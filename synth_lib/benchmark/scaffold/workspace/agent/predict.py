@@ -23,7 +23,7 @@ from pathlib import Path
 import pandas as pd
 
 from synth_lib.backtester.orchestration import backtest
-from synth_lib.preparation.config import STORE_SUBDIR
+from synth_lib.preparation.config import OHLCV_COLUMNS, STORE_SUBDIR
 from synth_lib.preparation.market_data import MinutePriceStore
 
 # All paths are resolved from the location of THIS file, never from the cwd: the
@@ -92,7 +92,7 @@ def generate(
 ) -> int:
     store = MinutePriceStore(asset, root=store_root(asset))
     df = store.load_range(start - timedelta(minutes=CONTEXT_MINUTES), end).set_index("timestamp")
-    prices = df["close"]
+    prices = df[OHLCV_COLUMNS]
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     end_ts = pd.Timestamp(end)
     n = 0

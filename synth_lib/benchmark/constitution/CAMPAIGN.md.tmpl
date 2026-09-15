@@ -46,9 +46,10 @@ cutoff** and run through the validator's own aggregation. Your Score is
 **100 × mean over the 3 competitions of min(1, your total reward weight ÷ the top miner's)** —
 simulated emissions relative to the field's best. Its consequences:
 - Each competition is worth 1/3 of the Score, regardless of asset count.
-- The 10-day window matches the validator's 24h smoothing window, so your rank is steady-state
-— no new-miner penalty. Estimate this Score for your own candidates with the official
-  backtester before you nominate.
+- The window is scored with the validator's own moving average, which backfills a miner that
+  appears late with the field's worst score. Your champion is generated from one horizon before
+  the window so it answers the earliest scored prompts too, and is never treated as late.
+  Estimate this Score for your own candidates with the official backtester before you nominate.
 
 ## Your resources
 
@@ -59,8 +60,9 @@ simulated emissions relative to the field's best. Its consequences:
   system `python3` has no numpy or pandas — only the workspace venv does.
   `agent/predict.py` is also used for the 1h format (pass `--time-length 3600 --time-increment
   60`).
-- **`market_data/`**: a frozen snapshot of minute prices (parquet partitions
-  `prices/{ASSET}/1m/date=YYYY-MM-DD.parquet`, resolve it with
+- **`market_data/`**: a frozen snapshot of minute OHLCV (parquet partitions
+  `prices/{ASSET}/1m/date=YYYY-MM-DD.parquet`, columns `open, high, low, close, volume,
+  trade_count`, resolve it with
   `synth_lib.preparation.config.default_store_root`, do not hardcode either) covering
   **$data_start → $data_cutoff**, mounted
   READ-ONLY, at the ROOT of the workspace. This is your ONLY source of market data. **There is no
@@ -181,10 +183,11 @@ simulated emissions relative to the field's best. Its consequences:
    `simulate(asset, start_time, time_increment, time_length, num_simulations, context_prices)`
    -> tuple `(start_timestamp, time_increment, *paths)` — each path: a list of
    `time_length//time_increment + 1` floats starting at the last price in the context.
-   **The `context_prices` contract, exactly**: a minute-indexed pd.Series of 1-minute closes
-   over the 7 days preceding `start_time`, and it MAY CONTAIN NaN — your `simulate()` must
-   tolerate them (drop, never interpolate). Evaluation passes the raw series: handle gaps
-   inside your model, not in a loader you hope evaluation shares.
+   **The `context_prices` contract, exactly**: a minute-indexed pd.DataFrame over the 7 days
+   preceding `start_time`, with columns `open, high, low, close, volume, trade_count`. `close`
+   is the series you are scored against; the rest are context. It MAY CONTAIN NaN in every
+   column — your `simulate()` must tolerate them (drop, never interpolate). Evaluation passes
+   the raw frame: handle gaps inside your model, not in a loader you hope evaluation shares.
    Runnable OFFLINE (weights/artifacts committed or included in the workspace).
 
 ## Required deliverables (in `agent/`)

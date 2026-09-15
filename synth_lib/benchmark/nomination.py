@@ -99,7 +99,10 @@ def probe_simulate(
         simulate = load_simulate(modeling_path)
         start = pd.Timestamp("2026-01-05T00:00:00Z")
         idx = pd.date_range(end=start, periods=7 * 24 * 60, freq="1min", tz="UTC")
-        context = pd.Series(100.0, index=idx)
+        context = pd.DataFrame(
+            {c: 100.0 for c in ("open", "high", "low", "close")} | {"volume": 1.0, "trade_count": 1.0},
+            index=idx,
+        )
         out = simulate(
             asset=asset,
             start_time=start.isoformat(),

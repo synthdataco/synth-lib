@@ -51,6 +51,26 @@ SANDBOX_CPUS = 12
 CADENCE_MINUTES = {86_400: 60, 3_600: 10}
 
 
+def generation_start(window_start: str, time_length: int, lead_in: bool) -> str:
+    """Where generation begins for a competition, given the scoring window's start.
+
+    The window scores every prompt whose `scored_time` falls inside it, but a prompt is scored one
+    horizon after it starts — so the earliest scored prompts began BEFORE the window. Generating
+    only from `window_start` leaves those without a prediction, and the validator's moving average
+    then treats the candidate as a miner that joined late: `prepare_df_for_moving_average` backfills
+    every earlier timestamp with the worst score in the field. The candidate eats a full horizon of
+    worst-score rounds it never had the chance to answer.
+
+    Leading generation in by one horizon makes the candidate's first `scored_time` equal the
+    field's, so it is never classified as new. Lengthening the window does not substitute for this:
+    it dilutes the backfilled rounds without removing them.
+    """
+    start = pd.Timestamp(window_start, tz="UTC")
+    if lead_in:
+        start -= pd.Timedelta(seconds=time_length)
+    return start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def run(cmd: list[str], what: str) -> None:
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
@@ -104,6 +124,7 @@ def generate_all(
     window: tuple[str, str],
     gpus: bool,
     limits: tuple[int, int],
+    lead_in: bool = True,
 ) -> None:
     """One --network none sandbox run per (competition, asset)."""
     if not GENERATE_SCRIPT.exists():  # packaging regression: it must ship with the package
@@ -115,7 +136,8 @@ def generate_all(
                 "uv run python generate_predictions.py"
                 " --modeling agent/modeling.py"
                 f" --asset {asset}"
-                f" --window-start {window[0]} --window-end {window[1]}"
+                f" --window-start {generation_start(window[0], comp.time_length, lead_in)}"
+                f" --window-end {window[1]}"
                 " --data-root /workspace/market_data --out-dir predictions"
                 f" --cadence-minutes {CADENCE_MINUTES[comp.time_length]}"
                 f" --time-increment {comp.time_increment} --time-length {comp.time_length}"
@@ -143,7 +165,9 @@ def generate_all(
             print(f"  generated {asset} tl={comp.time_length}", flush=True)
 
 
-def generate_baseline(modeling: Path, data_root: Path, out_dir: Path, window: tuple[str, str]) -> None:
+def generate_baseline(
+    modeling: Path, data_root: Path, out_dir: Path, window: tuple[str, str], lead_in: bool = True
+) -> None:
     """Host-side, trusted repo code. Known caveat: the subnet's default generator ignores
     context_prices and anchors on a price it fetches ITSELF — for past prompts that anchor may be
     wrong, so read the baseline's verdict with suspicion and drop it from the article if broken."""
@@ -158,7 +182,8 @@ def generate_baseline(modeling: Path, data_root: Path, out_dir: Path, window: tu
                         str(GENERATE_SCRIPT),
                         *("--modeling", str(modeling)),
                         *("--asset", asset),
-                        *("--window-start", window[0], "--window-end", window[1]),
+                        *("--window-start", generation_start(window[0], comp.time_length, lead_in)),
+                        *("--window-end", window[1]),
                         *("--data-root", str(data_root), "--out-dir", str(out_dir)),
                         *("--cadence-minutes", str(CADENCE_MINUTES[comp.time_length])),
                         *("--time-increment", str(comp.time_increment), "--time-length", str(comp.time_length)),
@@ -224,6 +249,13 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     ap.add_argument("--force", action="store_true", help="rescore legs whose verdict.json already exists")
     ap.add_argument("--skip-baseline", action="store_true")
     ap.add_argument(
+        "--no-lead-in",
+        action="store_true",
+        help="generate only inside the window, as before the lead-in fix: the first horizon of "
+        "scored prompts then has no prediction and the candidate is backfilled at the field's "
+        "worst score. For reproducing an old verdict, not for scoring a new one.",
+    )
+    ap.add_argument(
         "--baseline-module",
         default=PACKAGED_BASELINE,
         help="dotted module path or file path exposing simulate() (default: the packaged control)",
@@ -268,7 +300,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             f"{leg} uv sync",
         )
         print(f"[{leg}] phase 2: generation (--network none)", flush=True)
-        generate_all(clone, data_root, home, window, gpus=not args.no_gpu, limits=limits)
+        generate_all(clone, data_root, home, window, gpus=not args.no_gpu, limits=limits, lead_in=not args.no_lead_in)
         print(f"[{leg}] scoring", flush=True)
         result = score(leg, clone / "predictions", window_end, window_days)
         out.write_text(json.dumps(verdict_payload(result, champion.sha, window), indent=2) + "\n")
@@ -283,7 +315,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         baseline_modeling = baseline_modeling_path(args.baseline_module)
         predictions = work / "baseline-predictions"
         print("[baseline] generating (host)", flush=True)
-        generate_baseline(baseline_modeling, data_root, predictions, window)
+        generate_baseline(baseline_modeling, data_root, predictions, window, lead_in=not args.no_lead_in)
         result = score("synth_default", predictions, window_end, window_days)
         baseline_out.parent.mkdir(parents=True, exist_ok=True)
         baseline_out.write_text(json.dumps(verdict_payload(result, None, window), indent=2) + "\n")

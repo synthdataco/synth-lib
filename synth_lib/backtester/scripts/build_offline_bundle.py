@@ -59,6 +59,8 @@ SCORES_PAD = timedelta(hours=1)
 REWARDS_PAD = timedelta(hours=25)
 MAX_RETRIES = 3
 
+REQUEST_SPACING_SECONDS = 0.2
+
 
 def fetch_chunked(
     fetch: Callable[[datetime, datetime], pd.DataFrame],
@@ -94,8 +96,32 @@ def fetch_chunked(
             frames.append(df)
         print(f"  {label} [{cursor:%m-%d} -> {chunk_end:%m-%d}]: {len(df)} rows", flush=True)
         cursor = chunk_end
-        sleep(2)
+        sleep(REQUEST_SPACING_SECONDS)
     return pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
+
+
+def coerce_numeric_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Give numeric-looking object columns a real numeric dtype before parquet.
+
+    A single score above 2**53 makes pandas type the whole column `object`, and pyarrow then
+    refuses the int -> double conversion as inexact and aborts the write — losing an otherwise
+    complete asset, and with it every asset after it in the run. Scores that large are pathological
+    to begin with, so the float64 they land on is no worse than the number itself.
+
+    Columns that are genuinely textual (asset, timestamps) fail the parse and are left alone.
+    """
+    for column in frame.columns:
+        if frame[column].dtype != object:
+            continue
+        try:
+            numeric = pd.to_numeric(frame[column])
+        except (TypeError, ValueError):
+            continue  # a genuinely textual column
+        # A value beyond int64 leaves to_numeric's result `object` rather than raising, and parquet
+        # then refuses it just the same. float64 is lossy there, which is the right trade for a
+        # number no honest score reaches.
+        frame[column] = numeric.astype("float64") if numeric.dtype == object else numeric
+    return frame
 
 
 def bundle_realized_paths(asset: str, competition: CompetitionConfig, scores: pd.DataFrame) -> None:
@@ -140,6 +166,7 @@ def build_bundle(
                 chunk_days,
                 f"scores/{asset}",
             )
+            df = coerce_numeric_columns(df)
             df.to_parquet(path, index=False)
             prompts = df["scored_time"].nunique() if not df.empty else 0
             print(f"wrote {path}: {len(df)} rows, {prompts} prompts")
@@ -157,6 +184,7 @@ def build_bundle(
             chunk_days,
             "rewards",
         )
+        df = coerce_numeric_columns(df)
         df.to_parquet(path, index=False)
         rounds = df["updated_at"].nunique() if not df.empty else 0
         print(f"wrote {path}: {len(df)} rows, {rounds} update rounds")
