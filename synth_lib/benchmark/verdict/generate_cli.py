@@ -11,6 +11,7 @@ import pandas as pd
 from synth_lib.preparation.config import (  # type: ignore[import-untyped]
     STORE_SUBDIR,
 )
+from synth_lib.preparation.config import OHLCV_COLUMNS
 from synth_lib.preparation.minute_price_store import MinutePriceStore  # type: ignore[import-untyped]
 
 from synth_lib.benchmark.nomination import load_simulate
@@ -66,7 +67,7 @@ def main() -> None:
     # extracting "close" so that generate_predictions's .loc[t - CONTEXT : t] slicing
     # works on a DatetimeIndex.
     frame = store.load_range(start - pd.Timedelta(minutes=CONTEXT_MINUTES), end)
-    prices = frame.set_index("timestamp")["close"]
+    prices = frame.set_index("timestamp")[OHLCV_COLUMNS]
     n = generate_predictions(
         load_simulate(args.modeling),
         args.asset,

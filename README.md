@@ -100,8 +100,10 @@ market_data/
             └── ...
 ```
 
-Each parquet contains `timestamp`, `close`, `source`, `ingested_at`, and
-`is_final` columns. Rows are minute-aligned UTC; gaps are stored as NaN.
+Each parquet contains `timestamp`, `open`, `high`, `low`, `close`, `volume`,
+`trade_count`, `source`, `ingested_at`, and `is_final` columns. `close` is the
+series miners are scored against; the rest describe the same minute. Rows are
+minute-aligned UTC; gaps are stored as NaN in every column.
 
 ### Assets with no deep history (Hyperliquid)
 

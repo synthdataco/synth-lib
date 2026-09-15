@@ -66,7 +66,13 @@ def load_minute_prices(data_root: Path, asset: str, start: pd.Timestamp, end: pd
         path = root / f"date={day.isoformat()}.parquet"
         if not path.exists():
             raise FileNotFoundError(f"missing partition {path}")
-        frames.append(pd.read_parquet(path, columns=["timestamp", *OHLCV_COLUMNS]))
+        try:
+            frames.append(pd.read_parquet(path, columns=["timestamp", *OHLCV_COLUMNS]))
+        except ValueError as exc:  # pyarrow's ArrowInvalid, on a column the file lacks
+            raise ValueError(
+                f"{path} predates the OHLCV columns. Re-ingest with --force-refresh: ingest_day "
+                f"skips settled partitions that already exist."
+            ) from exc
         day += timedelta(days=1)
     frame = pd.concat(frames, ignore_index=True)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)

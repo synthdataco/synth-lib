@@ -54,6 +54,22 @@ def utc_datetime(value: datetime) -> datetime:
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "trade_count"]
 
 
+def legacy_partition_error(path: object, missing: list[str] | None = None) -> str:
+    """Message for a partition written before the store carried OHLCV.
+
+    `ingest_day` returns early for a settled day whose file exists, so upgrading the library does
+    not rewrite what is already on disk: an old store keeps close-only partitions indefinitely and
+    every reader that selects the OHLCV columns by name fails on them. The remedy is a re-ingest,
+    which is not guessable from pyarrow's own "No match for FieldRef" error.
+    """
+    lacks = f" (missing {', '.join(missing)})" if missing else ""
+    return (
+        f"{path} predates the OHLCV columns{lacks}. Re-ingest the affected days with "
+        f"--force-refresh: ingest_day skips settled partitions that already exist, so upgrading "
+        f"alone leaves them close-only."
+    )
+
+
 def venue_session() -> requests.Session:
     """A session that retries transient venue failures.
 

@@ -32,7 +32,12 @@ import pandas as pd
 from synth.simulation_input import SimulationInput  # type: ignore[import-untyped]
 from synth.validator.competition_config import ALL_COMPETITIONS  # type: ignore[import-untyped]
 
-from synth_lib.preparation.config import BINANCE_SYMBOLS, HYPERLIQUID_SYMBOLS, OHLCV_COLUMNS
+from synth_lib.preparation.config import (
+    BINANCE_SYMBOLS,
+    HYPERLIQUID_SYMBOLS,
+    OHLCV_COLUMNS,
+    legacy_partition_error,
+)
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.preparation.price_client import build_price_client
 
@@ -110,7 +115,10 @@ def build_context(
     while day <= start_time.date():
         path = store.day_path(day)
         if path.exists():
-            frames.append(pd.read_parquet(path, columns=["timestamp", *OHLCV_COLUMNS]))
+            try:
+                frames.append(pd.read_parquet(path, columns=["timestamp", *OHLCV_COLUMNS]))
+            except ValueError as exc:  # pyarrow's ArrowInvalid, on a column the file lacks
+                raise ValueError(legacy_partition_error(path)) from exc
         day += timedelta(days=1)
     if not frames:
         raise ValueError(f"no partitions for {store.asset} in {context_start.isoformat()}..{start_time.isoformat()}")

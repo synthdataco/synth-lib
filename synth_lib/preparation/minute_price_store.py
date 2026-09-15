@@ -14,6 +14,7 @@ from synth_lib.preparation.config import (
     OHLCV_COLUMNS,
     UTC,
     default_store_root,
+    legacy_partition_error,
     utc_datetime,
 )
 from synth_lib.preparation.price_client import PriceClient, build_price_client
@@ -129,6 +130,9 @@ class MinutePriceStore:
             frames.append(pd.read_parquet(path))
             cursor += timedelta(days=1)
         frame = pd.concat(frames, ignore_index=True)
+        missing = [c for c in OHLCV_COLUMNS if c not in frame.columns]
+        if missing:
+            raise ValueError(legacy_partition_error(self.root, missing))
         frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
         frame = frame.sort_values("timestamp").drop_duplicates("timestamp")
         window = frame.loc[(frame["timestamp"] >= start_time) & (frame["timestamp"] <= end_time)].copy()
