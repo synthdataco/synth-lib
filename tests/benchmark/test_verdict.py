@@ -345,3 +345,18 @@ def test_write_verdict_ranks_by_mean_percentile(tmp_path):
     data = json.loads(out.read_text())
     assert data["ranking"] == ["b", "a", "c"]
     assert data["candidates"][0]["per_competition"] == {"crypto-24h": {"rank": 1}}
+
+
+def test_generation_leads_in_by_one_horizon():
+    """The candidate must answer the window's earliest scored prompts, which start before it.
+
+    Without the lead-in its first scored_time is later than the field's, and
+    prepare_df_for_moving_average backfills every earlier round at the field's worst score.
+    """
+    from synth_lib.benchmark.verdict.run_verdict import generation_start
+
+    assert generation_start("2026-08-30", 86_400, True) == "2026-08-29T00:00:00Z"
+    assert generation_start("2026-08-30", 3_600, True) == "2026-08-29T23:00:00Z"
+    # Opt-out reproduces an old verdict exactly: generation starts with the window.
+    assert generation_start("2026-08-30", 86_400, False) == "2026-08-30T00:00:00Z"
+    assert generation_start("2026-08-30", 3_600, False) == "2026-08-30T00:00:00Z"
