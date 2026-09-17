@@ -86,8 +86,18 @@ simulated emissions relative to the field's best. Its consequences:
   per-asset coverage table with density by era. Two caveats it quantifies that will bite if
   ignored: the early months of the newer Hyperliquid listings are genuinely THIN (low realized
   volatility there is real, not smoothing), and these are venue-specific perpetual prices with
-  their own basis (xyz:SP500 trades around 7,500 — not the cash index), trading ~24/7 with NO
-  overnight or weekend sessions: do not build a session-of-day structure that does not exist.
+  their own basis (xyz:SP500 trades around 7,500 — not the cash index).
+
+  **The venue never closes; the underlying does.** Minutes exist around the clock for every asset,
+  so there is no session gap in the DATA — but the equity and commodity perps track markets that
+  shut, and their VOLATILITY follows those hours closely. Measured on the snapshot: realized
+  volatility per minute swings about 4-5x across the UTC day for the tokenised equities and gold,
+  peaking at the US cash open and bottoming overnight, and weekdays run 2-4x hotter than weekends.
+  The crypto assets, genuinely 24/7, are far flatter on both. A constant per-asset volatility is
+  therefore too wide overnight and too narrow at the open, and CRPS charges for both. Measure the
+  seasonality yourself before you model it, and check whether it holds for each asset rather than
+  assuming one shape fits the group.
+
   Do not "repair" NaN gaps by interpolating; scoring already drops NaN per prompt, and inventing
   prices in the gaps is how you fool your own validation.
 
