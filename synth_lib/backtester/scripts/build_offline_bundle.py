@@ -45,7 +45,6 @@ from synth_lib.backtester.loading import (
     get_miner_scores,
     get_rewards_history,
 )
-from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS
 from synth_lib.preparation.realized_path_store import (
     RealizedPathStore,
     prefetch_realized_paths,
@@ -125,10 +124,18 @@ def coerce_numeric_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def bundle_realized_paths(asset: str, competition: CompetitionConfig, scores: pd.DataFrame) -> None:
-    """Cache the realized path of every bundled prompt for a Hyperliquid asset.
+    """Cache the validator's realized path for every bundled prompt, whatever the asset's venue.
 
-    Those assets have no local minute prices beyond ~3.5 days, so a long backtest
-    cannot score without these.
+    This used to run for Hyperliquid assets only, on the reasoning that they are the ones whose
+    minute history the venue cannot serve. But it also decided where realized prices COME FROM: a
+    Hyperliquid asset was scored against the validator's own arrays, a Binance one against whatever
+    the operator's local store happened to hold. Two boxes then produce two different CRPS for the
+    same champion on the same window, and only the crypto majors move.
+
+    The bias has a direction. A 24h prompt's CRPS is a sum over its scoring points and NaN points
+    are dropped, so a minute missing locally shrinks the sum: a thinner store scores BETTER. Caching
+    every asset makes the ground truth the validator's for all of them, so the score stops depending
+    on the box it was computed on.
     """
     if scores.empty:
         return
@@ -170,7 +177,7 @@ def build_bundle(
             df.to_parquet(path, index=False)
             prompts = df["scored_time"].nunique() if not df.empty else 0
             print(f"wrote {path}: {len(df)} rows, {prompts} prompts")
-        if realized_paths and asset in HYPERLIQUID_SYMBOLS:
+        if realized_paths:
             bundle_realized_paths(asset, competition, df)
 
     path = out / f"rewards_history_{slug}.parquet"
@@ -237,8 +244,9 @@ def main() -> None:
     parser.add_argument(
         "--no-realized-paths",
         action="store_true",
-        help="skip caching realized paths for Hyperliquid assets (they have no minute history "
-        "beyond ~3.5 days, so those windows will score as NaN CRPS without them)",
+        help="skip caching validator realized paths. Hyperliquid assets then have no prices "
+        "beyond the venue's ~3.5 days and score as NaN CRPS; every asset falls back to the local "
+        "minute store, where a missing minute silently lowers CRPS rather than failing",
     )
     args = parser.parse_args()
 
