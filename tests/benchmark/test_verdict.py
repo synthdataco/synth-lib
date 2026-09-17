@@ -271,7 +271,13 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     com_equ = per_comp["com-equ-24h"]
     assert com_equ["assets_failed"] == ["SPYX"]
     assert "error" in com_equ["per_asset"]["SPYX"]
-    assert com_equ["per_asset"]["XAU"] == {"mean_crps": 1.0, "num_prompts": 24}
+    # realized_coverage travels with mean_crps by contract: a CRPS is comparable to another only
+    # at the same coverage, so the verdict must never publish one without the other.
+    assert com_equ["per_asset"]["XAU"] == {
+        "mean_crps": 1.0,
+        "num_prompts": 24,
+        "realized_coverage": None,
+    }
     assert com_equ["rank"] == 2
     assert com_equ["field_size"] == 3
     assert com_equ["percentile"] == 1.0 - (2 - 1) / 3

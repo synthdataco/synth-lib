@@ -1417,3 +1417,20 @@ class TestFillGapsFromRealizedPaths:
 
         assert _fill_gaps_from_realized_paths(prompts, "[test]") == 1
         mock_prefetch.assert_not_called()
+
+
+def test_realized_coverage_counts_only_prompts_with_predictions():
+    """Coverage measures the reference, not the champion: a prompt with no prediction is
+    num_prompts' business, and a hole in the realized path is what quietly shrinks CRPS."""
+    from synth_lib.backtester.orchestration import _realized_coverage
+
+    full = {"file_path": "p", "time_length": 3600, "time_increment": 60, "real_prices": [1.0] * 61}
+    holed = {"file_path": "p", "time_length": 3600, "time_increment": 60, "real_prices": [1.0] * 59 + [float("nan")] * 2}
+    unpredicted = {"file_path": None, "time_length": 3600, "time_increment": 60, "real_prices": []}
+
+    assert _realized_coverage([full])["realized_coverage"] == 1.0
+    out = _realized_coverage([full, holed])
+    assert out["realized_points_expected"] == 122 and out["realized_points_scored"] == 120
+    # The unpredicted prompt must not dilute coverage, or a missing prediction reads as a data hole.
+    assert _realized_coverage([full, unpredicted])["realized_coverage"] == 1.0
+    assert _realized_coverage([])["realized_coverage"] is None
