@@ -132,6 +132,10 @@ def evaluate_candidate(name: str, predictions_dir: Path, window_end: pd.Timestam
                 per_asset[asset] = {
                     "mean_crps": result.summary["mean_crps"],
                     "num_prompts": result.summary["num_prompts"],
+                    # Beside mean_crps on purpose: dropped NaN points shrink the CRPS sum, so a
+                    # thin realized path flatters the champion. Two verdicts compare only at
+                    # equal coverage.
+                    "realized_coverage": result.summary.get("realized_coverage"),
                     **(asset_rank_stats(result.smoothed_scores) or {}),
                 }
             except Exception as exc:

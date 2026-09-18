@@ -8,6 +8,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from synth.validator.competition_config import ALL_COMPETITIONS, CompetitionConfig
@@ -60,6 +61,27 @@ from synth_lib.backtester.scoring import (
     calculate_smoothed_scores,
     compute_combined_smoothed_scores,
 )
+
+
+def _realized_coverage(prompts: list[dict]) -> dict[str, object]:
+    """How much of each prompt's realized path actually carries a price.
+
+    A prompt's CRPS is a sum over its scoring points and NaN points are dropped, so a realized path
+    with holes yields a SMALLER sum — a better-looking score from a thinner reference, not a better
+    model. The shrinkage does not show in mean_crps, which is why it is reported beside it: two runs
+    of the same champion over the same window are comparable only at equal coverage.
+    """
+    expected = scored = 0
+    for prompt in prompts:
+        if prompt["file_path"] is None:
+            continue  # no prediction at all — num_prompts already counts that, it is not coverage
+        expected += prompt["time_length"] // prompt["time_increment"] + 1
+        scored += int(np.isfinite(np.asarray(prompt["real_prices"], dtype=float)).sum())
+    return {
+        "realized_points_expected": expected,
+        "realized_points_scored": scored,
+        "realized_coverage": (scored / expected) if expected else None,
+    }
 
 
 def backtest(
@@ -270,6 +292,7 @@ def backtest(
             )
 
     _fill_gaps_from_realized_paths(prompts, log_prefix)
+    realized_coverage = _realized_coverage(prompts)
 
     work_items = [
         (
@@ -443,6 +466,7 @@ def backtest(
         "final_smoothed_score": (
             float(miner_smoothed.iloc[-1]) if not miner_smoothed.empty else None
         ),
+        **realized_coverage,
     }
 
     return BacktestResult(
@@ -560,6 +584,11 @@ def run_backtest(
 
         print(
             f"  Prompts scored: {summary['num_prompts']}  Mean CRPS: {summary['mean_crps']:.6f}"
+            + (
+                f"  realized coverage: {summary['realized_coverage'] * 100:.2f}%"
+                if summary.get("realized_coverage") is not None
+                else ""
+            )
         )
 
         try:

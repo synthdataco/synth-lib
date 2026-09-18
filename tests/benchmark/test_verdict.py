@@ -259,7 +259,13 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     com_equ = per_comp["com-equ-24h"]
     assert com_equ["assets_failed"] == ["SPYX"]
     assert "error" in com_equ["per_asset"]["SPYX"]
-    assert com_equ["per_asset"]["XAU"] == {"mean_crps": 1.0, "num_prompts": 24}
+    # realized_coverage travels with mean_crps by contract: a CRPS is comparable to another only
+    # at the same coverage, so the verdict must never publish one without the other.
+    assert com_equ["per_asset"]["XAU"] == {
+        "mean_crps": 1.0,
+        "num_prompts": 24,
+        "realized_coverage": None,
+    }
     assert com_equ["rank"] == 2
     assert com_equ["field_size"] == 3
     assert com_equ["percentile"] == 1.0 - (2 - 1) / 3
@@ -333,3 +339,18 @@ def test_write_verdict_ranks_by_mean_percentile(tmp_path):
     data = json.loads(out.read_text())
     assert data["ranking"] == ["b", "a", "c"]
     assert data["candidates"][0]["per_competition"] == {"crypto-24h": {"rank": 1}}
+
+
+def test_generation_leads_in_by_one_horizon():
+    """The candidate must answer the window's earliest scored prompts, which start before it.
+
+    Without the lead-in its first scored_time is later than the field's, and
+    prepare_df_for_moving_average backfills every earlier round at the field's worst score.
+    """
+    from synth_lib.benchmark.verdict.run_verdict import generation_start
+
+    assert generation_start("2026-08-30", 86_400, True) == "2026-08-29T00:00:00Z"
+    assert generation_start("2026-08-30", 3_600, True) == "2026-08-29T23:00:00Z"
+    # Opt-out reproduces an old verdict exactly: generation starts with the window.
+    assert generation_start("2026-08-30", 86_400, False) == "2026-08-30T00:00:00Z"
+    assert generation_start("2026-08-30", 3_600, False) == "2026-08-30T00:00:00Z"

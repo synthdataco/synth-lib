@@ -46,9 +46,10 @@ cutoff** and run through the validator's own aggregation. Your Score is
 **100 × mean over the 3 competitions of min(1, your total reward weight ÷ the top miner's)** —
 simulated emissions relative to the field's best. Its consequences:
 - Each competition is worth 1/3 of the Score, regardless of asset count.
-- The 10-day window matches the validator's 24h smoothing window, so your rank is steady-state
-— no new-miner penalty. Estimate this Score for your own candidates with the official
-  backtester before you nominate.
+- The window is scored with the validator's own moving average, which backfills a miner that
+  appears late with the field's worst score. Your champion is generated from one horizon before
+  the window so it answers the earliest scored prompts too, and is never treated as late.
+  Estimate this Score for your own candidates with the official backtester before you nominate.
 
 ## Your resources
 
