@@ -47,6 +47,10 @@ UTC = timezone.utc
 # prompts before that date were produced by the old formula and aren't directly
 # comparable to ranks computed under the current formula. See README "Known
 # caveats".
+#
+# Bump this whenever the validator changes the crypto-1h formula again: the
+# volatility term the backtester already scores locally is not in API-stored
+# CRPS until the validator switches over.
 HF_CRPS_FORMULA_CHANGE_DATE = datetime(2026, 3, 11, tzinfo=UTC)
 
 # On-chain emission normalization for the USD earnings estimate. A miner's
