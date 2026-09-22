@@ -15,7 +15,10 @@ to pre-download them). Hyperliquid-routed assets have no minute history beyond
 ~3.5 days, so each bundled prompt's realized path is cached under
 market_data/realized/ instead.
 
-Already-written parquets are skipped, so an interrupted run can be resumed.
+Already-written parquets are skipped, so an interrupted run can be resumed. The window each one
+was fetched for is recorded in manifest.json and checked before that skip: the filenames carry
+the asset and the competition but not the dates, so without it a bundle built for one window
+satisfies any --days/--eval-end and the backtest runs over whatever days the two windows share.
 
 Usage (then run the backtest with SYNTH_BACKTESTER_OFFLINE_DATA_ROOT={out}):
 
@@ -30,6 +33,7 @@ Usage (then run the backtest with SYNTH_BACKTESTER_OFFLINE_DATA_ROOT={out}):
 from __future__ import annotations
 
 import argparse
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import sleep
@@ -59,6 +63,40 @@ REWARDS_PAD = timedelta(hours=25)
 MAX_RETRIES = 3
 
 REQUEST_SPACING_SECONDS = 0.2
+
+MANIFEST_NAME = "manifest.json"
+
+
+def _manifest(out: Path) -> dict[str, dict[str, str]]:
+    path = out / MANIFEST_NAME
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _record_window(out: Path, filename: str, start: datetime, end: datetime) -> None:
+    """Stamp the window a file was fetched for, as each file lands rather than at the end, so an
+    interrupted run still describes everything it wrote."""
+    manifest = _manifest(out)
+    manifest[filename] = {"start": start.isoformat(), "end": end.isoformat()}
+    (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
+def _require_window(out: Path, filename: str, start: datetime, end: datetime) -> None:
+    """Refuse a file on disk that was not fetched for a window containing [start, end].
+
+    A bundle may be the archived record a published verdict was produced from, so a file that does
+    not cover the requested window is never refetched over in place.
+    """
+    entry = _manifest(out).get(filename)
+    if entry is not None:
+        if datetime.fromisoformat(entry["start"]) <= start and datetime.fromisoformat(entry["end"]) >= end:
+            return
+        held = f"covers {entry['start']} .. {entry['end']}"
+    else:
+        held = f"predates window tracking, so what it covers is unknown ({MANIFEST_NAME} has no entry)"
+    raise SystemExit(
+        f"{out / filename} {held}, but this run needs {start.isoformat()} .. {end.isoformat()}.\n"
+        f"Build into a fresh --out, or delete the file to refetch it."
+    )
 
 
 def fetch_chunked(
@@ -161,8 +199,10 @@ def build_bundle(
     rewards_end = eval_end + REWARDS_PAD
 
     for asset in assets:
-        path = out / f"miner_scores_{asset}_{slug}.parquet"
+        name = f"miner_scores_{asset}_{slug}.parquet"
+        path = out / name
         if path.exists():
+            _require_window(out, name, scores_start, eval_end)
             print(f"skip {path} (exists)")
             df = pd.read_parquet(path)
         else:
@@ -175,13 +215,16 @@ def build_bundle(
             )
             df = coerce_numeric_columns(df)
             df.to_parquet(path, index=False)
+            _record_window(out, name, scores_start, eval_end)
             prompts = df["scored_time"].nunique() if not df.empty else 0
             print(f"wrote {path}: {len(df)} rows, {prompts} prompts")
         if realized_paths:
             bundle_realized_paths(asset, competition, df)
 
-    path = out / f"rewards_history_{slug}.parquet"
+    name = f"rewards_history_{slug}.parquet"
+    path = out / name
     if path.exists():
+        _require_window(out, name, rewards_start, rewards_end)
         print(f"skip {path} (exists)")
     else:
         df = fetch_chunked(
@@ -193,15 +236,19 @@ def build_bundle(
         )
         df = coerce_numeric_columns(df)
         df.to_parquet(path, index=False)
+        _record_window(out, name, rewards_start, rewards_end)
         rounds = df["updated_at"].nunique() if not df.empty else 0
         print(f"wrote {path}: {len(df)} rows, {rounds} update rounds")
 
-    path = out / "miner_pool_usd.parquet"
+    name = "miner_pool_usd.parquet"
+    path = out / name
     if path.exists():
+        _require_window(out, name, rewards_start, rewards_end)
         print(f"skip {path} (exists)")
     else:
         pool = get_daily_miner_pool_usd(rewards_start, rewards_end)
         pd.DataFrame({"date": pool.index, "usd": pool.values}).to_parquet(path, index=False)
+        _record_window(out, name, rewards_start, rewards_end)
         print(f"wrote {path}: {len(pool)} days")
 
     print(f"bundle complete: {out.resolve()}")
