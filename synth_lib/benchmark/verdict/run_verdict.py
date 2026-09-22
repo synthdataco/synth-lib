@@ -14,7 +14,9 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      evaluate.reward_metrics; the unweighted mean mirrors the subnet's 1/3-per-competition
      emission split, and the softmaxed reward_weight makes top positions worth more, which a
      rank percentile would flatten).
-  6. Write campaign_results/<campaign>/<leg>/verdict.json.
+  6. Write campaign_results/<campaign>/<leg>/verdict.json, and the per-competition
+     rank-evolution charts beside it in verdict-charts/ (one directory per verdict, so a
+     re-score under --tag cannot overwrite the charts of the verdict it is compared against).
 
 The synth_default baseline runs on the HOST (trusted repo code; note its known caveat below).
 
@@ -196,8 +198,8 @@ def generate_baseline(
             print(f"  baseline {asset} tl={comp.time_length}", flush=True)
 
 
-def score(name: str, predictions: Path, window_end: pd.Timestamp, window_days: int) -> dict:
-    result = evaluate_candidate(name, predictions, window_end, window_days)
+def score(name: str, predictions: Path, window_end: pd.Timestamp, window_days: int, charts: Path) -> dict:
+    result = evaluate_candidate(name, predictions, window_end, window_days, charts)
     mrt = result["mean_reward_vs_top"]
     result["score"] = round(100 * mrt, 1) if mrt is not None else None
     ranks = [c["rank"] for c in result["per_competition"].values() if c["rank"] is not None]
@@ -281,6 +283,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     print(f"legs: {legs}; work dir: {work}", flush=True)
 
     verdict_name = f"verdict-{args.tag}.json" if args.tag else "verdict.json"
+    charts_name = f"{Path(verdict_name).stem}-charts"
     for leg in legs:
         out = campaign_dir / leg / verdict_name
         if out.exists() and not args.force:
@@ -302,7 +305,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print(f"[{leg}] phase 2: generation (--network none)", flush=True)
         generate_all(clone, data_root, home, window, gpus=not args.no_gpu, limits=limits, lead_in=not args.no_lead_in)
         print(f"[{leg}] scoring", flush=True)
-        result = score(leg, clone / "predictions", window_end, window_days)
+        result = score(leg, clone / "predictions", window_end, window_days, campaign_dir / leg / charts_name)
         out.write_text(json.dumps(verdict_payload(result, champion.sha, window), indent=2) + "\n")
         print(f"[{leg}] score={result['score']} mean_rank={result['mean_competition_rank']} -> {out}", flush=True)
         if not args.keep_work:
@@ -316,7 +319,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         predictions = work / "baseline-predictions"
         print("[baseline] generating (host)", flush=True)
         generate_baseline(baseline_modeling, data_root, predictions, window, lead_in=not args.no_lead_in)
-        result = score("synth_default", predictions, window_end, window_days)
+        result = score("synth_default", predictions, window_end, window_days, baseline_out.parent / charts_name)
         baseline_out.parent.mkdir(parents=True, exist_ok=True)
         baseline_out.write_text(json.dumps(verdict_payload(result, None, window), indent=2) + "\n")
         print(

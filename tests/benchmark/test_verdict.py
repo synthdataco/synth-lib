@@ -202,7 +202,8 @@ class _FakeResult:
     def __init__(self, mean_crps: float = 1.0, num_prompts: int = 24):
         self.prompt_df = pd.DataFrame()
         self.smoothed_scores = pd.DataFrame()
-        self.summary = {"mean_crps": mean_crps, "num_prompts": num_prompts}
+        self.miner_name = "cand"
+        self.summary = {"mean_crps": mean_crps, "num_prompts": num_prompts, "miner_id": 999}
 
 
 def _fake_combined(miner_ranks: dict[int, float]):
@@ -252,7 +253,9 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     monkeypatch.setattr(ev, "backtest", fake_backtest)
     monkeypatch.setattr(ev, "compute_combined_smoothed_scores", fake_compute_combined)
 
-    result = ev.evaluate_candidate("cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1)
+    result = ev.evaluate_candidate(
+        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, charts_dir=tmp_path / "charts"
+    )
 
     assert len(backtest_calls) == 19  # 5 (crypto-24h) + 9 (com-equ-24h) + 5 (crypto-1h)
     assert ("BTC", 86400) in backtest_calls
@@ -318,9 +321,12 @@ def test_all_assets_failed_competition_yields_none(monkeypatch, tmp_path):
     monkeypatch.setattr(ev, "backtest", fake_backtest)
     monkeypatch.setattr(ev, "compute_combined_smoothed_scores", fake_compute_combined)
 
-    result = ev.evaluate_candidate("cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1)
+    result = ev.evaluate_candidate(
+        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, charts_dir=tmp_path / "charts"
+    )
 
     crypto_1h = result["per_competition"]["crypto-1h"]
+    assert crypto_1h["rank_chart"] is None  # no candidate in the field, so nothing to plot
     assert crypto_1h["rank"] is None
     assert crypto_1h["field_size"] is None
     assert crypto_1h["percentile"] is None
@@ -366,3 +372,39 @@ def test_generation_leads_in_by_one_horizon():
     # Opt-out reproduces an old verdict exactly: generation starts with the window.
     assert generation_start("2026-08-30", 86_400, False) == "2026-08-30T00:00:00Z"
     assert generation_start("2026-08-30", 3_600, False) == "2026-08-30T00:00:00Z"
+
+
+def test_each_competition_writes_a_rank_chart(monkeypatch, tmp_path):
+    """The verdict reports the first and last round; the chart is where the path between them is."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+
+    def fake_backtest(
+        *, miner_name, asset, time_length, time_increment, n_backtest_days, predictions_dir, eval_end, competition
+    ):
+        return _FakeResult()
+
+    rounds = pd.to_datetime(["2026-08-01T00:00:00Z", "2026-08-01T12:00:00Z", "2026-08-02T00:00:00Z"])
+
+    def fake_compute_combined(results, competition=None, cutoff_days=None):
+        if not results:
+            return pd.DataFrame(columns=["updated_at", "miner_uid", "reward_weight"])
+        return pd.DataFrame(
+            {
+                "updated_at": list(rounds) * 2,
+                "miner_uid": [999] * 3 + [1] * 3,
+                "reward_weight": [0.3, 0.5, 0.6, 0.7, 0.5, 0.4],
+            }
+        )
+
+    monkeypatch.setattr(ev, "backtest", fake_backtest)
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", fake_compute_combined)
+
+    charts = tmp_path / "verdict-charts"
+    result = ev.evaluate_candidate(
+        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, charts_dir=charts
+    )
+
+    for slug in ("crypto-24h", "com-equ-24h", "crypto-1h"):
+        name = result["per_competition"][slug]["rank_chart"]
+        assert name == f"rank_evolution_TOTAL_{slug}.png"
+        assert (charts / name).stat().st_size > 0

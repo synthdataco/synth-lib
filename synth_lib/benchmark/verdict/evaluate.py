@@ -21,6 +21,10 @@ therefore appear in the verdict report, and a candidate with failures is not str
 comparable to a candidate without failures — comparability is judged at the meta-report
 level, not here.
 
+Each competition also writes a rank-evolution chart into `charts_dir`, the candidate's rank
+per scoring round against the field it faced. The verdict reports the first and last round; the
+chart is the only place the path between them is visible.
+
 Validator realized sourcing (Binance/HL), scores API paginated 1 day, CRPS = the
 validator's official function — all handled by synth-lib.
 Window > 3 days: prepare the offline bundle FIRST (prepare_offline_bundle), otherwise the API rejects it.
@@ -37,6 +41,7 @@ import pandas as pd
 from synth.validator.competition_config import COM_EQU_24H, CRYPTO_1H, CRYPTO_24H  # type: ignore[import-untyped]
 from synth_lib.backtester.config import _OFFLINE_ENV_VAR, slug_for  # type: ignore[import-untyped]
 from synth_lib.backtester.orchestration import backtest  # type: ignore[import-untyped]
+from synth_lib.backtester.plots.rank import plot_total_rank_evolution  # type: ignore[import-untyped]
 from synth_lib.backtester.scoring import compute_combined_smoothed_scores  # type: ignore[import-untyped]
 from synth_lib.backtester.scripts.build_offline_bundle import build_bundle  # type: ignore[import-untyped]
 
@@ -96,7 +101,26 @@ def final_rank(smoothed_scores: pd.DataFrame, miner_id: int = MINER_ID) -> tuple
     return rank, int(len(last))
 
 
-def evaluate_candidate(name: str, predictions_dir: Path, window_end: pd.Timestamp, window_days: int) -> dict:
+def _rank_chart(results: list, combined: pd.DataFrame, slug: str, charts_dir: Path) -> str | None:
+    """Write the competition's rank-evolution chart and return its filename.
+
+    A chart is a report, not a result: a failure here must not lose a scoring run that has already
+    spent its sandbox time, so it is reported and the verdict is written without it.
+    """
+    try:
+        return plot_total_rank_evolution(results, combined, slug, charts_dir).name
+    except (RuntimeError, ValueError, KeyError) as exc:
+        print(f"  [{slug}] rank chart failed: {exc}")
+        return None
+
+
+def evaluate_candidate(
+    name: str,
+    predictions_dir: Path,
+    window_end: pd.Timestamp,
+    window_days: int,
+    charts_dir: Path,
+) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
     For each competition: backtest each asset via synth_lib.backtest() (one asset at a
@@ -107,6 +131,8 @@ def evaluate_candidate(name: str, predictions_dir: Path, window_end: pd.Timestam
     ASSET_COEFFICIENTS, normalizes per miner, then a single softmax — not an average of asset-
     percentiles. The candidate's (uid 999) rank/percentile in this combined field is computed by
     final_rank(). Percentile = 1 - (rank-1)/field_size.
+
+    One rank-evolution chart per competition lands in `charts_dir`, named for the competition.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []
@@ -152,17 +178,20 @@ def evaluate_candidate(name: str, predictions_dir: Path, window_end: pd.Timestam
             # rank_over_rounds averages the candidate's rank across every scoring round of the
             # window — the requested per-competition average rank, robust to a lucky last round.
             rank_over_rounds = asset_rank_stats(combined)
+            rank_chart = _rank_chart(results, combined, slug, charts_dir)
         else:
             rank = field_size = None
             percentile = None
             rewards = None
             rank_over_rounds = None
+            rank_chart = None
 
         per_competition[slug] = {
             "rank": rank,
             "field_size": field_size,
             "percentile": percentile,
             "rank_over_rounds": rank_over_rounds,
+            "rank_chart": rank_chart,
             "rewards": rewards,
             "assets_failed": assets_failed,
             "per_asset": per_asset,
