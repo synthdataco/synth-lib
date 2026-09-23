@@ -408,3 +408,45 @@ def test_each_competition_writes_a_rank_chart(monkeypatch, tmp_path):
         name = result["per_competition"][slug]["rank_chart"]
         assert name == f"rank_evolution_TOTAL_{slug}.png"
         assert (charts / name).stat().st_size > 0
+
+
+def test_generation_hands_the_seed_to_every_sandbox(tmp_path, monkeypatch):
+    """Constitution rule 7 promises the variable is set at evaluation. A sandbox inherits nothing
+    from the host, so it only holds if generation passes it explicitly."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    commands: list[list[str]] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: commands.append(cmd))
+
+    rv.generate_all(tmp_path, tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), gpus=False, limits=(2, 4), seed=7)
+
+    assert commands, "no sandbox was launched"
+    for cmd in commands:
+        assert "-e" in cmd and f"{rv.SEED_ENV}=7" in cmd
+
+
+def test_the_baseline_is_seeded_too(tmp_path, monkeypatch):
+    """The baseline runs on the host, where the variable must not leak in from the operator's shell."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    envs: list[dict | None] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: envs.append(env))
+
+    rv.generate_baseline(tmp_path / "m.py", tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), seed=7)
+
+    assert envs and all(e == {rv.SEED_ENV: "7"} for e in envs)
+
+
+def test_the_verdict_records_the_seed(tmp_path):
+    """Without it, "seeded" is unverifiable and a re-score cannot reproduce the Score."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    result = {
+        "score": 12.3,
+        "mean_competition_rank": 40,
+        "mean_reward_vs_top": 0.123,
+        "mean_competition_percentile": 0.8,
+        "per_competition": {},
+    }
+    payload = rv.verdict_payload(result, "abc1234", ("2026-08-30", "2026-09-09"), seed=7)
+    assert payload["seed"] == 7

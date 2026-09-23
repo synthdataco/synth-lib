@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -52,6 +53,11 @@ SANDBOX_CPUS = 12
 # roughly how the field itself is sampled by the scores API.
 CADENCE_MINUTES = {86_400: 60, 3_600: 10}
 
+# Constitution rule 7: a champion that uses randomness seeds every generator from this, and it
+# is set only here, at evaluation. Absent during a campaign, so an agent's own runs vary.
+SEED_ENV = "SYNTH_BENCHMARK_SEED"
+DEFAULT_SEED = 0
+
 
 def generation_start(window_start: str, time_length: int, lead_in: bool) -> str:
     """Where generation begins for a competition, given the scoring window's start.
@@ -73,8 +79,8 @@ def generation_start(window_start: str, time_length: int, lead_in: bool) -> str:
     return start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run(cmd: list[str], what: str) -> None:
-    result = subprocess.run(cmd, capture_output=True)
+def run(cmd: list[str], what: str, env: dict[str, str] | None = None) -> None:
+    result = subprocess.run(cmd, capture_output=True, env={**os.environ, **env} if env else None)
     if result.returncode != 0:
         tail = (result.stdout + result.stderr).decode(errors="replace")[-2000:]
         raise RuntimeError(f"{what} failed (rc={result.returncode}):\n{tail}")
@@ -99,6 +105,7 @@ def sandbox(
     gpus: bool,
     cpus: int = SANDBOX_CPUS,
     memory_gb: int = SANDBOX_MEMORY_GB,
+    env: dict[str, str] | None = None,
 ) -> list[str]:
     return sandbox_cmd(
         workspace=workspace,
@@ -108,7 +115,7 @@ def sandbox(
         memory_gb=memory_gb,
         cpus=cpus,
         network=network,
-        env={},
+        env=env or {},
         inner_cmd=inner,
         gpus=gpus,
     )
@@ -126,9 +133,12 @@ def generate_all(
     window: tuple[str, str],
     gpus: bool,
     limits: tuple[int, int],
+    seed: int,
     lead_in: bool = True,
 ) -> None:
-    """One --network none sandbox run per (competition, asset)."""
+    """One --network none sandbox run per (competition, asset).
+
+    The sandbox inherits nothing from the host, so the seed has to be handed to it explicitly."""
     if not GENERATE_SCRIPT.exists():  # packaging regression: it must ship with the package
         raise FileNotFoundError(f"generation core missing at {GENERATE_SCRIPT}")
     shutil.copy(GENERATE_SCRIPT, workspace / "generate_predictions.py")
@@ -155,6 +165,7 @@ def generate_all(
                         gpus=gpus,
                         cpus=limits[0],
                         memory_gb=limits[1],
+                        env={SEED_ENV: str(seed)},
                     ),
                     f"generate {asset} tl={comp.time_length}",
                 )
@@ -168,7 +179,7 @@ def generate_all(
 
 
 def generate_baseline(
-    modeling: Path, data_root: Path, out_dir: Path, window: tuple[str, str], lead_in: bool = True
+    modeling: Path, data_root: Path, out_dir: Path, window: tuple[str, str], seed: int, lead_in: bool = True
 ) -> None:
     """Host-side, trusted repo code. Known caveat: the subnet's default generator ignores
     context_prices and anchors on a price it fetches ITSELF — for past prompts that anchor may be
@@ -191,6 +202,7 @@ def generate_baseline(
                         *("--time-increment", str(comp.time_increment), "--time-length", str(comp.time_length)),
                     ],
                     f"baseline {asset} tl={comp.time_length}",
+                    env={SEED_ENV: str(seed)},
                 )
             except RuntimeError as exc:
                 print(f"  SKIP baseline {asset} tl={comp.time_length}: {str(exc).splitlines()[-1]}", flush=True)
@@ -210,7 +222,7 @@ def score(name: str, predictions: Path, window_end: pd.Timestamp, window_days: i
     return result
 
 
-def verdict_payload(result: dict, sha: str | None, window: tuple[str, str]) -> dict:
+def verdict_payload(result: dict, sha: str | None, window: tuple[str, str], seed: int) -> dict:
     return {
         "score": result["score"],
         "mean_competition_rank": result["mean_competition_rank"],
@@ -231,6 +243,9 @@ def verdict_payload(result: dict, sha: str | None, window: tuple[str, str]) -> d
         "sandbox_image": image_identity(SANDBOX_IMAGE),
         "cadence_minutes": CADENCE_MINUTES,
         "num_simulations": 1000,
+        # What a stochastic champion was seeded with. Without it "seeded" is unverifiable and
+        # a re-score of this window cannot reproduce the number above.
+        "seed": seed,
     }
 
 
@@ -261,6 +276,13 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         "--baseline-module",
         default=PACKAGED_BASELINE,
         help="dotted module path or file path exposing simulate() (default: the packaged control)",
+    )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=f"value of {SEED_ENV} for generation, recorded in the verdict. Constitution rule 7 "
+        "has a stochastic champion seed every generator from it, so a re-score reproduces",
     )
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--keep-work", action="store_true", help="keep clones + predictions for inspection")
@@ -303,10 +325,19 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             f"{leg} uv sync",
         )
         print(f"[{leg}] phase 2: generation (--network none)", flush=True)
-        generate_all(clone, data_root, home, window, gpus=not args.no_gpu, limits=limits, lead_in=not args.no_lead_in)
+        generate_all(
+            clone,
+            data_root,
+            home,
+            window,
+            gpus=not args.no_gpu,
+            limits=limits,
+            seed=args.seed,
+            lead_in=not args.no_lead_in,
+        )
         print(f"[{leg}] scoring", flush=True)
         result = score(leg, clone / "predictions", window_end, window_days, campaign_dir / leg / charts_name)
-        out.write_text(json.dumps(verdict_payload(result, champion.sha, window), indent=2) + "\n")
+        out.write_text(json.dumps(verdict_payload(result, champion.sha, window, args.seed), indent=2) + "\n")
         print(f"[{leg}] score={result['score']} mean_rank={result['mean_competition_rank']} -> {out}", flush=True)
         if not args.keep_work:
             shutil.rmtree(clone, ignore_errors=True)
@@ -318,10 +349,12 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         baseline_modeling = baseline_modeling_path(args.baseline_module)
         predictions = work / "baseline-predictions"
         print("[baseline] generating (host)", flush=True)
-        generate_baseline(baseline_modeling, data_root, predictions, window, lead_in=not args.no_lead_in)
+        generate_baseline(
+            baseline_modeling, data_root, predictions, window, seed=args.seed, lead_in=not args.no_lead_in
+        )
         result = score("synth_default", predictions, window_end, window_days, baseline_out.parent / charts_name)
         baseline_out.parent.mkdir(parents=True, exist_ok=True)
-        baseline_out.write_text(json.dumps(verdict_payload(result, None, window), indent=2) + "\n")
+        baseline_out.write_text(json.dumps(verdict_payload(result, None, window, args.seed), indent=2) + "\n")
         print(
             f"[baseline] score={result['score']} mean_rank={result['mean_competition_rank']} -> {baseline_out}",
             flush=True,
