@@ -199,6 +199,13 @@ simulated emissions relative to the field's best. Its consequences:
    column — your `simulate()` must tolerate them (drop, never interpolate). Evaluation passes
    the raw frame: handle gaps inside your model, not in a loader you hope evaluation shares.
    Runnable OFFLINE (weights/artifacts committed or included in the workspace).
+7. **If your model uses randomness at all, seed it from `SYNTH_BENCHMARK_SEED`.** Nothing
+   here asks you to introduce randomness — a deterministic champion ignores this rule. If you
+   do use it, read the variable once at the top of `simulate()` and seed every generator your
+   model touches from it: Python's `random`, NumPy, torch, and anything carrying its own. It
+   is absent during your own runs and set only at evaluation, so fall back to a seed of your
+   choosing when it is missing. What you may never do is hardcode a seed that ignores the
+   variable, or leave a generator unseeded so the clock or OS entropy supplies it.
 
 ## Required deliverables (in `agent/`)
 
