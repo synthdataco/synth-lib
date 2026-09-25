@@ -140,10 +140,16 @@ def backtest(
         window_start = pd.Timestamp(simulate_registration).to_pydatetime() - timedelta(days=competition.window_days)
     else:
         window_start = anchor - timedelta(days=n_backtest_days)
-    query_start = max(
-        pred_start - timedelta(minutes=PREDICTION_MATCH_TOLERANCE_MINUTES),
-        window_start,
-    )
+    if simulate_registration is not None:
+        # The field has to be fetched from before the candidate existed: its ABSENCE there is what
+        # makes the moving average treat it as a late joiner. Clamping to prediction coverage would
+        # shorten the lookback to one horizon, and the backfill with it.
+        query_start = window_start
+    else:
+        query_start = max(
+            pred_start - timedelta(minutes=PREDICTION_MATCH_TOLERANCE_MINUTES),
+            window_start,
+        )
     query_end = pred_end + timedelta(seconds=time_length) + timedelta(hours=1)
 
     # Step 2: fetch existing miner scores

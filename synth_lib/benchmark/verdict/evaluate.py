@@ -176,7 +176,12 @@ def evaluate_candidate(
                 assets_failed.append(asset)
                 per_asset[asset] = {"error": repr(exc)}
 
-        combined = compute_combined_smoothed_scores(results, competition=comp)
+        # Also here, not only per asset: without it _trim_warmup drops the first
+        # competition.window_days of rounds — exactly the backfilled onboarding period the
+        # flag exists to show — and the headline rank, rewards and charts all read this frame.
+        combined = compute_combined_smoothed_scores(
+            results, competition=comp, simulate_registration=simulate_registration
+        )
         has_candidate = not combined.empty and bool((combined["miner_uid"] == MINER_ID).any())
         if results and has_candidate:
             rank, field_size = final_rank(combined)

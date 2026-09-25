@@ -206,12 +206,19 @@ class _FakeResult:
         self.summary = {"mean_crps": mean_crps, "num_prompts": num_prompts, "miner_id": 999}
 
 
-def _fake_combined(miner_ranks: dict[int, float]):
-    """Builds a compute_combined_smoothed_scores stub returning a fixed reward_weight ranking."""
+def _fake_combined(miner_ranks: dict[int, float], seen: list | None = None):
+    """Builds a compute_combined_smoothed_scores stub returning a fixed reward_weight ranking.
+
+    `seen` collects the simulate_registration it was called with. Forwarding that to the per-asset
+    backtest is not enough: this is the frame the headline rank and the rewards are read from, and
+    without it _trim_warmup drops exactly the backfilled period.
+    """
     t1 = pd.Timestamp("2026-08-01T00:00:00Z")
 
-    def fake(results, competition=None, cutoff_days=None):
+    def fake(results, competition=None, cutoff_days=None, simulate_registration=None):
         assert cutoff_days is None  # must let it default to competition.window_days
+        if seen is not None:
+            seen.append(simulate_registration)
         if not results:
             return pd.DataFrame(columns=["updated_at", "miner_uid", "reward_weight"])
         return pd.DataFrame(
@@ -255,7 +262,7 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     combined_calls: list[tuple[object, int]] = []
     fake_combined = _fake_combined({1: 0.5, 999: 0.3, 2: 0.2})  # miner 999 -> rank 2 of 3
 
-    def fake_compute_combined(results, competition=None, cutoff_days=None):
+    def fake_compute_combined(results, competition=None, cutoff_days=None, simulate_registration=None):
         combined_calls.append((competition, len(results)))
         return fake_combined(results, competition=competition, cutoff_days=cutoff_days)
 
@@ -333,7 +340,7 @@ def test_all_assets_failed_competition_yields_none(monkeypatch, tmp_path):
 
     fake_combined = _fake_combined({999: 0.6, 1: 0.4})  # miner 999 -> rank 1 of 2
 
-    def fake_compute_combined(results, competition=None, cutoff_days=None):
+    def fake_compute_combined(results, competition=None, cutoff_days=None, simulate_registration=None):
         return fake_combined(results, competition=competition, cutoff_days=cutoff_days)
 
     monkeypatch.setattr(ev, "backtest", fake_backtest)
@@ -412,7 +419,7 @@ def test_each_competition_writes_a_rank_chart(monkeypatch, tmp_path):
 
     rounds = pd.to_datetime(["2026-08-01T00:00:00Z", "2026-08-01T12:00:00Z", "2026-08-02T00:00:00Z"])
 
-    def fake_compute_combined(results, competition=None, cutoff_days=None):
+    def fake_compute_combined(results, competition=None, cutoff_days=None, simulate_registration=None):
         if not results:
             return pd.DataFrame(columns=["updated_at", "miner_uid", "reward_weight"])
         return pd.DataFrame(
@@ -563,3 +570,27 @@ def test_the_bundle_widens_only_when_registration_is_simulated(monkeypatch, tmp_
         simulate_registration=pd.Timestamp("2026-08-30T00:00:00Z").to_pydatetime(),
     )
     assert set(days) == {20}  # window_days + the longest competition moving average
+
+
+def test_the_onboarding_ramp_survives_the_combined_aggregation(monkeypatch, tmp_path):
+    """Forwarding to the per-asset backtest is not enough: the competition frame is where the
+    headline rank and rewards come from, and _trim_warmup deletes the backfilled period there."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+
+    seen: list = []
+    monkeypatch.setattr(ev, "backtest", lambda **kw: _FakeResult())
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", _fake_combined({1: 0.5, 999: 0.3}, seen))
+    reg = pd.Timestamp("2026-08-30T00:00:00Z").to_pydatetime()
+
+    ev.evaluate_candidate(
+        "cand", tmp_path, window_end=pd.Timestamp("2026-09-09T00:00:00Z"), window_days=10,
+        charts_dir=tmp_path / "charts", simulate_registration=reg,
+    )
+    assert seen and all(s == reg for s in seen), "the combined aggregation must know too"
+
+    seen.clear()
+    ev.evaluate_candidate(
+        "cand", tmp_path, window_end=pd.Timestamp("2026-09-09T00:00:00Z"), window_days=10,
+        charts_dir=tmp_path / "charts",
+    )
+    assert seen and all(s is None for s in seen)
