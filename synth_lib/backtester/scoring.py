@@ -15,7 +15,10 @@ from synth.validator.competition_config import (
     SMOOTHED_SCORE_COEFFICIENT,
     CompetitionConfig,
 )
-from synth.validator.crps_calculation import calculate_crps_for_miner
+from synth.validator.crps_calculation import (
+    calculate_crps_for_miner,
+    calculate_total_score_for_miner,
+)
 from synth.validator.moving_average import (
     compute_smoothed_score,
     prepare_df_for_moving_average,
@@ -26,13 +29,15 @@ from synth_lib.backtester.config import (
     _COMBINED_EMPTY_COLS,
     _LEGACY_FALLBACK_WINDOW_DAYS,
     UTC,
+    OUTLIER_CAP_DATE,
+    VOL_CRPS_1H_DATE,
     competition_for,
     slug_for,
 )
 from synth_lib.backtester.loading import load_prediction
 from synth_lib.backtester.miner_data_handler import _BACKTEST_MDH
+from synth_lib.backtester.prompt_scores_legacy import compute_prompt_scores_pre_cap
 from synth_lib.backtester.result import BacktestResult
-
 
 
 def _compute_prompt_scores_for_group(crps: pd.Series) -> pd.Series:
@@ -43,18 +48,24 @@ def _compute_prompt_scores_for_group(crps: pd.Series) -> pd.Series:
     return pd.Series(result[0], index=crps.index)
 
 
-def _compute_prompt_score_stats_for_group(crps: pd.Series) -> pd.DataFrame:
-    """Like _compute_prompt_scores_for_group but also returns percentile90 and
+def _compute_prompt_score_stats_for_group(crps: pd.Series, capped_era: bool = True) -> pd.DataFrame:
+    """Like _compute_prompt_scores_for_group but also returns percentile95 and
     lowest_score so synth.prepare_df_for_moving_average can apply its worst-score
-    backfill rule to new miners.
+    backfill rule to new miners. The name must match what that function reads.
+
+    `capped_era` selects the validator's scoring as of the group's scored_time: the outlier clip
+    has only existed since OUTLIER_CAP_DATE.
     """
-    capped, p90, low = compute_prompt_scores(crps.values)
+    # The validator also returns a per-row was_capped flag, which it persists so the outlier
+    # clip rate stays monitorable. Nothing downstream here reads it.
+    scorer = compute_prompt_scores if capped_era else compute_prompt_scores_pre_cap
+    capped, p95, low, _was_capped = scorer(crps.values)
     n = len(crps)
     if capped is None:
         return pd.DataFrame(
             {
                 "new_prompt_scores": [0.0] * n,
-                "percentile90": [0.0] * n,
+                "percentile95": [0.0] * n,
                 "lowest_score": [0.0] * n,
             },
             index=crps.index,
@@ -62,11 +73,12 @@ def _compute_prompt_score_stats_for_group(crps: pd.Series) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "new_prompt_scores": capped,
-            "percentile90": [float(p90)] * n,
+            "percentile95": [float(p95)] * n,
             "lowest_score": [float(low)] * n,
         },
         index=crps.index,
     )
+
 
 def calculate_smoothed_scores(
     all_scores: pd.DataFrame,
@@ -87,9 +99,7 @@ def calculate_smoothed_scores(
     # Use miner_uid as miner_id for synth; drop any existing miner_id to avoid duplication
     if "miner_id" in input_df.columns:
         input_df = input_df.drop(columns=["miner_id"])
-    input_df = input_df.rename(
-        columns={"miner_uid": "miner_id", scores_column: "prompt_score_v3"}
-    )
+    input_df = input_df.rename(columns={"miner_uid": "miner_id", scores_column: "prompt_score_v3"})
     input_df["scored_time"] = pd.to_datetime(input_df["scored_time"])
 
     # Prepare the df (backfill new miners, etc.)
@@ -98,13 +108,8 @@ def calculate_smoothed_scores(
     result_rows = []
     for updated_at in rewards_history["updated_at"].sort_values().unique():
         cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[
-            (prepared["scored_time"] >= cutoff)
-            & (prepared["scored_time"] <= updated_at)
-        ]
-        rewards = compute_smoothed_score(
-            _BACKTEST_MDH, window_df, updated_at, competition
-        )
+        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
+        rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, competition)
         if rewards is None:
             continue
 
@@ -147,7 +152,7 @@ def compute_combined_smoothed_scores(
     if cutoff_days is None:
         cutoff_days = competition.window_days
 
-    # Concat per-asset prompt_df frames. percentile90 and lowest_score must be
+    # Concat per-asset prompt_df frames. percentile95 and lowest_score must be
     # carried through so synth's prepare_df_for_moving_average can backfill new
     # miners (it silently skips backfill when those columns are absent).
     cols = [
@@ -155,7 +160,7 @@ def compute_combined_smoothed_scores(
         "miner_uid",
         "asset",
         "new_prompt_scores",
-        "percentile90",
+        "percentile95",
         "lowest_score",
     ]
     frames = []
@@ -171,9 +176,7 @@ def compute_combined_smoothed_scores(
     # Adapt column names to what synth expects: miner_id, prompt_score_v3
     if "miner_id" in combined_crps.columns:
         combined_crps = combined_crps.drop(columns=["miner_id"])
-    combined_crps = combined_crps.rename(
-        columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"}
-    )
+    combined_crps = combined_crps.rename(columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"})
     combined_crps["scored_time"] = pd.to_datetime(combined_crps["scored_time"])
 
     prepared = prepare_df_for_moving_average(combined_crps)
@@ -189,13 +192,8 @@ def compute_combined_smoothed_scores(
     result_rows = []
     for updated_at in sorted(timestamps):
         cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[
-            (prepared["scored_time"] >= cutoff)
-            & (prepared["scored_time"] <= updated_at)
-        ]
-        rewards = compute_smoothed_score(
-            _BACKTEST_MDH, window_df, updated_at, competition
-        )
+        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
+        rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, competition)
         if rewards is None:
             continue
         for row in rewards:
@@ -219,6 +217,7 @@ def compute_combined_smoothed_scores(
         warmup_days=cutoff_days,
     )
 
+
 def _score_single_prompt(
     file_path: Path | None,
     start_time: Any,
@@ -228,6 +227,7 @@ def _score_single_prompt(
     time_incr: int,
     real_prices: list[float],
     scoring_intervals: dict[str, int],
+    vol_scoring_blocks: dict[str, tuple[int, float]],
     miner_id: int,
 ) -> dict:
     """Score a single prompt's prediction against real prices. Runs in a worker process.
@@ -248,10 +248,28 @@ def _score_single_prompt(
 
     llm_predictions_raw = load_prediction(file_path)
     simulation_runs = np.asarray(llm_predictions_raw["paths"], dtype=float)
+    # A non-finite path scores as a miss, the same as no prediction at all: compute_prompt_scores
+    # fills -1 with the prompt's 95th percentile. Scoring it would give a NaN CRPS, and the
+    # percentile is taken over every miner on that prompt, so one NaN drops the prompt from the
+    # whole field instead of costing the champion anything.
+    if not np.isfinite(simulation_runs).all():
+        return {
+            "miner_uid": miner_id,
+            "scored_time": scored_time,
+            "crps": -1,
+            "asset": asset_val,
+            "start_time": start_time,
+            "time_increment": time_incr,
+            "time_length": time_len,
+            "miner_id": miner_id,
+        }
     real_price_array = np.asarray(real_prices, dtype=float)
-    total_crps, _ = calculate_crps_for_miner(
-        simulation_runs, real_price_array, time_incr, scoring_intervals
-    )
+    if vol_scoring_blocks and pd.Timestamp(scored_time) >= VOL_CRPS_1H_DATE:
+        total_crps, _ = calculate_total_score_for_miner(
+            simulation_runs, real_price_array, time_incr, scoring_intervals, vol_scoring_blocks
+        )
+    else:
+        total_crps, _ = calculate_crps_for_miner(simulation_runs, real_price_array, time_incr, scoring_intervals)
 
     return {
         "miner_uid": miner_id,
@@ -280,11 +298,7 @@ def _trim_warmup(
     """
     if smoothed_scores.empty or scored.empty:
         return smoothed_scores
-    anchor = (
-        pd.Timestamp(warmup_anchor)
-        if warmup_anchor is not None
-        else pd.Timestamp(scored["scored_time"].min())
-    )
+    anchor = pd.Timestamp(warmup_anchor) if warmup_anchor is not None else pd.Timestamp(scored["scored_time"].min())
     warmup_end = anchor + pd.Timedelta(days=warmup_days)
     trimmed = smoothed_scores.loc[smoothed_scores["updated_at"] >= warmup_end]
     if trimmed.empty:

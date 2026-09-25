@@ -3,9 +3,11 @@ operator's own repository — the agent starts from public sources and its own i
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
+from importlib.metadata import Distribution, PackageNotFoundError
 from pathlib import Path
 
 from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
@@ -17,6 +19,40 @@ SCAFFOLD_DIR = Path(__file__).parent / "scaffold" / "workspace"
 # dependencies does not silently stop pre-seeding torch.
 _DEPENDENCIES_RE = re.compile(r"(dependencies\s*=\s*\[)([^\]]*)(\])")
 GPU_DEPENDENCY = '"torch>=2.0"'
+
+# The scaffold cannot name a commit it is itself part of, so it carries a placeholder and the
+# host substitutes its own resolved rev at workspace creation.
+HOST_REV_PLACEHOLDER = "__HOST_REV__"
+
+
+def _host_synth_lib_rev() -> str:
+    """The commit this synth-lib was installed from, per PEP 610 direct_url.json.
+
+    An agent tuning against a different backtester than the verdict runs is measuring something
+    else, so the workspace is pinned to the host's own engine rather than to a written-down sha.
+    A local or editable install has no commit to name, and a rev the sandbox cannot fetch fails
+    inside a paid campaign instead of here.
+    """
+    try:
+        raw = Distribution.from_name("synth-lib").read_text("direct_url.json")
+    except PackageNotFoundError as exc:
+        raise RuntimeError("synth-lib is not installed: cannot pin the agent workspace") from exc
+    commit = (json.loads(raw).get("vcs_info") or {}).get("commit_id") if raw else None
+    if not commit:
+        raise RuntimeError(
+            "synth-lib was not installed from git, so the agent workspace cannot be pinned to the "
+            "engine this host runs. Install it from a rev the sandbox can fetch before launching "
+            "a campaign."
+        )
+    return str(commit)
+
+
+def _pin_scaffold_to_host(pyproject: Path) -> None:
+    """Replace the scaffold placeholder with the host's rev."""
+    text = pyproject.read_text()
+    if HOST_REV_PLACEHOLDER not in text:
+        raise RuntimeError(f"no {HOST_REV_PLACEHOLDER} in {pyproject} — scaffold changed shape")
+    pyproject.write_text(text.replace(HOST_REV_PLACEHOLDER, _host_synth_lib_rev()))
 
 
 def _add_gpu_dependency(pyproject: Path) -> None:
@@ -37,8 +73,8 @@ def _add_gpu_dependency(pyproject: Path) -> None:
 
 MAX_BLOB_BYTES = 50 * 1024 * 1024
 
-# A guard rail, not a jail: `--no-verify` and CAMPAIGN_MAX_BLOB_BYTES both bypass it, deliberately
-# — committed weights are how a champion runs offline. What it buys is that committing gigabytes
+# A guard rail with a deliberate way past it: raise CAMPAIGN_MAX_BLOB_BYTES — committed weights
+# are how a champion runs offline. What it buys is that committing gigabytes
 # becomes a visible, auditable act in the transcript instead of an accident. The bundle deliverable
 # (`git bundle --all`) packs every committed blob, and a blob stays reachable from its commit even
 # after a later commit deletes the file, so there is no undo.
@@ -58,14 +94,12 @@ if [ -n "$oversized" ]; then
     echo "" >&2
     echo "Datasets, virtualenvs and generated predictions must stay UNTRACKED (see .gitignore):" >&2
     echo "only committed objects reach the workspace bundle, so untracked files cost nothing." >&2
-    echo "If this file IS part of your champion (e.g. model weights it needs to run offline):" >&2
-    echo "  git commit --no-verify" >&2
+    echo "If this file IS part of your champion (e.g. model weights it needs to run offline)," >&2
+    echo "raise the limit: CAMPAIGN_MAX_BLOB_BYTES=<bytes> git commit ..." >&2
     exit 1
 fi
 exit 0
-""".replace(
-    "__LIMIT__", str(MAX_BLOB_BYTES)
-)
+""".replace("__LIMIT__", str(MAX_BLOB_BYTES))
 
 
 def _install_pre_commit_hook(ws: Path) -> None:
@@ -102,6 +136,7 @@ def create_workspace(cfg: CampaignConfig, model: ModelSpec, data_md: str | None 
     tmpl = ws / "gitignore.tmpl"
     if tmpl.exists():
         tmpl.rename(ws / ".gitignore")
+    _pin_scaffold_to_host(ws / "pyproject.toml")
     if cfg.gpu:
         _add_gpu_dependency(ws / "pyproject.toml")
     (ws / "agent" / "journal.md").write_text("")

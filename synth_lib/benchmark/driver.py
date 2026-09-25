@@ -20,7 +20,11 @@ from synth_lib.benchmark.nomination import probe_simulate_subprocess
 INITIAL_PROMPT = "Read the CAMPAIGN.md file in your agent folder and start your research campaign."
 RESUME_PROMPT = (
     "You are resuming after an interruption. Re-read CAMPAIGN.md, BUDGET.md, and your journal.md, "
-    "then continue where you left off."
+    "then continue the work. Nobody reads your questions: a turn that ends by asking what to do next is a wasted turn. "
+    "If your deliverables are complete and envelope remains, keep iterating or amend your nomination. "
+    "Believe in yourself and continue your research campaign. "
+    "I know you can do it. You can improve your model and achieve better results. "
+    "Carry on with determination. Explore new ideas."
 )
 LANDING_PROMPT = (
     "IMMEDIATE LANDING ORDER: run NO new experiments. Finalize agent/journal.md, "

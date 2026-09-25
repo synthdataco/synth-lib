@@ -16,8 +16,6 @@ from synth.validator.competition_config import (
     CompetitionConfig,
 )
 
-
-
 # Miner-dashboard read API (shared host with the monitoring API, /v1 prefix).
 MINER_DASHBOARD_API_BASE = "https://monitoring.synthdata.co/v1"
 # Default 24h scoring intervals (crypto-24h / com-equ-24h); only used when no
@@ -48,6 +46,18 @@ UTC = timezone.utc
 # comparable to ranks computed under the current formula. See README "Known
 # caveats".
 HF_CRPS_FORMULA_CHANGE_DATE = datetime(2026, 3, 11, tzinfo=UTC)
+
+# When the mainnet validator started adding the volatility term to crypto-1h. A prompt is scored
+# one horizon after it starts, so the formula that applied to it is the one deployed at its
+# `scored_time`, not at its `start_time`: a window containing this instant holds prompts of both
+# kinds, and scoring them all one way puts the candidate and the archived field on different rules.
+VOL_CRPS_1H_DATE = datetime(2026, 9, 22, 13, 16, 32, tzinfo=UTC)
+
+# When the mainnet validator started clipping raw CRPS above 10x the field median and taking
+# the p95 that fills missed responses over the unclipped scores. Same rule as above: the
+# formula that applied to a prompt is the one deployed at its `scored_time`. This one reaches
+# every competition, not just crypto-1h, because it sits in compute_prompt_scores.
+OUTLIER_CAP_DATE = datetime(2026, 9, 4, 9, 45, tzinfo=UTC)  # 11:45 GMT+2
 
 # On-chain emission normalization for the USD earnings estimate. A miner's
 # realized emission is not exactly proportional to the reward_weight the
@@ -115,9 +125,7 @@ if _UNMAPPED_LABELS:
         f"COMPETITION_SLUGS has no slug for competition label(s) {_UNMAPPED_LABELS}; "
         "update it to match synth.validator.competition_config.ALL_COMPETITIONS."
     )
-SLUG_TO_COMPETITION: dict[str, CompetitionConfig] = {
-    COMPETITION_SLUGS[c.label]: c for c in ALL_COMPETITIONS
-}
+SLUG_TO_COMPETITION: dict[str, CompetitionConfig] = {COMPETITION_SLUGS[c.label]: c for c in ALL_COMPETITIONS}
 
 
 def slug_for(comp: CompetitionConfig) -> str:
@@ -126,8 +134,7 @@ def slug_for(comp: CompetitionConfig) -> str:
         return COMPETITION_SLUGS[comp.label]
     except KeyError:
         raise ValueError(
-            f"No slug mapped for competition label {comp.label!r}; "
-            "add it to COMPETITION_SLUGS."
+            f"No slug mapped for competition label {comp.label!r}; " "add it to COMPETITION_SLUGS."
         ) from None
 
 
@@ -152,9 +159,7 @@ def _offline_root() -> Path | None:
     return Path(val) if val else None
 
 
-def _filter_time_range(
-    df: pd.DataFrame, col: str, start: datetime, end: datetime
-) -> pd.DataFrame:
+def _filter_time_range(df: pd.DataFrame, col: str, start: datetime, end: datetime) -> pd.DataFrame:
     if df.empty:
         return df
     s = pd.to_datetime(df[col], utc=True)

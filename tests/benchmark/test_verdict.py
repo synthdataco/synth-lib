@@ -227,7 +227,7 @@ def _fake_combined(miner_ranks: dict[int, float]):
 
 def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     # CRYPTO_1H shares BTC/ETH/SOL/XRP/HYPE with CRYPTO_24H at a different time_length — both
-    # time_lengths must actually be requested. SPYX (com-equ-24h) is made to fail to exercise
+    # time_lengths must actually be requested. XAU (com-equ-24h) is made to fail to exercise
     # fault isolation: it must be excluded from the results list handed to
     # compute_combined_smoothed_scores for that competition, but still surfaced in
     # assets_failed/per_asset.
@@ -239,8 +239,8 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
         *, miner_name, asset, time_length, time_increment, n_backtest_days, predictions_dir, eval_end, competition
     ):
         backtest_calls.append((asset, time_length))
-        if asset == "SPYX":
-            raise RuntimeError("missing data for SPYX")
+        if asset == "XAU":
+            raise RuntimeError("missing data for XAU")
         return _FakeResult()
 
     combined_calls: list[tuple[object, int]] = []
@@ -257,14 +257,14 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
         "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, charts_dir=tmp_path / "charts"
     )
 
-    assert len(backtest_calls) == 19  # 5 (crypto-24h) + 9 (com-equ-24h) + 5 (crypto-1h)
+    assert len(backtest_calls) == 18  # 5 (crypto-24h) + 8 (com-equ-24h) + 5 (crypto-1h)
     assert ("BTC", 86400) in backtest_calls
     assert ("BTC", 3600) in backtest_calls
 
     assert len(combined_calls) == 3  # one call per competition
     comps_by_label = {comp.label: n for comp, n in combined_calls}
     assert set(comps_by_label) == {c.label for c in ev.COMPETITIONS}
-    assert comps_by_label["Commodities/Equities 24h"] == 8  # 9 assets minus failed SPYX
+    assert comps_by_label["Commodities/Equities 24h"] == 7  # 8 assets minus failed XAU
     assert comps_by_label["Crypto 24h"] == 5
     assert comps_by_label["Crypto 1h"] == 5
 
@@ -272,11 +272,11 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     assert set(per_comp) == {"crypto-24h", "com-equ-24h", "crypto-1h"}
 
     com_equ = per_comp["com-equ-24h"]
-    assert com_equ["assets_failed"] == ["SPYX"]
-    assert "error" in com_equ["per_asset"]["SPYX"]
+    assert com_equ["assets_failed"] == ["XAU"]
+    assert "error" in com_equ["per_asset"]["XAU"]
     # realized_coverage travels with mean_crps by contract: a CRPS is comparable to another only
     # at the same coverage, so the verdict must never publish one without the other.
-    assert com_equ["per_asset"]["XAU"] == {
+    assert com_equ["per_asset"]["NVDAX"] == {
         "mean_crps": 1.0,
         "num_prompts": 24,
         "realized_coverage": None,

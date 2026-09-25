@@ -42,7 +42,10 @@ from synth_lib.backtester.preparation import (
     _slice_real_prices,
 )
 from synth_lib.backtester.result import BacktestResult, NoScoresAvailable
+from synth_lib.backtester.config import VOL_CRPS_1H_DATE
+from synth.validator.crps_calculation import calculate_crps_for_miner, calculate_total_score_for_miner
 from synth_lib.backtester.scoring import (
+    _compute_prompt_score_stats_for_group,
     _compute_prompt_scores_for_group,
     _score_single_prompt,
     calculate_smoothed_scores,
@@ -343,8 +346,14 @@ class TestBacktestIntegration:
 
         # prompt_df contract
         expected_cols = {
-            "miner_uid", "crps", "scored_time", "asset",
-            "time_length", "time_increment", "start_time", "new_prompt_scores",
+            "miner_uid",
+            "crps",
+            "scored_time",
+            "asset",
+            "time_length",
+            "time_increment",
+            "start_time",
+            "new_prompt_scores",
         }
         assert expected_cols.issubset(set(result.prompt_df.columns))
         assert result.prompt_df["miner_uid"].isna().sum() == 0
@@ -445,8 +454,12 @@ class TestRewardSlug:
             fname = t.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_XAU_{TIME_LENGTH}.json"
             (tmp_path / fname).write_text(json.dumps({**_make_prediction(t), "asset": "XAU"}))
         backtest(
-            miner_name="t", asset="XAU", time_length=TIME_LENGTH,
-            n_backtest_days=5, miner_id=MINER_ID, predictions_dir=tmp_path,
+            miner_name="t",
+            asset="XAU",
+            time_length=TIME_LENGTH,
+            n_backtest_days=5,
+            miner_id=MINER_ID,
+            predictions_dir=tmp_path,
         )
         assert mock_rewards.call_args.kwargs["prompt_name"] == "com-equ-24h"
 
@@ -464,22 +477,26 @@ def _make_spread_result() -> BacktestResult:
     scored_times = [t + timedelta(seconds=TIME_LENGTH) for t in times]
     for st in scored_times:
         for uid in range(1, 6):
-            rows.append({
-                "miner_uid": uid,
+            rows.append(
+                {
+                    "miner_uid": uid,
+                    "asset": ASSET,
+                    "crps": 400.0 + uid * 40,
+                    "scored_time": st,
+                    "time_length": TIME_LENGTH,
+                    "time_increment": TIME_INCREMENT,
+                }
+            )
+        rows.append(
+            {
+                "miner_uid": MINER_ID,
                 "asset": ASSET,
-                "crps": 400.0 + uid * 40,
+                "crps": 500.0,
                 "scored_time": st,
                 "time_length": TIME_LENGTH,
                 "time_increment": TIME_INCREMENT,
-            })
-        rows.append({
-            "miner_uid": MINER_ID,
-            "asset": ASSET,
-            "crps": 500.0,
-            "scored_time": st,
-            "time_length": TIME_LENGTH,
-            "time_increment": TIME_INCREMENT,
-        })
+            }
+        )
     return BacktestResult(
         miner_name="test_miner",
         prompt_df=pd.DataFrame(rows),
@@ -623,6 +640,7 @@ class TestScoreSinglePrompt:
             time_incr=TIME_INCREMENT,
             real_prices=real_prices,
             scoring_intervals={"5min": 300, "30min": 1800, "3hour": 10800, "24hour_abs": 86400},
+            vol_scoring_blocks={},
             miner_id=MINER_ID,
         )
 
@@ -643,10 +661,36 @@ class TestScoreSinglePrompt:
             time_incr=TIME_INCREMENT,
             real_prices=[],
             scoring_intervals={},
+            vol_scoring_blocks={},
             miner_id=MINER_ID,
         )
 
         assert result["crps"] == -1
+
+    def test_volatility_blocks_add_to_the_score(self, predictions_dir: Path) -> None:
+        """Scoring goes through the validator's total score, so configured volatility
+        blocks raise the CRPS above the price-only score (guards against scoring with
+        synth's price-half `calculate_crps_for_miner` again)."""
+        fname = T0.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{ASSET}_{TIME_LENGTH}.json"
+        # The fixture's simulated paths are flat, so a moving real path gives every
+        # block a realized volatility the ensemble misses.
+        common = dict(
+            file_path=predictions_dir / fname,
+            start_time=T0,
+            asset_val=ASSET,
+            scored_time=VOL_CRPS_1H_DATE,
+            time_len=TIME_LENGTH,
+            time_incr=TIME_INCREMENT,
+            real_prices=[100_000.0 + 50.0 * (i % 7) for i in range(NUM_STEPS + 1)],
+            scoring_intervals={"5min": 300},
+            miner_id=MINER_ID,
+        )
+
+        price_only = _score_single_prompt(vol_scoring_blocks={}, **common)
+        with_vol = _score_single_prompt(vol_scoring_blocks={"vol_20min": (TIME_INCREMENT * 4, 1.0)}, **common)
+
+        assert price_only["crps"] > 0
+        assert with_vol["crps"] > price_only["crps"]
 
 
 # ---------------------------------------------------------------------------
@@ -869,17 +913,18 @@ class TestComputeCombinedSmoothedScores:
             },
         )
 
-    def test_spyx_dominance_over_xau(self) -> None:
+    def test_sp500_dominance_over_xau(self) -> None:
         from synth_lib.backtester.scoring import compute_combined_smoothed_scores
+
         updated = pd.Timestamp("2026-07-01 12:00:00", tz="UTC")
         st = datetime(2026, 7, 1, 10, 0, 0, tzinfo=UTC)
         r_xau = self._make_result("XAU", {1: 100.0, 2: 500.0}, st, updated)
-        r_spyx = self._make_result("SPYX", {1: 500.0, 2: 100.0}, st, updated)
-        combined = compute_combined_smoothed_scores([r_xau, r_spyx], COM_EQU_24H)
+        r_sp500 = self._make_result("SP500", {1: 500.0, 2: 100.0}, st, updated)
+        combined = compute_combined_smoothed_scores([r_xau, r_sp500], COM_EQU_24H)
         rows = combined.loc[combined["updated_at"] == updated]
         assert len(rows) == 2
         rw = rows.set_index("miner_uid")["reward_weight"]
-        assert rw.loc[2] > rw.loc[1]  # miner 2 good on higher-coef SPYX (3.44) wins
+        assert rw.loc[2] > rw.loc[1]  # miner 2 good on higher-coef SP500 (3.44) wins
 
     def test_output_columns_and_sums(self) -> None:
         """reward_weight across miners at a single timestamp sums to
@@ -970,38 +1015,87 @@ class TestComputeEarningsDf:
 
     def test_formula(self) -> None:
         from synth_lib.backtester.earnings import _compute_earnings_df
-        combined = pd.DataFrame([
-            {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
-            {"updated_at": pd.Timestamp("2026-06-25 16:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.2},
-            {"updated_at": pd.Timestamp("2026-06-26 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.05},
-        ])
-        daily_pool = pd.Series({pd.Timestamp("2026-06-25", tz="UTC"): 5000.0, pd.Timestamp("2026-06-26", tz="UTC"): 4000.0})
+
+        combined = pd.DataFrame(
+            [
+                {
+                    "updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"),
+                    "miner_uid": 999,
+                    "new_smoothed_score": 1.0,
+                    "reward_weight": 0.1,
+                },
+                {
+                    "updated_at": pd.Timestamp("2026-06-25 16:00", tz="UTC"),
+                    "miner_uid": 999,
+                    "new_smoothed_score": 1.0,
+                    "reward_weight": 0.2,
+                },
+                {
+                    "updated_at": pd.Timestamp("2026-06-26 08:00", tz="UTC"),
+                    "miner_uid": 999,
+                    "new_smoothed_score": 1.0,
+                    "reward_weight": 0.05,
+                },
+            ]
+        )
+        daily_pool = pd.Series(
+            {pd.Timestamp("2026-06-25", tz="UTC"): 5000.0, pd.Timestamp("2026-06-26", tz="UTC"): 4000.0}
+        )
         earnings = _compute_earnings_df(combined, miner_id=999, daily_pool_usd=daily_pool, emission_factor=1.0)
         assert earnings["usd_per_round"].tolist() == pytest.approx([250.0, 500.0, 200.0])
         assert earnings["usd_cumulative"].tolist() == pytest.approx([250.0, 750.0, 950.0])
 
     def test_emission_factor_scales_usd(self) -> None:
         from synth_lib.backtester.earnings import _compute_earnings_df
-        combined = pd.DataFrame([
-            {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
-        ])
+
+        combined = pd.DataFrame(
+            [
+                {
+                    "updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"),
+                    "miner_uid": 999,
+                    "new_smoothed_score": 1.0,
+                    "reward_weight": 0.1,
+                },
+            ]
+        )
         daily_pool = pd.Series({pd.Timestamp("2026-06-25", tz="UTC"): 5000.0})
         earnings = _compute_earnings_df(combined, miner_id=999, daily_pool_usd=daily_pool, emission_factor=0.5)
         assert earnings["usd_per_round"].tolist() == pytest.approx([250.0])
 
     def test_drops_rounds_on_missing_pool_days(self, capsys: pytest.CaptureFixture[str]) -> None:
         from synth_lib.backtester.earnings import _compute_earnings_df
-        combined = pd.DataFrame([
-            {"updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.1},
-            {"updated_at": pd.Timestamp("2026-06-26 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.2},
-            {"updated_at": pd.Timestamp("2026-06-27 08:00", tz="UTC"), "miner_uid": 999, "new_smoothed_score": 1.0, "reward_weight": 0.15},
-        ])
-        daily_pool = pd.Series({pd.Timestamp("2026-06-25", tz="UTC"): 5000.0, pd.Timestamp("2026-06-27", tz="UTC"): 4000.0})
+
+        combined = pd.DataFrame(
+            [
+                {
+                    "updated_at": pd.Timestamp("2026-06-25 08:00", tz="UTC"),
+                    "miner_uid": 999,
+                    "new_smoothed_score": 1.0,
+                    "reward_weight": 0.1,
+                },
+                {
+                    "updated_at": pd.Timestamp("2026-06-26 08:00", tz="UTC"),
+                    "miner_uid": 999,
+                    "new_smoothed_score": 1.0,
+                    "reward_weight": 0.2,
+                },
+                {
+                    "updated_at": pd.Timestamp("2026-06-27 08:00", tz="UTC"),
+                    "miner_uid": 999,
+                    "new_smoothed_score": 1.0,
+                    "reward_weight": 0.15,
+                },
+            ]
+        )
+        daily_pool = pd.Series(
+            {pd.Timestamp("2026-06-25", tz="UTC"): 5000.0, pd.Timestamp("2026-06-27", tz="UTC"): 4000.0}
+        )
         earnings = _compute_earnings_df(combined, miner_id=999, daily_pool_usd=daily_pool, emission_factor=1.0)
         assert len(earnings) == 2
         assert earnings["usd_per_round"].tolist() == pytest.approx([500.0, 600.0])
         captured = capsys.readouterr()
         assert "2026-06-26" in captured.out and "dropping" in captured.out.lower()
+
 
 # ---------------------------------------------------------------------------
 # plot_estimated_earnings
@@ -1075,7 +1169,9 @@ class TestPlotEstimatedEarnings:
         assert "estimated_earnings_crypto-24h" in chart_path.name
 
     @patch("synth_lib.backtester.plots.earnings.get_daily_miner_pool_usd")
-    def test_partial_coverage_warning(self, mock_pool: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_partial_coverage_warning(
+        self, mock_pool: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """Backtesting fewer assets than the competition's asset_list prints a partial-coverage tag."""
         from synth_lib.backtester.plots.earnings import plot_estimated_earnings
         from synth_lib.backtester.scoring import compute_combined_smoothed_scores
@@ -1183,37 +1279,44 @@ class TestSplitWarning:
     def test_pre_split_window_warns(self) -> None:
         from synth_lib.backtester.caveats import _maybe_warn_competition_split
         from synth_lib.backtester.config import COMPETITION_SPLIT_DATE
+
         with pytest.warns(UserWarning, match="before the 3-competition split"):
             _maybe_warn_competition_split(
-                competition=CRYPTO_24H, n_backtest_days=30,
+                competition=CRYPTO_24H,
+                n_backtest_days=30,
                 eval_end=COMPETITION_SPLIT_DATE - timedelta(days=1),
-                simulate_registration=None, simulate_deregistration=None,
+                simulate_registration=None,
+                simulate_deregistration=None,
             )
 
     def test_post_split_window_silent(self) -> None:
         from synth_lib.backtester.caveats import _maybe_warn_competition_split
         from synth_lib.backtester.config import COMPETITION_SPLIT_DATE
+
         with warnings.catch_warnings():
             warnings.simplefilter("error", UserWarning)
             _maybe_warn_competition_split(
-                competition=CRYPTO_24H, n_backtest_days=5,
+                competition=CRYPTO_24H,
+                n_backtest_days=5,
                 eval_end=COMPETITION_SPLIT_DATE + timedelta(days=20),
-                simulate_registration=None, simulate_deregistration=None,
+                simulate_registration=None,
+                simulate_deregistration=None,
             )
 
 
 class TestCliSelection:
     def test_competitions_by_name_all_has_three(self) -> None:
         from synth_lib.backtester.scripts.run_backtest import COMPETITIONS_BY_NAME
+
         assert len(COMPETITIONS_BY_NAME["all"]) == 3
 
     def test_build_filtered_competitions_intersects_assets(self) -> None:
         from synth_lib.backtester.scripts.run_backtest import _build_filtered_competitions
+
         out = _build_filtered_competitions([CRYPTO_24H, COM_EQU_24H], ["BTC", "XAU"])
         by_label = {c.label: c.asset_list for c in out}
         assert by_label["Crypto 24h"] == ["BTC"]
         assert by_label["Commodities/Equities 24h"] == ["XAU"]
-
 
 
 class TestNoScoresAvailable:
@@ -1238,9 +1341,7 @@ class TestNoScoresAvailable:
         assert df.empty
 
     @patch("synth_lib.backtester.orchestration.get_miner_scores")
-    def test_backtest_raises_no_scores_available(
-        self, mock_scores: MagicMock, tmp_path: Path
-    ) -> None:
+    def test_backtest_raises_no_scores_available(self, mock_scores: MagicMock, tmp_path: Path) -> None:
         """Must not degrade to a bare RuntimeError — run_backtest keys SKIPPED off it."""
         mock_scores.return_value = pd.DataFrame()
         predictions = tmp_path / "predictions"
@@ -1289,9 +1390,7 @@ class TestSliceRealPrices:
 
     def test_nan_minutes_survive_the_slice(self) -> None:
         """NaN is repairable by the fallback, so the slice must pass it through."""
-        prices = _slice_real_prices(
-            self._frame(61, gap_at=5), pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300
-        )
+        prices = _slice_real_prices(self._frame(61, gap_at=5), pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300)
 
         assert np.isnan(prices[1])
 
@@ -1321,9 +1420,7 @@ class TestFillGapsFromRealizedPaths:
 
     @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
     @patch("synth_lib.backtester.preparation.RealizedPathStore")
-    def test_substitutes_the_validator_path(
-        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
-    ) -> None:
+    def test_substitutes_the_validator_path(self, mock_store_cls: MagicMock, mock_prefetch: MagicMock) -> None:
         expected_steps = 86_400 // 300 + 1
         path = pd.Series(
             [float(i) for i in range(expected_steps)],
@@ -1338,9 +1435,7 @@ class TestFillGapsFromRealizedPaths:
 
     @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
     @patch("synth_lib.backtester.preparation.RealizedPathStore")
-    def test_detects_gaps_in_object_dtype_prices(
-        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
-    ) -> None:
+    def test_detects_gaps_in_object_dtype_prices(self, mock_store_cls: MagicMock, mock_prefetch: MagicMock) -> None:
         """Gap detection must survive None from object-dtype partitions."""
         expected_steps = 86_400 // 300 + 1
         mock_store_cls.return_value.get.return_value = pd.Series(
@@ -1353,9 +1448,7 @@ class TestFillGapsFromRealizedPaths:
 
     @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
     @patch("synth_lib.backtester.preparation.RealizedPathStore")
-    def test_complete_local_prices_are_left_alone(
-        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
-    ) -> None:
+    def test_complete_local_prices_are_left_alone(self, mock_store_cls: MagicMock, mock_prefetch: MagicMock) -> None:
         prompts = [self._prompt([1.0, 2.0, 3.0])]
 
         assert _fill_gaps_from_realized_paths(prompts, "[test]") == 0
@@ -1365,9 +1458,7 @@ class TestFillGapsFromRealizedPaths:
 
     @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
     @patch("synth_lib.backtester.preparation.RealizedPathStore")
-    def test_unscored_prompts_are_not_fetched(
-        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
-    ) -> None:
+    def test_unscored_prompts_are_not_fetched(self, mock_store_cls: MagicMock, mock_prefetch: MagicMock) -> None:
         """A prompt with no matching prediction file scores as crps=-1 anyway."""
         prompt = self._prompt([])
         prompt["file_path"] = None
@@ -1377,9 +1468,7 @@ class TestFillGapsFromRealizedPaths:
 
     @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
     @patch("synth_lib.backtester.preparation.RealizedPathStore")
-    def test_warns_when_a_gap_cannot_be_repaired(
-        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
-    ) -> None:
+    def test_warns_when_a_gap_cannot_be_repaired(self, mock_store_cls: MagicMock, mock_prefetch: MagicMock) -> None:
         mock_store_cls.return_value.get.return_value = None
         prompts = [self._prompt([float("nan"), 2.0, 3.0])]
 
@@ -1388,9 +1477,7 @@ class TestFillGapsFromRealizedPaths:
 
     @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
     @patch("synth_lib.backtester.preparation.RealizedPathStore")
-    def test_wrong_length_path_is_rejected(
-        self, mock_store_cls: MagicMock, mock_prefetch: MagicMock
-    ) -> None:
+    def test_wrong_length_path_is_rejected(self, mock_store_cls: MagicMock, mock_prefetch: MagicMock) -> None:
         """A wrong-length path is a different prompt config — would mis-score."""
         mock_store_cls.return_value.get.return_value = pd.Series(
             [1.0, 2.0], index=pd.date_range(self.START, periods=2, freq="5min")
@@ -1425,7 +1512,12 @@ def test_realized_coverage_counts_only_prompts_with_predictions():
     from synth_lib.backtester.orchestration import _realized_coverage
 
     full = {"file_path": "p", "time_length": 3600, "time_increment": 60, "real_prices": [1.0] * 61}
-    holed = {"file_path": "p", "time_length": 3600, "time_increment": 60, "real_prices": [1.0] * 59 + [float("nan")] * 2}
+    holed = {
+        "file_path": "p",
+        "time_length": 3600,
+        "time_increment": 60,
+        "real_prices": [1.0] * 59 + [float("nan")] * 2,
+    }
     unpredicted = {"file_path": None, "time_length": 3600, "time_increment": 60, "real_prices": []}
 
     assert _realized_coverage([full])["realized_coverage"] == 1.0
@@ -1434,3 +1526,87 @@ def test_realized_coverage_counts_only_prompts_with_predictions():
     # The unpredicted prompt must not dilute coverage, or a missing prediction reads as a data hole.
     assert _realized_coverage([full, unpredicted])["realized_coverage"] == 1.0
     assert _realized_coverage([])["realized_coverage"] is None
+
+
+class TestVolCrpsCutover:
+    """crypto-1h gained a volatility term on 2026-09-22; a window can contain both formulas."""
+
+    # crypto-1h is a 3600s horizon at a 60s increment: 61 scoring points.
+    PATHS = np.array([[100.0 + i * 0.1 + k for i in range(61)] for k in range(8)], dtype=float)
+    REAL = np.array([100.0 + i * 0.1 for i in range(61)], dtype=float)
+
+    def _score(self, tmp_path, scored_time):
+        f = tmp_path / "p.json"
+        f.write_text(json.dumps({"paths": self.PATHS.tolist()}))
+        return _score_single_prompt(
+            file_path=f,
+            start_time=pd.Timestamp("2026-09-22T12:00:00Z"),
+            asset_val="BTC",
+            scored_time=scored_time,
+            time_len=CRYPTO_1H.time_length,
+            time_incr=CRYPTO_1H.time_increment,
+            real_prices=self.REAL.tolist(),
+            scoring_intervals=CRYPTO_1H.scoring_intervals,
+            vol_scoring_blocks=CRYPTO_1H.vol_scoring_blocks,
+            miner_id=999,
+        )["crps"]
+
+    def test_before_the_cutover_scores_price_only(self, tmp_path):
+        expected, _ = calculate_crps_for_miner(
+            self.PATHS, self.REAL, CRYPTO_1H.time_increment, CRYPTO_1H.scoring_intervals
+        )
+        got = self._score(tmp_path, pd.Timestamp(VOL_CRPS_1H_DATE) - pd.Timedelta(seconds=1))
+        assert got == pytest.approx(expected)
+
+    def test_at_the_cutover_the_volatility_term_is_added(self, tmp_path):
+        expected, _ = calculate_total_score_for_miner(
+            self.PATHS,
+            self.REAL,
+            CRYPTO_1H.time_increment,
+            CRYPTO_1H.scoring_intervals,
+            CRYPTO_1H.vol_scoring_blocks,
+        )
+        got = self._score(tmp_path, pd.Timestamp(VOL_CRPS_1H_DATE))
+        assert got == pytest.approx(expected)
+
+    def test_the_two_sides_of_the_cutover_differ(self, tmp_path):
+        """If they were equal the dispatch would be untestable and the date pointless."""
+        before = self._score(tmp_path, pd.Timestamp(VOL_CRPS_1H_DATE) - pd.Timedelta(seconds=1))
+        after = self._score(tmp_path, pd.Timestamp(VOL_CRPS_1H_DATE))
+        assert after > before
+
+    def test_the_24h_competitions_have_no_volatility_term(self):
+        """No vol_scoring_blocks, so the cutover date never applies to them."""
+        assert not CRYPTO_24H.vol_scoring_blocks
+
+
+class TestOutlierCapCutover:
+    """The validator has clipped raw CRPS above 10x the field median only since 2026-09-04."""
+
+    # One outlier far above the median, which the cap moves and the pre-cap formula does not.
+    CRPS = pd.Series([10.0, 11.0, 12.0, 13.0, 5000.0])
+
+    def test_before_the_cutover_nothing_is_clipped(self):
+        stats = _compute_prompt_score_stats_for_group(self.CRPS, capped_era=False)
+        assert stats["new_prompt_scores"].max() == pytest.approx(5000.0 - 10.0)
+
+    def test_from_the_cutover_the_outlier_is_clipped(self):
+        stats = _compute_prompt_score_stats_for_group(self.CRPS, capped_era=True)
+        median = float(np.median(self.CRPS.values))
+        assert stats["new_prompt_scores"].max() == pytest.approx(median * 10.0 - 10.0)
+
+    def test_a_well_behaved_field_is_identical_either_side(self):
+        """The cap only bites above 10x the median, so it must not move an ordinary prompt."""
+        ordinary = pd.Series([10.0, 11.0, 12.0, 13.0, 14.0])
+        before = _compute_prompt_score_stats_for_group(ordinary, capped_era=False)
+        after = _compute_prompt_score_stats_for_group(ordinary, capped_era=True)
+        pd.testing.assert_frame_equal(before, after)
+
+    def test_a_miss_is_filled_with_the_p95_on_both_sides(self):
+        """-1 is a missed response, not a score; both eras fill it rather than ranking it."""
+        with_miss = pd.Series([10.0, 11.0, 12.0, -1.0])
+        for era in (False, True):
+            stats = _compute_prompt_score_stats_for_group(with_miss, capped_era=era)
+            assert stats["new_prompt_scores"].iloc[3] == pytest.approx(
+                stats["percentile95"].iloc[0] - stats["lowest_score"].iloc[0]
+            )

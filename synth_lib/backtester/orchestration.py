@@ -18,6 +18,7 @@ from synth_lib.backtester.caveats import (
     _maybe_warn_hf_crps_formula_change,
 )
 from synth_lib.backtester.config import (
+    OUTLIER_CAP_DATE,
     DEFAULT_MINER_OUTPUT_ROOT,
     PREDICTION_MATCH_TOLERANCE_MINUTES,
     SCORING_INTERVALS,
@@ -111,12 +112,8 @@ def backtest(
         scoring_intervals = competition.scoring_intervals
 
     # Discover prediction files and their date range
-    predictions_root = predictions_dir or (
-        DEFAULT_MINER_OUTPUT_ROOT / miner_name / "predictions"
-    )
-    prediction_files = sorted(
-        p for p in predictions_root.glob("**/*.json") if not p.name.startswith("_")
-    )
+    predictions_root = predictions_dir or (DEFAULT_MINER_OUTPUT_ROOT / miner_name / "predictions")
+    prediction_files = sorted(p for p in predictions_root.glob("**/*.json") if not p.name.startswith("_"))
     pred_times = [_parse_prediction_filename_time(p) for p in prediction_files]
     pred_times = [t for t in pred_times if t is not None]
     if not pred_times:
@@ -140,9 +137,7 @@ def backtest(
     else:
         anchor = datetime.now(UTC)
     if simulate_registration is not None:
-        window_start = pd.Timestamp(simulate_registration).to_pydatetime() - timedelta(
-            days=competition.window_days
-        )
+        window_start = pd.Timestamp(simulate_registration).to_pydatetime() - timedelta(days=competition.window_days)
     else:
         window_start = anchor - timedelta(days=n_backtest_days)
     query_start = max(
@@ -216,29 +211,21 @@ def backtest(
             direction="forward",
         )
         result = result[~result["updated_at"].isna()]
-        rewards_history = rewards_history.loc[
-            rewards_history["updated_at"].isin(result["updated_at"])
-        ].copy()
-        asset_scores = asset_scores.loc[
-            asset_scores["scored_time"].isin(result["scored_time"])
-        ].copy()
+        rewards_history = rewards_history.loc[rewards_history["updated_at"].isin(result["updated_at"])].copy()
+        asset_scores = asset_scores.loc[asset_scores["scored_time"].isin(result["scored_time"])].copy()
     else:
         if rewards_history["updated_at"].max() < asset_scores["scored_time"].max():
             max_scored_time = asset_scores.loc[
                 asset_scores["scored_time"] <= rewards_history["updated_at"].max(),
                 "scored_time",
             ].max()
-            asset_scores = asset_scores.loc[
-                asset_scores["scored_time"] <= max_scored_time
-            ].copy()
+            asset_scores = asset_scores.loc[asset_scores["scored_time"] <= max_scored_time].copy()
         elif rewards_history["updated_at"].max() > asset_scores["scored_time"].max():
             max_upd_at = rewards_history.loc[
                 rewards_history["updated_at"] >= asset_scores["scored_time"].max(),
                 "updated_at",
             ].min()
-            rewards_history = rewards_history.loc[
-                rewards_history["updated_at"] <= max_upd_at
-            ].copy()
+            rewards_history = rewards_history.loc[rewards_history["updated_at"] <= max_upd_at].copy()
 
     # Step 5: download asset price data
     asset_prices: dict[str, pd.DataFrame] = {}
@@ -259,25 +246,17 @@ def backtest(
     prompts: list[dict[str, Any]] = []
 
     for start_time in start_times:
-        scores_subset = asset_scores.loc[
-            asset_scores["start_time"] == start_time
-        ].copy()
+        scores_subset = asset_scores.loc[asset_scores["start_time"] == start_time].copy()
 
         for _, asset_val, scored_time, time_len, time_incr in (
-            scores_subset[["asset", "scored_time", "time_length", "time_increment"]]
-            .drop_duplicates()
-            .itertuples()
+            scores_subset[["asset", "scored_time", "time_length", "time_increment"]].drop_duplicates().itertuples()
         ):
-            file_path = _find_prediction_file(
-                prediction_files, start_time, asset_val, time_len
-            )
+            file_path = _find_prediction_file(prediction_files, start_time, asset_val, time_len)
 
             # Pre-slice real prices in the main process (avoids pickling DataFrames)
             real_prices: list[float] = []
             if file_path is not None:
-                real_prices = _slice_real_prices(
-                    asset_prices[asset_val], start_time, time_len, time_incr
-                )
+                real_prices = _slice_real_prices(asset_prices[asset_val], start_time, time_len, time_incr)
 
             prompts.append(
                 {
@@ -304,6 +283,7 @@ def backtest(
             prompt["time_increment"],
             prompt["real_prices"],
             scoring_intervals,
+            competition.vol_scoring_blocks,
             miner_id,
         )
         for prompt in prompts
@@ -311,9 +291,7 @@ def backtest(
 
     # Dispatch scoring — parallel if executor provided, else sequential
     if scoring_executor is not None:
-        futures = [
-            scoring_executor.submit(_score_single_prompt, *item) for item in work_items
-        ]
+        futures = [scoring_executor.submit(_score_single_prompt, *item) for item in work_items]
         raw_results = [f.result() for f in futures]
     else:
         raw_results = [_score_single_prompt(*item) for item in work_items]
@@ -337,8 +315,7 @@ def backtest(
     valid_scores = new_scores.loc[new_scores["crps"] != -1]
     if valid_scores.empty:
         raise RuntimeError(
-            "All matched predictions resulted in crps=-1 (scoring failures). "
-            "No valid backtest results to report."
+            "All matched predictions resulted in crps=-1 (scoring failures). " "No valid backtest results to report."
         )
     end_backtest_time = valid_scores["scored_time"].max()
     new_scores = new_scores.loc[new_scores["scored_time"] <= end_backtest_time]
@@ -354,8 +331,7 @@ def backtest(
         new_scores = new_scores.loc[new_scores["scored_time"] >= sim_reg]
         if new_scores.empty:
             raise RuntimeError(
-                f"simulate_registration={sim_reg} drops all of our miner's CRPS rows; "
-                f"no valid backtest results."
+                f"simulate_registration={sim_reg} drops all of our miner's CRPS rows; " f"no valid backtest results."
             )
     if simulate_deregistration is not None:
         sim_dereg = pd.Timestamp(simulate_deregistration)
@@ -381,19 +357,26 @@ def backtest(
             rewards_history["updated_at"] >= all_scores["scored_time"].max(),
             "updated_at",
         ].min()
-        rewards_history = rewards_history.loc[
-            rewards_history["updated_at"] <= max_upd_at
-        ].copy()
+        rewards_history = rewards_history.loc[rewards_history["updated_at"] <= max_upd_at].copy()
 
     # Step 12: apply prompt score calculation across all scores. We also persist
-    # percentile90 and lowest_score per group because prepare_df_for_moving_average
+    # percentile95 and lowest_score per group because prepare_df_for_moving_average
     # uses them to compute the worst-score backfill for new miners (silently
     # skips backfill when those columns are absent).
-    _stats = all_scores.groupby(
-        ["scored_time", "asset", "time_length", "time_increment"], group_keys=False
-    )["crps"].apply(_compute_prompt_score_stats_for_group)
+    # Split on the outlier-cap cutover before grouping. scored_time is a group key, so every row
+    # in a group is on the same side and no group is ever split by this.
+    keys = ["scored_time", "asset", "time_length", "time_increment"]
+    capped_era = pd.to_datetime(all_scores["scored_time"], utc=True) >= OUTLIER_CAP_DATE
+    parts = [
+        all_scores.loc[mask]
+        .groupby(keys, group_keys=False)["crps"]
+        .apply(_compute_prompt_score_stats_for_group, capped_era=era)
+        for era, mask in ((True, capped_era), (False, ~capped_era))
+        if mask.any()
+    ]
+    _stats = pd.concat(parts).reindex(all_scores.index)
     all_scores["new_prompt_scores"] = _stats["new_prompt_scores"]
-    all_scores["percentile90"] = _stats["percentile90"]
+    all_scores["percentile95"] = _stats["percentile95"]
     all_scores["lowest_score"] = _stats["lowest_score"]
 
     # Step 13: build rewards history entries for LLM miner
@@ -401,9 +384,7 @@ def backtest(
     for prompt_name_item in rewards_history["prompt_name"].unique():
         new_miner_rewards_prompt = pd.DataFrame(
             {
-                "updated_at": rewards_history.loc[
-                    rewards_history["prompt_name"] == prompt_name_item, "updated_at"
-                ]
+                "updated_at": rewards_history.loc[rewards_history["prompt_name"] == prompt_name_item, "updated_at"]
                 .sort_values()
                 .unique(),
                 "miner_uid": miner_id,
@@ -411,9 +392,7 @@ def backtest(
             }
         )
         new_miner_rewards_list.append(new_miner_rewards_prompt)
-    new_miner_rewards = pd.concat(
-        new_miner_rewards_list, ignore_index=True
-    ).sort_values("updated_at")
+    new_miner_rewards = pd.concat(new_miner_rewards_list, ignore_index=True).sort_values("updated_at")
 
     # Step 14: merge LLM miner rewards into full rewards history
     rewards_history = pd.concat(
@@ -463,9 +442,7 @@ def backtest(
         "miner_id": miner_id,
         "num_prompts": int((new_scores["crps"] != -1).sum()),
         "mean_crps": float(new_scores.loc[new_scores["crps"] != -1, "crps"].mean()),
-        "final_smoothed_score": (
-            float(miner_smoothed.iloc[-1]) if not miner_smoothed.empty else None
-        ),
+        "final_smoothed_score": (float(miner_smoothed.iloc[-1]) if not miner_smoothed.empty else None),
         **realized_coverage,
     }
 
@@ -475,6 +452,7 @@ def backtest(
         smoothed_scores=recalculated_smoothed_scores,
         summary=summary,
     )
+
 
 def run_backtest(
     miner_name: str,
@@ -567,16 +545,10 @@ def run_backtest(
             total_miners = len(last_slice)
             miner_rw = last_slice.loc[last_slice["miner_uid"] == miner_id]
             if not miner_rw.empty:
-                rank = int(
-                    last_slice["reward_weight"]
-                    .rank(ascending=False, method="min")
-                    .loc[miner_rw.index[0]]
-                )
+                rank = int(last_slice["reward_weight"].rank(ascending=False, method="min").loc[miner_rw.index[0]])
                 rw = float(miner_rw["reward_weight"].iloc[0])
                 sm = float(summary.get("final_smoothed_score", 0) or 0)
-                print(
-                    f"  rank: {rank}/{total_miners}  reward_weight: {rw:.6f}  smoothed_score: {sm:.2f}"
-                )
+                print(f"  rank: {rank}/{total_miners}  reward_weight: {rw:.6f}  smoothed_score: {sm:.2f}")
             else:
                 print(f"  Miner {miner_id} not found in final smoothed scores.")
         else:

@@ -47,6 +47,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["real_host_rev: opts out of the conftest stub to exercise the direct_url lookup"]
 
 # 120 to match the code as written. Not every pre-existing file is clean yet, so format what you
 # touch rather than reformatting the tree in one go.
@@ -59,4 +60,4 @@ extend-ignore = ["E203"]
 
 
 [tool.uv.sources]
-synth-subnet = { git = "https://github.com/synthdataco/synth-subnet", rev = "0d014cbcec376b28e887403b84025ebf1a89f60e" }
+synth-subnet = { git = "https://github.com/synthdataco/synth-subnet", rev = "2cfb24b29b745c37a143984e3e86e6c54f342293" }

@@ -129,7 +129,10 @@ def test_pre_commit_hook_rejects_oversized_blob(tmp_path):
     done = _commit(ws, "add data", env={"CAMPAIGN_MAX_BLOB_BYTES": "1024"})
     assert done.returncode != 0
     err = done.stderr.decode()
-    assert "big.parquet" in err and "--no-verify" in err
+    # The message names the limit to raise, not git's --no-verify: an instruction to skip a
+    # blocking check reads as defense evasion to the model safety classifiers agents run under.
+    assert "big.parquet" in err and "CAMPAIGN_MAX_BLOB_BYTES" in err
+    assert "--no-verify" not in err
 
 
 def test_pre_commit_hook_allows_small_blob_and_no_verify_escape(tmp_path):
@@ -202,8 +205,15 @@ def test_scaffolded_predict_anchors_paths_to_workspace_not_cwd(tmp_path, monkeyp
         def load_range(self, start, end):
             idx = pd.date_range(start, end, freq="1min", tz="UTC")
             return pd.DataFrame(
-                {"timestamp": idx, "open": 100.0, "high": 100.0, "low": 100.0,
-                 "close": 100.0, "volume": 1.0, "trade_count": 1.0}
+                {
+                    "timestamp": idx,
+                    "open": 100.0,
+                    "high": 100.0,
+                    "low": 100.0,
+                    "close": 100.0,
+                    "volume": 1.0,
+                    "trade_count": 1.0,
+                }
             )
 
     monkeypatch.setattr(predict, "MinutePriceStore", StubStore)
@@ -279,3 +289,52 @@ def test_predict_coverage_passes_when_partitions_present(tmp_path, monkeypatch):
     predict.check_snapshot_coverage(
         "BTC", datetime(2026, 7, 10, tzinfo=timezone.utc), datetime(2026, 7, 12, tzinfo=timezone.utc)
     )
+
+
+def test_workspace_pins_the_engine_the_host_runs(tmp_path):
+    """An agent tuning against a different backtester than the verdict runs measures something else."""
+    from tests.benchmark.conftest import STUB_REV
+
+    ws = create_workspace(_cfg(tmp_path), ModelSpec(id="m1", cli="fake", model="none"))
+
+    pyproject = (ws / "pyproject.toml").read_text()
+    assert f'rev = "{STUB_REV}"' in pyproject
+    assert "__HOST_REV__" not in pyproject
+
+
+def test_a_scaffold_without_the_placeholder_is_caught(tmp_path):
+    from synth_lib.benchmark.workspace import _pin_scaffold_to_host
+
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[tool.uv.sources]\nsynth-lib = { git = "...", rev = "abc" }\n')
+    with pytest.raises(RuntimeError, match="scaffold changed shape"):
+        _pin_scaffold_to_host(pyproject)
+
+
+@pytest.mark.real_host_rev
+def test_a_non_git_install_cannot_pin_the_workspace(monkeypatch):
+    """The sandbox fetches this rev. A local install has none, and the failure would land inside a
+    paid campaign rather than at setup."""
+    from synth_lib.benchmark import workspace as ws_mod
+
+    class _Local:
+        @staticmethod
+        def read_text(_name):
+            return '{"url": "file:///src", "dir_info": {"editable": true}}'
+
+    monkeypatch.setattr(ws_mod.Distribution, "from_name", lambda _n: _Local())
+    with pytest.raises(RuntimeError, match="not installed from git"):
+        ws_mod._host_synth_lib_rev()
+
+
+@pytest.mark.real_host_rev
+def test_a_git_install_gives_its_commit(monkeypatch):
+    from synth_lib.benchmark import workspace as ws_mod
+
+    class _Vcs:
+        @staticmethod
+        def read_text(_name):
+            return '{"url": "https://x/y", "vcs_info": {"vcs": "git", "commit_id": "abc123"}}'
+
+    monkeypatch.setattr(ws_mod.Distribution, "from_name", lambda _n: _Vcs())
+    assert ws_mod._host_synth_lib_rev() == "abc123"

@@ -38,12 +38,11 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
-from synth.validator.competition_config import ALL_COMPETITIONS  # type: ignore[import-untyped]
 
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
-from synth_lib.benchmark.verdict.evaluate import evaluate_candidate, prepare_offline_bundle
+from synth_lib.benchmark.verdict.evaluate import COMPETITIONS, evaluate_candidate, prepare_offline_bundle
 
 GENERATE_SCRIPT = Path(__file__).resolve().parents[1] / "generate_predictions.py"
 SANDBOX_IMAGE = DEFAULT_IMAGE
@@ -142,7 +141,7 @@ def generate_all(
     if not GENERATE_SCRIPT.exists():  # packaging regression: it must ship with the package
         raise FileNotFoundError(f"generation core missing at {GENERATE_SCRIPT}")
     shutil.copy(GENERATE_SCRIPT, workspace / "generate_predictions.py")
-    for comp in ALL_COMPETITIONS:
+    for comp in COMPETITIONS:
         for asset in comp.asset_list:
             inner = (
                 "uv run python generate_predictions.py"
@@ -184,7 +183,7 @@ def generate_baseline(
     """Host-side, trusted repo code. Known caveat: the subnet's default generator ignores
     context_prices and anchors on a price it fetches ITSELF — for past prompts that anchor may be
     wrong, so read the baseline's verdict with suspicion and drop it from the article if broken."""
-    for comp in ALL_COMPETITIONS:
+    for comp in COMPETITIONS:
         for asset in comp.asset_list:
             try:
                 run(
