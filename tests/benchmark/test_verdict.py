@@ -236,7 +236,16 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     backtest_calls: list[tuple[str, int]] = []
 
     def fake_backtest(
-        *, miner_name, asset, time_length, time_increment, n_backtest_days, predictions_dir, eval_end, competition
+        *,
+        miner_name,
+        asset,
+        time_length,
+        time_increment,
+        n_backtest_days,
+        predictions_dir,
+        eval_end,
+        competition,
+        simulate_registration,
     ):
         backtest_calls.append((asset, time_length))
         if asset == "XAU":
@@ -307,7 +316,16 @@ def test_all_assets_failed_competition_yields_none(monkeypatch, tmp_path):
     import synth_lib.benchmark.verdict.evaluate as ev
 
     def fake_backtest(
-        *, miner_name, asset, time_length, time_increment, n_backtest_days, predictions_dir, eval_end, competition
+        *,
+        miner_name,
+        asset,
+        time_length,
+        time_increment,
+        n_backtest_days,
+        predictions_dir,
+        eval_end,
+        competition,
+        simulate_registration,
     ):
         if time_length == 3600:
             raise RuntimeError("crypto-1h store broken")
@@ -379,7 +397,16 @@ def test_each_competition_writes_a_rank_chart(monkeypatch, tmp_path):
     import synth_lib.benchmark.verdict.evaluate as ev
 
     def fake_backtest(
-        *, miner_name, asset, time_length, time_increment, n_backtest_days, predictions_dir, eval_end, competition
+        *,
+        miner_name,
+        asset,
+        time_length,
+        time_increment,
+        n_backtest_days,
+        predictions_dir,
+        eval_end,
+        competition,
+        simulate_registration,
     ):
         return _FakeResult()
 
@@ -448,5 +475,91 @@ def test_the_verdict_records_the_seed(tmp_path):
         "mean_competition_percentile": 0.8,
         "per_competition": {},
     }
-    payload = rv.verdict_payload(result, "abc1234", ("2026-08-30", "2026-09-09"), seed=7)
+    payload = rv.verdict_payload(result, "abc1234", ("2026-08-30", "2026-09-09"), seed=7, simulate_registration=None)
     assert payload["seed"] == 7
+
+
+def test_simulate_registration_reaches_the_backtester_and_the_verdict(monkeypatch, tmp_path):
+    """The onboarding scenario is a different question from the steady-state Score, so the verdict
+    has to record which one it answers."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    seen: list = []
+
+    def fake_backtest(*, simulate_registration, **kw):
+        seen.append(simulate_registration)
+        return _FakeResult()
+
+    monkeypatch.setattr(ev, "backtest", fake_backtest)
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", _fake_combined({1: 0.5, 999: 0.3}))
+    reg = pd.Timestamp("2026-08-30T00:00:00Z").to_pydatetime()
+
+    ev.evaluate_candidate(
+        "cand",
+        tmp_path,
+        window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
+        window_days=10,
+        charts_dir=tmp_path / "charts",
+        simulate_registration=reg,
+    )
+    assert seen and all(s == reg for s in seen)
+
+    payload = rv.verdict_payload(
+        {
+            "score": 1.0,
+            "mean_competition_rank": 2,
+            "mean_reward_vs_top": 0.1,
+            "mean_competition_percentile": 0.5,
+            "per_competition": {},
+        },
+        "abc",
+        ("2026-08-30", "2026-09-09"),
+        seed=0,
+        simulate_registration=reg,
+    )
+    assert payload["simulate_registration"] == reg.isoformat()
+
+
+def test_the_default_verdict_simulates_no_registration(monkeypatch, tmp_path):
+    """Without the flag nothing changes: the steady-state Score is still the canonical one."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+
+    seen: list = []
+
+    def fake_backtest(*, simulate_registration, **kw):
+        seen.append(simulate_registration)
+        return _FakeResult()
+
+    monkeypatch.setattr(ev, "backtest", fake_backtest)
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", _fake_combined({1: 0.5, 999: 0.3}))
+    ev.evaluate_candidate(
+        "cand",
+        tmp_path,
+        window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
+        window_days=10,
+        charts_dir=tmp_path / "charts",
+    )
+    assert seen and all(s is None for s in seen)
+
+
+def test_the_bundle_widens_only_when_registration_is_simulated(monkeypatch, tmp_path):
+    """The frame reaches a competition window before the registration day, into a period the
+    candidate did not exist in — the field has to be bundled for it."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+
+    days: list[int] = []
+    monkeypatch.setattr(ev, "build_bundle", lambda **kw: days.append(kw["days"]))
+    monkeypatch.setenv("SYNTH_BACKTESTER_OFFLINE_DATA_ROOT", "")
+
+    ev.prepare_offline_bundle(pd.Timestamp("2026-09-09T00:00:00Z"), 10, out_root=tmp_path)
+    assert set(days) == {10}
+
+    days.clear()
+    ev.prepare_offline_bundle(
+        pd.Timestamp("2026-09-09T00:00:00Z"),
+        10,
+        out_root=tmp_path,
+        simulate_registration=pd.Timestamp("2026-08-30T00:00:00Z").to_pydatetime(),
+    )
+    assert set(days) == {20}  # window_days + the longest competition moving average

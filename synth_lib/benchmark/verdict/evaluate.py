@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -120,6 +121,7 @@ def evaluate_candidate(
     window_end: pd.Timestamp,
     window_days: int,
     charts_dir: Path,
+    simulate_registration: datetime | None = None,
 ) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
@@ -133,6 +135,11 @@ def evaluate_candidate(
     final_rank(). Percentile = 1 - (rank-1)/field_size.
 
     One rank-evolution chart per competition lands in `charts_dir`, named for the competition.
+
+    `simulate_registration` scores the champion as a miner that registered that day: its CRPS rows
+    before it are dropped, the validator's moving average classifies it as a late joiner, and the
+    preceding `competition.window_days` are backfilled at the field's worst score. That is what a
+    champion actually earns in its first days live, and it is NOT comparable to a Score without it.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []
@@ -153,6 +160,7 @@ def evaluate_candidate(
                     predictions_dir=predictions_dir,
                     eval_end=window_end.to_pydatetime(),
                     competition=comp,
+                    simulate_registration=simulate_registration,
                 )
                 results.append(result)
                 per_asset[asset] = {
@@ -225,7 +233,12 @@ def write_verdict(candidates: list[dict], out_path: Path) -> None:
     out_path.write_text(json.dumps({"ranking": [c["name"] for c in ranked], "candidates": ranked}, indent=2))
 
 
-def prepare_offline_bundle(window_end: pd.Timestamp, window_days: int, out_root: Path | None = None) -> Path:
+def prepare_offline_bundle(
+    window_end: pd.Timestamp,
+    window_days: int,
+    out_root: Path | None = None,
+    simulate_registration: datetime | None = None,
+) -> Path:
     """Builds the synth-lib offline bundle for the three competitions (mandatory for a
     window > ~3 days, since the live scores API rejects wider ranges) and exports
     SYNTH_BACKTESTER_OFFLINE_DATA_ROOT. Thin wrapper around build_bundle
@@ -235,11 +248,15 @@ def prepare_offline_bundle(window_end: pd.Timestamp, window_days: int, out_root:
     bundle directory.
     """
     anchor = window_end.to_pydatetime()
-    out = out_root or Path("offline_data") / f"verdict_{anchor:%Y%m%d}_{window_days}d"
+    # Simulating registration pushes the frame back another competition.window_days before the
+    # registration day, so the field has to be bundled for a period the candidate did not exist in.
+    extra = max(c.window_days for c in COMPETITIONS) if simulate_registration is not None else 0
+    days = window_days + extra
+    out = out_root or Path("offline_data") / f"verdict_{anchor:%Y%m%d}_{days}d"
     for comp in COMPETITIONS:
         build_bundle(
             slug=slug_for(comp),
-            days=window_days,
+            days=days,
             eval_end=anchor,
             assets=list(comp.asset_list),
             chunk_days=2.0,
