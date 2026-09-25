@@ -47,6 +47,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["real_host_rev: opts out of the conftest stub to exercise the direct_url lookup"]
 
 # 120 to match the code as written. Not every pre-existing file is clean yet, so format what you
 # touch rather than reformatting the tree in one go.
