@@ -15,7 +15,10 @@ from synth.validator.competition_config import (
     SMOOTHED_SCORE_COEFFICIENT,
     CompetitionConfig,
 )
-from synth.validator.crps_calculation import calculate_total_score_for_miner
+from synth.validator.crps_calculation import (
+    calculate_crps_for_miner,
+    calculate_total_score_for_miner,
+)
 from synth.validator.moving_average import (
     compute_smoothed_score,
     prepare_df_for_moving_average,
@@ -26,13 +29,13 @@ from synth_lib.backtester.config import (
     _COMBINED_EMPTY_COLS,
     _LEGACY_FALLBACK_WINDOW_DAYS,
     UTC,
+    VOL_CRPS_1H_DATE,
     competition_for,
     slug_for,
 )
 from synth_lib.backtester.loading import load_prediction
 from synth_lib.backtester.miner_data_handler import _BACKTEST_MDH
 from synth_lib.backtester.result import BacktestResult
-
 
 
 def _compute_prompt_scores_for_group(crps: pd.Series) -> pd.Series:
@@ -70,6 +73,7 @@ def _compute_prompt_score_stats_for_group(crps: pd.Series) -> pd.DataFrame:
         index=crps.index,
     )
 
+
 def calculate_smoothed_scores(
     all_scores: pd.DataFrame,
     rewards_history: pd.DataFrame,
@@ -89,9 +93,7 @@ def calculate_smoothed_scores(
     # Use miner_uid as miner_id for synth; drop any existing miner_id to avoid duplication
     if "miner_id" in input_df.columns:
         input_df = input_df.drop(columns=["miner_id"])
-    input_df = input_df.rename(
-        columns={"miner_uid": "miner_id", scores_column: "prompt_score_v3"}
-    )
+    input_df = input_df.rename(columns={"miner_uid": "miner_id", scores_column: "prompt_score_v3"})
     input_df["scored_time"] = pd.to_datetime(input_df["scored_time"])
 
     # Prepare the df (backfill new miners, etc.)
@@ -100,13 +102,8 @@ def calculate_smoothed_scores(
     result_rows = []
     for updated_at in rewards_history["updated_at"].sort_values().unique():
         cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[
-            (prepared["scored_time"] >= cutoff)
-            & (prepared["scored_time"] <= updated_at)
-        ]
-        rewards = compute_smoothed_score(
-            _BACKTEST_MDH, window_df, updated_at, competition
-        )
+        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
+        rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, competition)
         if rewards is None:
             continue
 
@@ -173,9 +170,7 @@ def compute_combined_smoothed_scores(
     # Adapt column names to what synth expects: miner_id, prompt_score_v3
     if "miner_id" in combined_crps.columns:
         combined_crps = combined_crps.drop(columns=["miner_id"])
-    combined_crps = combined_crps.rename(
-        columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"}
-    )
+    combined_crps = combined_crps.rename(columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"})
     combined_crps["scored_time"] = pd.to_datetime(combined_crps["scored_time"])
 
     prepared = prepare_df_for_moving_average(combined_crps)
@@ -191,13 +186,8 @@ def compute_combined_smoothed_scores(
     result_rows = []
     for updated_at in sorted(timestamps):
         cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[
-            (prepared["scored_time"] >= cutoff)
-            & (prepared["scored_time"] <= updated_at)
-        ]
-        rewards = compute_smoothed_score(
-            _BACKTEST_MDH, window_df, updated_at, competition
-        )
+        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
+        rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, competition)
         if rewards is None:
             continue
         for row in rewards:
@@ -220,6 +210,7 @@ def compute_combined_smoothed_scores(
         combined_crps,
         warmup_days=cutoff_days,
     )
+
 
 def _score_single_prompt(
     file_path: Path | None,
@@ -267,9 +258,12 @@ def _score_single_prompt(
             "miner_id": miner_id,
         }
     real_price_array = np.asarray(real_prices, dtype=float)
-    total_crps, _ = calculate_total_score_for_miner(
-        simulation_runs, real_price_array, time_incr, scoring_intervals, vol_scoring_blocks
-    )
+    if vol_scoring_blocks and pd.Timestamp(scored_time) >= VOL_CRPS_1H_DATE:
+        total_crps, _ = calculate_total_score_for_miner(
+            simulation_runs, real_price_array, time_incr, scoring_intervals, vol_scoring_blocks
+        )
+    else:
+        total_crps, _ = calculate_crps_for_miner(simulation_runs, real_price_array, time_incr, scoring_intervals)
 
     return {
         "miner_uid": miner_id,
@@ -298,11 +292,7 @@ def _trim_warmup(
     """
     if smoothed_scores.empty or scored.empty:
         return smoothed_scores
-    anchor = (
-        pd.Timestamp(warmup_anchor)
-        if warmup_anchor is not None
-        else pd.Timestamp(scored["scored_time"].min())
-    )
+    anchor = pd.Timestamp(warmup_anchor) if warmup_anchor is not None else pd.Timestamp(scored["scored_time"].min())
     warmup_end = anchor + pd.Timedelta(days=warmup_days)
     trimmed = smoothed_scores.loc[smoothed_scores["updated_at"] >= warmup_end]
     if trimmed.empty:
