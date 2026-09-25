@@ -896,17 +896,17 @@ class TestComputeCombinedSmoothedScores:
             },
         )
 
-    def test_spyx_dominance_over_xau(self) -> None:
+    def test_sp500_dominance_over_xau(self) -> None:
         from synth_lib.backtester.scoring import compute_combined_smoothed_scores
         updated = pd.Timestamp("2026-07-01 12:00:00", tz="UTC")
         st = datetime(2026, 7, 1, 10, 0, 0, tzinfo=UTC)
         r_xau = self._make_result("XAU", {1: 100.0, 2: 500.0}, st, updated)
-        r_spyx = self._make_result("SPYX", {1: 500.0, 2: 100.0}, st, updated)
-        combined = compute_combined_smoothed_scores([r_xau, r_spyx], COM_EQU_24H)
+        r_sp500 = self._make_result("SP500", {1: 500.0, 2: 100.0}, st, updated)
+        combined = compute_combined_smoothed_scores([r_xau, r_sp500], COM_EQU_24H)
         rows = combined.loc[combined["updated_at"] == updated]
         assert len(rows) == 2
         rw = rows.set_index("miner_uid")["reward_weight"]
-        assert rw.loc[2] > rw.loc[1]  # miner 2 good on higher-coef SPYX (3.44) wins
+        assert rw.loc[2] > rw.loc[1]  # miner 2 good on higher-coef SP500 (3.44) wins
 
     def test_output_columns_and_sums(self) -> None:
         """reward_weight across miners at a single timestamp sums to

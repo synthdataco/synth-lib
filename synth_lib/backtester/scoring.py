@@ -48,7 +48,9 @@ def _compute_prompt_score_stats_for_group(crps: pd.Series) -> pd.DataFrame:
     lowest_score so synth.prepare_df_for_moving_average can apply its worst-score
     backfill rule to new miners.
     """
-    capped, p90, low = compute_prompt_scores(crps.values)
+    # The validator also returns a per-row was_capped flag, which it persists so the outlier
+    # clip rate stays monitorable. Nothing downstream here reads it.
+    capped, p90, low, _was_capped = compute_prompt_scores(crps.values)
     n = len(crps)
     if capped is None:
         return pd.DataFrame(

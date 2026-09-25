@@ -59,4 +59,4 @@ extend-ignore = ["E203"]
 
 
 [tool.uv.sources]
-synth-subnet = { git = "https://github.com/synthdataco/synth-subnet", rev = "0d014cbcec376b28e887403b84025ebf1a89f60e" }
+synth-subnet = { git = "https://github.com/synthdataco/synth-subnet", rev = "2cfb24b29b745c37a143984e3e86e6c54f342293" }
