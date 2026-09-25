@@ -251,6 +251,21 @@ def _score_single_prompt(
 
     llm_predictions_raw = load_prediction(file_path)
     simulation_runs = np.asarray(llm_predictions_raw["paths"], dtype=float)
+    # A non-finite path scores as a miss, the same as no prediction at all: compute_prompt_scores
+    # fills -1 with the prompt's 95th percentile. Scoring it would give a NaN CRPS, and the
+    # percentile is taken over every miner on that prompt, so one NaN drops the prompt from the
+    # whole field instead of costing the champion anything.
+    if not np.isfinite(simulation_runs).all():
+        return {
+            "miner_uid": miner_id,
+            "scored_time": scored_time,
+            "crps": -1,
+            "asset": asset_val,
+            "start_time": start_time,
+            "time_increment": time_incr,
+            "time_length": time_len,
+            "miner_id": miner_id,
+        }
     real_price_array = np.asarray(real_prices, dtype=float)
     total_crps, _ = calculate_total_score_for_miner(
         simulation_runs, real_price_array, time_incr, scoring_intervals, vol_scoring_blocks
