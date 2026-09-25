@@ -583,14 +583,21 @@ def test_the_onboarding_ramp_survives_the_combined_aggregation(monkeypatch, tmp_
     reg = pd.Timestamp("2026-08-30T00:00:00Z").to_pydatetime()
 
     ev.evaluate_candidate(
-        "cand", tmp_path, window_end=pd.Timestamp("2026-09-09T00:00:00Z"), window_days=10,
-        charts_dir=tmp_path / "charts", simulate_registration=reg,
+        "cand",
+        tmp_path,
+        window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
+        window_days=10,
+        charts_dir=tmp_path / "charts",
+        simulate_registration=reg,
     )
     assert seen and all(s == reg for s in seen), "the combined aggregation must know too"
 
     seen.clear()
     ev.evaluate_candidate(
-        "cand", tmp_path, window_end=pd.Timestamp("2026-09-09T00:00:00Z"), window_days=10,
+        "cand",
+        tmp_path,
+        window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
+        window_days=10,
         charts_dir=tmp_path / "charts",
     )
     assert seen and all(s is None for s in seen)

@@ -1634,9 +1634,13 @@ class TestRegistrationLookback:
         (preds / name).write_text(json.dumps({"paths": [[1.0, 2.0]]}))
         with pytest.raises(NoScoresAvailable):
             backtest(
-                miner_name="m", asset="BTC", time_length=CRYPTO_24H.time_length,
-                time_increment=CRYPTO_24H.time_increment, n_backtest_days=10,
-                predictions_dir=preds, competition=CRYPTO_24H,
+                miner_name="m",
+                asset="BTC",
+                time_length=CRYPTO_24H.time_length,
+                time_increment=CRYPTO_24H.time_increment,
+                n_backtest_days=10,
+                predictions_dir=preds,
+                competition=CRYPTO_24H,
                 eval_end=(pd.Timestamp(simulate_registration) + pd.Timedelta(days=10)).to_pydatetime(),
                 simulate_registration=simulate_registration,
             )
