@@ -109,7 +109,7 @@ def generate(
             context_prices=context,
         )
         paths = [list(map(float, p)) for p in out[2:]]
-        payload = {
+        record = {
             "start_timestamp": t.isoformat(),
             "asset": asset,
             "time_increment": time_increment,
@@ -119,7 +119,7 @@ def generate(
             "paths": paths,
         }
         name = t.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{asset}_{time_length}.json"
-        (PREDICTIONS_DIR / name).write_text(json.dumps(payload))
+        (PREDICTIONS_DIR / name).write_text(json.dumps(record))
         n += 1
     return n
 

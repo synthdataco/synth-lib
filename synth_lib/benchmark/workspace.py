@@ -73,8 +73,8 @@ def _add_gpu_dependency(pyproject: Path) -> None:
 
 MAX_BLOB_BYTES = 50 * 1024 * 1024
 
-# A guard rail, not a jail: `--no-verify` and CAMPAIGN_MAX_BLOB_BYTES both bypass it, deliberately
-# — committed weights are how a champion runs offline. What it buys is that committing gigabytes
+# A guard rail with a deliberate way past it: raise CAMPAIGN_MAX_BLOB_BYTES — committed weights
+# are how a champion runs offline. What it buys is that committing gigabytes
 # becomes a visible, auditable act in the transcript instead of an accident. The bundle deliverable
 # (`git bundle --all`) packs every committed blob, and a blob stays reachable from its commit even
 # after a later commit deletes the file, so there is no undo.
@@ -94,8 +94,8 @@ if [ -n "$oversized" ]; then
     echo "" >&2
     echo "Datasets, virtualenvs and generated predictions must stay UNTRACKED (see .gitignore):" >&2
     echo "only committed objects reach the workspace bundle, so untracked files cost nothing." >&2
-    echo "If this file IS part of your champion (e.g. model weights it needs to run offline):" >&2
-    echo "  git commit --no-verify" >&2
+    echo "If this file IS part of your champion (e.g. model weights it needs to run offline)," >&2
+    echo "raise the limit: CAMPAIGN_MAX_BLOB_BYTES=<bytes> git commit ..." >&2
     exit 1
 fi
 exit 0

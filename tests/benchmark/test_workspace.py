@@ -129,7 +129,10 @@ def test_pre_commit_hook_rejects_oversized_blob(tmp_path):
     done = _commit(ws, "add data", env={"CAMPAIGN_MAX_BLOB_BYTES": "1024"})
     assert done.returncode != 0
     err = done.stderr.decode()
-    assert "big.parquet" in err and "--no-verify" in err
+    # The message names the limit to raise, not git's --no-verify: an instruction to skip a
+    # blocking check reads as defense evasion to the model safety classifiers agents run under.
+    assert "big.parquet" in err and "CAMPAIGN_MAX_BLOB_BYTES" in err
+    assert "--no-verify" not in err
 
 
 def test_pre_commit_hook_allows_small_blob_and_no_verify_escape(tmp_path):

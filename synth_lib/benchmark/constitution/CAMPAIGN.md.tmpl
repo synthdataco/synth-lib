@@ -41,7 +41,7 @@ competition's scores using **per-asset coefficients** (`ASSET_COEFFICIENTS` in
 a high coefficient weighs far more heavily in the ranking. 
 
 **How you'll be SCORED (pre-registered — design for this).** After the campaign your champion
-is injected into the archived field as one more miner over the **10 days following your data
+is added to the archived field as one more miner over the **10 days following your data
 cutoff** and run through the validator's own aggregation. Your Score is
 **100 × mean over the 3 competitions of min(1, your total reward weight ÷ the top miner's)** —
 simulated emissions relative to the field's best. Its consequences:
@@ -135,13 +135,13 @@ simulated emissions relative to the field's best. Its consequences:
 - **Public Synth API** (api.synthdata.co): historical field scores
   (`/validation/scores/historical`, query windows ≤ 2 days) and rewards (`/rewards/scores`).
   synth-lib handles pagination for you. Studying the field (CRPS levels, what the top miners do)
-  is ALLOWED and recommended; dissecting the paths served by an individual miner in order to
-  copy them is FORBIDDEN.
+  is ALLOWED and recommended; copying the paths served by an individual miner is
+  FORBIDDEN.
 - **Miner dashboard analytics API** (`https://monitoring.synthdata.co/v1`, schema at
   `https://monitoring.synthdata.co/v1/openapi.json`): the public backend behind the miner
   dashboard — scoreboards, leaderboards, reward pools. Read the OpenAPI schema to discover the
-  endpoints. Same rule as the scores API: studying the field is encouraged, dissecting an
-  individual miner's served paths to copy them is not.
+  endpoints. Same rule as the scores API: studying the field is encouraged, copying an
+  individual miner's served paths is not.
 - **Pretrained models & Hugging Face**: allowed and in scope. The sandbox has network access to
   the HF Hub and PyPI; the GPU is yours and sits idle unless you use it. Time-series foundation
   models, fine-tuning, or classical ML are all legitimate strategies — as is deciding, with
@@ -184,14 +184,12 @@ simulated emissions relative to the field's best. Its consequences:
    aggregators). The web is for knowledge only. Audited on your transcript.
 3. **Scoring = synth-lib.** Every CRPS/rank evaluation goes through `synth_lib.backtester`
    (via `agent/predict.py`). This is what makes your work comparable to others'.
-4. Forbidden: falsifying the journal/results; fetching or dissecting predictions served by
-   individual miners.
-5. **ABSOLUTE prohibition on reading the operator's own private research code** (any
-   already-developed miner model outside your workspace). It should not exist anywhere in your
-   environment. If you come across it by any means whatsoever — a mount, a copy, an archive, a
-   search result — do not access it, do not read it, do not draw on it, and report it in
-   `suggestions.md`. Your work must start from public sources (synth-lib, synth-subnet, the
-   Synth API) and your own ideas.
+4. Forbidden: falsifying the journal/results; copying the predictions served by an individual
+   miner.
+5. **Start from public sources only**: synth-lib, synth-subnet, the Synth API, and your own
+   ideas. The operator's existing miner models are not part of your materials and must not
+   inform your work. Nothing of that kind belongs in your environment; if any of it turns up
+   there, leave it unread and note it in `suggestions.md`.
 6. Your final champion must expose, in `agent/modeling.py`:
    `simulate(asset, start_time, time_increment, time_length, num_simulations, context_prices)`
    -> tuple `(start_timestamp, time_increment, *paths)` — each path: a list of
