@@ -129,7 +129,10 @@ simulated emissions relative to the field's best. Its consequences:
   `agent/predict.py`; NEVER reimplement your own scoring. The backtester runs FULLY OFFLINE
   here: `SYNTH_BACKTESTER_OFFLINE_DATA_ROOT` is set in your environment and points at a bundle
   of historical field scores and rewards inside your snapshot — you do not need the API for
-  ranks, and the bundle covers your whole data window.
+  ranks. DATA.md gives the measured span of scored prompts it holds: a rank backtest outside
+  that has no field to compare against. DATA.md also gives the span of the cached realized
+  paths, which are a different thing — they stand in for minutes your price store is missing,
+  so a prompt outside their span still ranks normally when its prices are complete.
 - **synth-subnet** (a synth-lib dependency; source: github.com/synthdataco/synth-subnet): the
   validator's code. Read it to understand exactly how you'll be scored.
 - **Public Synth API** (api.synthdata.co): historical field scores

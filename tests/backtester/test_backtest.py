@@ -1610,3 +1610,44 @@ class TestOutlierCapCutover:
             assert stats["new_prompt_scores"].iloc[3] == pytest.approx(
                 stats["percentile95"].iloc[0] - stats["lowest_score"].iloc[0]
             )
+
+
+class TestRegistrationLookback:
+    """The field must be fetched from before the candidate existed, whatever the predictions cover."""
+
+    def _queried_start(self, monkeypatch, tmp_path, simulate_registration):
+        import synth_lib.backtester.orchestration as orch
+
+        seen = {}
+
+        def fake_scores(*, start_time, end_time, asset, time_length, time_increment):
+            seen["start"] = start_time
+            raise NoScoresAvailable("stop here — the query bound is what this test is about")
+
+        monkeypatch.setattr(orch, "get_miner_scores", fake_scores)
+        monkeypatch.setattr(orch, "download_price_data", lambda *a, **k: pd.DataFrame())
+        # one prediction file, one horizon before registration, exactly as generate_all produces
+        preds = tmp_path / "predictions"
+        preds.mkdir()
+        start = pd.Timestamp(simulate_registration) - pd.Timedelta(seconds=CRYPTO_24H.time_length)
+        name = start.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_BTC_{CRYPTO_24H.time_length}.json"
+        (preds / name).write_text(json.dumps({"paths": [[1.0, 2.0]]}))
+        with pytest.raises(NoScoresAvailable):
+            backtest(
+                miner_name="m",
+                asset="BTC",
+                time_length=CRYPTO_24H.time_length,
+                time_increment=CRYPTO_24H.time_increment,
+                n_backtest_days=10,
+                predictions_dir=preds,
+                competition=CRYPTO_24H,
+                eval_end=(pd.Timestamp(simulate_registration) + pd.Timedelta(days=10)).to_pydatetime(),
+                simulate_registration=simulate_registration,
+            )
+        return pd.Timestamp(seen["start"])
+
+    def test_the_lookback_is_a_full_moving_average_window_not_one_horizon(self, monkeypatch, tmp_path):
+        reg = pd.Timestamp("2026-08-30T00:00:00Z")
+        start = self._queried_start(monkeypatch, tmp_path, reg.to_pydatetime())
+        # Clamping to prediction coverage would put this one horizon back; the backfill needs ten days.
+        assert start <= reg - pd.Timedelta(days=CRYPTO_24H.window_days)

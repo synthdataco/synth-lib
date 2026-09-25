@@ -34,7 +34,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -209,8 +209,15 @@ def generate_baseline(
             print(f"  baseline {asset} tl={comp.time_length}", flush=True)
 
 
-def score(name: str, predictions: Path, window_end: pd.Timestamp, window_days: int, charts: Path) -> dict:
-    result = evaluate_candidate(name, predictions, window_end, window_days, charts)
+def score(
+    name: str,
+    predictions: Path,
+    window_end: pd.Timestamp,
+    window_days: int,
+    charts: Path,
+    simulate_registration: datetime | None = None,
+) -> dict:
+    result = evaluate_candidate(name, predictions, window_end, window_days, charts, simulate_registration)
     mrt = result["mean_reward_vs_top"]
     result["score"] = round(100 * mrt, 1) if mrt is not None else None
     ranks = [c["rank"] for c in result["per_competition"].values() if c["rank"] is not None]
@@ -221,7 +228,9 @@ def score(name: str, predictions: Path, window_end: pd.Timestamp, window_days: i
     return result
 
 
-def verdict_payload(result: dict, sha: str | None, window: tuple[str, str], seed: int) -> dict:
+def verdict_payload(
+    result: dict, sha: str | None, window: tuple[str, str], seed: int, simulate_registration: datetime | None
+) -> dict:
     return {
         "score": result["score"],
         "mean_competition_rank": result["mean_competition_rank"],
@@ -245,6 +254,10 @@ def verdict_payload(result: dict, sha: str | None, window: tuple[str, str], seed
         # What a stochastic champion was seeded with. Without it "seeded" is unverifiable and
         # a re-score of this window cannot reproduce the number above.
         "seed": seed,
+        # A Score with a simulated registration includes the onboarding backfill every real
+        # miner pays once. It answers a different question from the steady-state Score and the
+        # two must never be read as the same number.
+        "simulate_registration": simulate_registration.isoformat() if simulate_registration else None,
     }
 
 
@@ -277,6 +290,14 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         help="dotted module path or file path exposing simulate() (default: the packaged control)",
     )
     ap.add_argument(
+        "--simulate-registration",
+        action="store_true",
+        help="score the champion as a miner that registered on --window-start: its rows before that "
+        "day are dropped, so the validator's moving average treats it as a late joiner and backfills "
+        "the preceding window at the field's worst score. This is what a champion earns in its first "
+        "days live, and it is NOT comparable to a Score without it — give it its own --tag.",
+    )
+    ap.add_argument(
         "--seed",
         type=int,
         default=DEFAULT_SEED,
@@ -293,8 +314,10 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     window_days = (date.fromisoformat(args.window_end) - date.fromisoformat(args.window_start)).days
     data_root = args.data_root.resolve()
 
+    # The registration day is the window's first: the champion is deployed as the window opens.
+    sim_reg = pd.Timestamp(args.window_start, tz="UTC").to_pydatetime() if args.simulate_registration else None
     print("building the offline scores bundle for the scoring window (network, resumable)...", flush=True)
-    prepare_offline_bundle(window_end, window_days)  # also exports SYNTH_BACKTESTER_OFFLINE_DATA_ROOT
+    prepare_offline_bundle(window_end, window_days, simulate_registration=sim_reg)
 
     legs = args.legs or sorted(p.name for p in campaign_dir.iterdir() if p.is_dir() and (p / "CHAMPION").exists())
     work = Path(tempfile.mkdtemp(prefix=f"verdict-{args.campaign}-"))
@@ -335,8 +358,8 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             lead_in=not args.no_lead_in,
         )
         print(f"[{leg}] scoring", flush=True)
-        result = score(leg, clone / "predictions", window_end, window_days, campaign_dir / leg / charts_name)
-        out.write_text(json.dumps(verdict_payload(result, champion.sha, window, args.seed), indent=2) + "\n")
+        result = score(leg, clone / "predictions", window_end, window_days, campaign_dir / leg / charts_name, sim_reg)
+        out.write_text(json.dumps(verdict_payload(result, champion.sha, window, args.seed, sim_reg), indent=2) + "\n")
         print(f"[{leg}] score={result['score']} mean_rank={result['mean_competition_rank']} -> {out}", flush=True)
         if not args.keep_work:
             shutil.rmtree(clone, ignore_errors=True)
@@ -351,9 +374,11 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         generate_baseline(
             baseline_modeling, data_root, predictions, window, seed=args.seed, lead_in=not args.no_lead_in
         )
-        result = score("synth_default", predictions, window_end, window_days, baseline_out.parent / charts_name)
+        result = score(
+            "synth_default", predictions, window_end, window_days, baseline_out.parent / charts_name, sim_reg
+        )
         baseline_out.parent.mkdir(parents=True, exist_ok=True)
-        baseline_out.write_text(json.dumps(verdict_payload(result, None, window, args.seed), indent=2) + "\n")
+        baseline_out.write_text(json.dumps(verdict_payload(result, None, window, args.seed, sim_reg), indent=2) + "\n")
         print(
             f"[baseline] score={result['score']} mean_rank={result['mean_competition_rank']} -> {baseline_out}",
             flush=True,
