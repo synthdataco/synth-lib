@@ -10,7 +10,7 @@ For each asset in the competition it builds a minimal per-asset BacktestResult
 (mirroring how backtest() builds prompt_df at its "Step 12"): the API CRPS is
 grouped per (scored_time, asset, time_length, time_increment) through
 _compute_prompt_score_stats_for_group to produce new_prompt_scores /
-percentile90 / lowest_score. The union of scored_times drives the reconstruction
+percentile95 / lowest_score. The union of scored_times drives the reconstruction
 rounds. compute_combined_smoothed_scores then applies ASSET_COEFFICIENTS,
 per-miner normalization and the single cross-asset softmax — exactly the real
 validator path.
@@ -77,7 +77,7 @@ def build_asset_result(scores: pd.DataFrame, asset: str) -> BacktestResult:
     Mirrors backtest()'s "Step 12": groups crps per
     (scored_time, asset, time_length, time_increment) through
     _compute_prompt_score_stats_for_group to attach new_prompt_scores,
-    percentile90 and lowest_score. smoothed_scores carries only the unique
+    percentile95 and lowest_score. smoothed_scores carries only the unique
     scored_times as `updated_at` so compute_combined_smoothed_scores has
     timestamps to iterate.
     """
@@ -86,7 +86,7 @@ def build_asset_result(scores: pd.DataFrame, asset: str) -> BacktestResult:
         ["scored_time", "asset", "time_length", "time_increment"], group_keys=False
     )["crps"].apply(_compute_prompt_score_stats_for_group)
     df["new_prompt_scores"] = stats["new_prompt_scores"]
-    df["percentile90"] = stats["percentile90"]
+    df["percentile95"] = stats["percentile95"]
     df["lowest_score"] = stats["lowest_score"]
 
     smoothed = pd.DataFrame(

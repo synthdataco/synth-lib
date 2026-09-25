@@ -44,19 +44,19 @@ def _compute_prompt_scores_for_group(crps: pd.Series) -> pd.Series:
 
 
 def _compute_prompt_score_stats_for_group(crps: pd.Series) -> pd.DataFrame:
-    """Like _compute_prompt_scores_for_group but also returns percentile90 and
+    """Like _compute_prompt_scores_for_group but also returns percentile95 and
     lowest_score so synth.prepare_df_for_moving_average can apply its worst-score
-    backfill rule to new miners.
+    backfill rule to new miners. The name must match what that function reads.
     """
     # The validator also returns a per-row was_capped flag, which it persists so the outlier
     # clip rate stays monitorable. Nothing downstream here reads it.
-    capped, p90, low, _was_capped = compute_prompt_scores(crps.values)
+    capped, p95, low, _was_capped = compute_prompt_scores(crps.values)
     n = len(crps)
     if capped is None:
         return pd.DataFrame(
             {
                 "new_prompt_scores": [0.0] * n,
-                "percentile90": [0.0] * n,
+                "percentile95": [0.0] * n,
                 "lowest_score": [0.0] * n,
             },
             index=crps.index,
@@ -64,7 +64,7 @@ def _compute_prompt_score_stats_for_group(crps: pd.Series) -> pd.DataFrame:
     return pd.DataFrame(
         {
             "new_prompt_scores": capped,
-            "percentile90": [float(p90)] * n,
+            "percentile95": [float(p95)] * n,
             "lowest_score": [float(low)] * n,
         },
         index=crps.index,
@@ -149,7 +149,7 @@ def compute_combined_smoothed_scores(
     if cutoff_days is None:
         cutoff_days = competition.window_days
 
-    # Concat per-asset prompt_df frames. percentile90 and lowest_score must be
+    # Concat per-asset prompt_df frames. percentile95 and lowest_score must be
     # carried through so synth's prepare_df_for_moving_average can backfill new
     # miners (it silently skips backfill when those columns are absent).
     cols = [
@@ -157,7 +157,7 @@ def compute_combined_smoothed_scores(
         "miner_uid",
         "asset",
         "new_prompt_scores",
-        "percentile90",
+        "percentile95",
         "lowest_score",
     ]
     frames = []

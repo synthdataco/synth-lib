@@ -387,14 +387,14 @@ def backtest(
         ].copy()
 
     # Step 12: apply prompt score calculation across all scores. We also persist
-    # percentile90 and lowest_score per group because prepare_df_for_moving_average
+    # percentile95 and lowest_score per group because prepare_df_for_moving_average
     # uses them to compute the worst-score backfill for new miners (silently
     # skips backfill when those columns are absent).
     _stats = all_scores.groupby(
         ["scored_time", "asset", "time_length", "time_increment"], group_keys=False
     )["crps"].apply(_compute_prompt_score_stats_for_group)
     all_scores["new_prompt_scores"] = _stats["new_prompt_scores"]
-    all_scores["percentile90"] = _stats["percentile90"]
+    all_scores["percentile95"] = _stats["percentile95"]
     all_scores["lowest_score"] = _stats["lowest_score"]
 
     # Step 13: build rewards history entries for LLM miner
