@@ -45,6 +45,7 @@ from synth_lib.backtester.result import BacktestResult, NoScoresAvailable
 from synth_lib.backtester.config import VOL_CRPS_1H_DATE
 from synth.validator.crps_calculation import calculate_crps_for_miner, calculate_total_score_for_miner
 from synth_lib.backtester.scoring import (
+    _compute_prompt_score_stats_for_group,
     _compute_prompt_scores_for_group,
     _score_single_prompt,
     calculate_smoothed_scores,
@@ -1577,3 +1578,35 @@ class TestVolCrpsCutover:
     def test_the_24h_competitions_have_no_volatility_term(self):
         """No vol_scoring_blocks, so the cutover date never applies to them."""
         assert not CRYPTO_24H.vol_scoring_blocks
+
+
+class TestOutlierCapCutover:
+    """The validator has clipped raw CRPS above 10x the field median only since 2026-09-04."""
+
+    # One outlier far above the median, which the cap moves and the pre-cap formula does not.
+    CRPS = pd.Series([10.0, 11.0, 12.0, 13.0, 5000.0])
+
+    def test_before_the_cutover_nothing_is_clipped(self):
+        stats = _compute_prompt_score_stats_for_group(self.CRPS, capped_era=False)
+        assert stats["new_prompt_scores"].max() == pytest.approx(5000.0 - 10.0)
+
+    def test_from_the_cutover_the_outlier_is_clipped(self):
+        stats = _compute_prompt_score_stats_for_group(self.CRPS, capped_era=True)
+        median = float(np.median(self.CRPS.values))
+        assert stats["new_prompt_scores"].max() == pytest.approx(median * 10.0 - 10.0)
+
+    def test_a_well_behaved_field_is_identical_either_side(self):
+        """The cap only bites above 10x the median, so it must not move an ordinary prompt."""
+        ordinary = pd.Series([10.0, 11.0, 12.0, 13.0, 14.0])
+        before = _compute_prompt_score_stats_for_group(ordinary, capped_era=False)
+        after = _compute_prompt_score_stats_for_group(ordinary, capped_era=True)
+        pd.testing.assert_frame_equal(before, after)
+
+    def test_a_miss_is_filled_with_the_p95_on_both_sides(self):
+        """-1 is a missed response, not a score; both eras fill it rather than ranking it."""
+        with_miss = pd.Series([10.0, 11.0, 12.0, -1.0])
+        for era in (False, True):
+            stats = _compute_prompt_score_stats_for_group(with_miss, capped_era=era)
+            assert stats["new_prompt_scores"].iloc[3] == pytest.approx(
+                stats["percentile95"].iloc[0] - stats["lowest_score"].iloc[0]
+            )

@@ -29,12 +29,14 @@ from synth_lib.backtester.config import (
     _COMBINED_EMPTY_COLS,
     _LEGACY_FALLBACK_WINDOW_DAYS,
     UTC,
+    OUTLIER_CAP_DATE,
     VOL_CRPS_1H_DATE,
     competition_for,
     slug_for,
 )
 from synth_lib.backtester.loading import load_prediction
 from synth_lib.backtester.miner_data_handler import _BACKTEST_MDH
+from synth_lib.backtester.prompt_scores_legacy import compute_prompt_scores_pre_cap
 from synth_lib.backtester.result import BacktestResult
 
 
@@ -46,14 +48,18 @@ def _compute_prompt_scores_for_group(crps: pd.Series) -> pd.Series:
     return pd.Series(result[0], index=crps.index)
 
 
-def _compute_prompt_score_stats_for_group(crps: pd.Series) -> pd.DataFrame:
+def _compute_prompt_score_stats_for_group(crps: pd.Series, capped_era: bool = True) -> pd.DataFrame:
     """Like _compute_prompt_scores_for_group but also returns percentile95 and
     lowest_score so synth.prepare_df_for_moving_average can apply its worst-score
     backfill rule to new miners. The name must match what that function reads.
+
+    `capped_era` selects the validator's scoring as of the group's scored_time: the outlier clip
+    has only existed since OUTLIER_CAP_DATE.
     """
     # The validator also returns a per-row was_capped flag, which it persists so the outlier
     # clip rate stays monitorable. Nothing downstream here reads it.
-    capped, p95, low, _was_capped = compute_prompt_scores(crps.values)
+    scorer = compute_prompt_scores if capped_era else compute_prompt_scores_pre_cap
+    capped, p95, low, _was_capped = scorer(crps.values)
     n = len(crps)
     if capped is None:
         return pd.DataFrame(

@@ -53,6 +53,12 @@ HF_CRPS_FORMULA_CHANGE_DATE = datetime(2026, 3, 11, tzinfo=UTC)
 # kinds, and scoring them all one way puts the candidate and the archived field on different rules.
 VOL_CRPS_1H_DATE = datetime(2026, 9, 22, 13, 16, 32, tzinfo=UTC)
 
+# When the mainnet validator started clipping raw CRPS above 10x the field median and taking
+# the p95 that fills missed responses over the unclipped scores. Same rule as above: the
+# formula that applied to a prompt is the one deployed at its `scored_time`. This one reaches
+# every competition, not just crypto-1h, because it sits in compute_prompt_scores.
+OUTLIER_CAP_DATE = datetime(2026, 9, 4, 9, 45, tzinfo=UTC)  # 11:45 GMT+2
+
 # On-chain emission normalization for the USD earnings estimate. A miner's
 # realized emission is not exactly proportional to the reward_weight the
 # validator sets: Yuma consensus (trust/clipping) and the presence of other
