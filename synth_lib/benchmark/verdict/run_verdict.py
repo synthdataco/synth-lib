@@ -8,7 +8,9 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      built, and that needs the network. It fetches only pinned packages, never prices.
   4. Phase 2 (network=none): one sandbox run per (competition, asset) generating predictions.
      The data root is mounted read-only at /workspace/market_data; the model itself only ever
-     receives the pre-prompt context Series (see generate_predictions.py).
+     receives the pre-prompt context Series (see generate_predictions.py). Predictions are
+     written to a cache mounted at /workspace/predictions that outlives the workspace, one file
+     per day, so a re-score of a window already generated skips straight to scoring.
   5. On the host: evaluate_candidate() against the offline bundle -> per-competition rank +
      simulated emissions -> Score = 100 x mean over competitions of reward_vs_top (see
      evaluate.reward_metrics; the unweighted mean mirrors the subnet's 1/3-per-competition
@@ -58,6 +60,9 @@ SANDBOX_CPUS = 12
 CADENCE_MINUTES = {86_400: 60, 3_600: 10}
 # Written into the workspace for --live-prompts; the generator reads one file per (asset, format).
 PROMPT_TIMES_DIR = "prompt_times"
+# A prompt's paths depend on the champion's code and on the seed it was generated with, so both
+# are in the cache path: nothing else distinguishes two runs of the same window.
+DEFAULT_PREDICTIONS_CACHE = Path("predictions_cache")
 
 # Constitution rule 7: a champion that uses randomness seeds every generator from this, and it
 # is set only here, at evaluation. Absent during a campaign, so an agent's own runs vary.
@@ -134,6 +139,16 @@ def docker_limits() -> tuple[int, int]:
     return min(SANDBOX_CPUS, int(ncpu)), min(SANDBOX_MEMORY_GB, int(mem_bytes) // 1024**3)
 
 
+def predictions_cache(root: Path, champion: str, seed: int, live_prompts: bool) -> Path:
+    """Where one champion's generated paths live, across runs.
+
+    --live-prompts gets its own subtree. Both modes answer the same window, so their prompts sit
+    minutes apart and the nearest-match in scoring would happily serve one run the other's
+    predictions — which is exactly the difference the flag exists to measure.
+    """
+    return root / champion / f"seed={seed}" / ("live-prompts" if live_prompts else "cadence-grid")
+
+
 def sandbox(
     workspace: Path,
     data_root: Path,
@@ -144,6 +159,7 @@ def sandbox(
     cpus: int = SANDBOX_CPUS,
     memory_gb: int = SANDBOX_MEMORY_GB,
     env: dict[str, str] | None = None,
+    predictions: Path | None = None,
 ) -> list[str]:
     return sandbox_cmd(
         workspace=workspace,
@@ -156,6 +172,7 @@ def sandbox(
         env=env or {},
         inner_cmd=inner,
         gpus=gpus,
+        predictions=predictions,
     )
 
 
@@ -174,6 +191,7 @@ def generate_all(
     seed: int,
     lead_in: bool = True,
     prompt_starts: dict[tuple[str, int], list[pd.Timestamp]] | None = None,
+    cache: Path | None = None,
 ) -> None:
     """One --network none sandbox run per (competition, asset).
 
@@ -210,6 +228,7 @@ def generate_all(
                         cpus=limits[0],
                         memory_gb=limits[1],
                         env={SEED_ENV: str(seed)},
+                        predictions=cache,
                     ),
                     f"generate {asset} tl={comp.time_length}",
                 )
@@ -236,6 +255,7 @@ def generate_baseline(
     wrong, so read the baseline's verdict with suspicion and drop it from the article if broken."""
     if prompt_starts is not None:
         write_prompt_times(out_dir.parent, prompt_starts)
+    out_dir.mkdir(parents=True, exist_ok=True)
     for comp in COMPETITIONS:
         for asset in comp.asset_list:
             times = out_dir.parent / PROMPT_TIMES_DIR / f"{asset}_{comp.time_length}.json"
@@ -375,6 +395,14 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         help=f"value of {SEED_ENV} for generation, recorded in the verdict. Constitution rule 7 "
         "has a stochastic champion seed every generator from it, so a re-score reproduces",
     )
+    ap.add_argument(
+        "--predictions-cache",
+        type=Path,
+        default=DEFAULT_PREDICTIONS_CACHE,
+        help="where generated paths are kept between runs, under <sha>/seed=<n>/<prompt mode>. A day already "
+        "covering every prompt of a re-score is reused instead of regenerated. Roughly 5 GB per "
+        "champion per 10-day window, so prune it rather than letting it grow",
+    )
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--keep-work", action="store_true", help="keep clones + predictions for inspection")
     args = ap.parse_args()
@@ -422,6 +450,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             f"{leg} uv sync",
         )
         print(f"[{leg}] phase 2: generation (--network none)", flush=True)
+        cache = predictions_cache(args.predictions_cache, champion.sha, args.seed, args.live_prompts)
         generate_all(
             clone,
             data_root,
@@ -432,9 +461,10 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             seed=args.seed,
             lead_in=not args.no_lead_in,
             prompt_starts=prompt_starts,
+            cache=cache,
         )
         print(f"[{leg}] scoring", flush=True)
-        result = score(leg, clone / "predictions", window_end, window_days, verdict_dir, sim_reg)
+        result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg)
         payload = verdict_payload(result, champion.sha, window, args.seed, sim_reg, args.live_prompts)
         verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n")
@@ -448,7 +478,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print(f"[baseline] {baseline_out} already exists — SKIPPING (pass --force to rescore)", flush=True)
     elif not args.skip_baseline:
         baseline_modeling = baseline_modeling_path(args.baseline_module)
-        predictions = work / "baseline-predictions"
+        predictions = predictions_cache(args.predictions_cache, "synth_default", args.seed, args.live_prompts)
         print("[baseline] generating (host)", flush=True)
         generate_baseline(
             baseline_modeling,
@@ -467,8 +497,6 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             f"[baseline] score={result['score']} mean_rank={result['mean_competition_rank']} -> {baseline_out}",
             flush=True,
         )
-        if not args.keep_work:
-            shutil.rmtree(predictions, ignore_errors=True)
 
     if not args.keep_work:
         shutil.rmtree(work, ignore_errors=True)

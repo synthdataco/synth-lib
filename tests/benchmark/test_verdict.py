@@ -719,3 +719,34 @@ def test_live_prompt_starts_take_the_scored_set_not_the_issued_one(monkeypatch):
     # scores are keyed on scored_time, so the query opens one horizon after the first prompt
     assert ("BTC", 3_600, pd.Timestamp("2026-08-30T01:00:00Z").to_pydatetime()) in asked
     assert ("BTC", 86_400, pd.Timestamp("2026-08-31T00:00:00Z").to_pydatetime()) in asked
+
+
+def test_the_two_prompt_modes_never_share_a_cache(tmp_path):
+    """Both modes answer the same window minutes apart, and scoring matches the nearest prompt
+    within half an hour — one cache would let a grid run score the other run's predictions, which
+    is the whole difference the flag measures."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    grid = rv.predictions_cache(tmp_path, "abc1234", 0, live_prompts=False)
+    live = rv.predictions_cache(tmp_path, "abc1234", 0, live_prompts=True)
+    assert grid != live
+    # …but a champion and a seed do define one: a re-score of the same window reuses it
+    assert rv.predictions_cache(tmp_path, "abc1234", 0, live_prompts=True) == live
+    assert rv.predictions_cache(tmp_path, "abc1234", 7, live_prompts=True) != live
+    assert rv.predictions_cache(tmp_path, "def5678", 0, live_prompts=True) != live
+
+
+def test_the_cache_is_mounted_where_generation_writes(tmp_path, monkeypatch):
+    """The workspace is a throwaway clone. Paths only survive it if the sandbox writes them
+    through a mount that outlives it, at the path --out-dir resolves to."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    commands: list[str] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: commands.append(" ".join(cmd)))
+    cache = tmp_path / "cache"
+    rv.generate_all(
+        tmp_path, tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), gpus=False, limits=(2, 4), seed=7, cache=cache
+    )
+
+    assert commands and all(f"{cache.resolve()}:/workspace/predictions:rw" in cmd for cmd in commands)
+    assert all("--out-dir predictions" in cmd for cmd in commands)
