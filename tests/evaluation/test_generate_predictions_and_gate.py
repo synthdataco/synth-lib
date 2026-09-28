@@ -108,6 +108,16 @@ def test_prompt_grid_keeps_last_prompt_on_unaligned_end():
     assert [t.hour for t in grid] == [0, 1, 2]  # 02:00 kept despite the unaligned end
 
 
+def test_explicit_prompt_times_replace_the_grid_and_stay_inside_the_window():
+    """The validator's kept requests sit at arbitrary minutes, so the list is not a grid — but it
+    is still bounded by the window, and anything outside it has no realized path yet."""
+    times = [pd.Timestamp(t, tz="UTC") for t in ("2026-07-29 23:50", "2026-07-30 00:04", "2026-07-30 02:31")]
+    grid = prompt_grid(
+        pd.Timestamp("2026-07-30", tz="UTC"), pd.Timestamp("2026-07-30 02:30", tz="UTC"), 60, prompt_times=times
+    )
+    assert [str(t) for t in grid] == ["2026-07-30 00:04:00+00:00"]
+
+
 def test_store_root_resolves_under_prices(tmp_path):
     (tmp_path / "prices" / "BTC" / "1m").mkdir(parents=True)
     assert store_root(tmp_path, "BTC") == tmp_path / "prices" / "BTC" / "1m"

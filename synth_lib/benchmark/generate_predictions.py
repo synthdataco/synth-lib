@@ -80,11 +80,23 @@ def load_minute_prices(data_root: Path, asset: str, start: pd.Timestamp, end: pd
     return frame.loc[start:end]
 
 
-def prompt_grid(window_start: pd.Timestamp, window_end: pd.Timestamp, cadence_minutes: int) -> list[pd.Timestamp]:
+def prompt_grid(
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    cadence_minutes: int,
+    prompt_times: list[pd.Timestamp] | None = None,
+) -> list[pd.Timestamp]:
     """Prompts in [start, end). Filtered with `t < window_end` rather than [:-1] so a window_end
-    not aligned to the cadence does not drop the last valid prompt."""
-    grid = pd.date_range(window_start, window_end, freq=f"{cadence_minutes}min", tz="UTC")
-    return [t for t in grid if t < window_end]
+    not aligned to the cadence does not drop the last valid prompt.
+
+    `prompt_times` replaces the even grid with an explicit list — the start_times the validator
+    actually prompted at, which sit at arbitrary minutes."""
+    grid = (
+        prompt_times
+        if prompt_times is not None
+        else pd.date_range(window_start, window_end, freq=f"{cadence_minutes}min", tz="UTC")
+    )
+    return [t for t in grid if window_start <= t < window_end]
 
 
 def generate(
@@ -98,10 +110,11 @@ def generate(
     time_increment: int,
     time_length: int,
     num_simulations: int = DEFAULT_NUM_SIMULATIONS,
+    prompt_times: list[pd.Timestamp] | None = None,
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     count = 0
-    for t in prompt_grid(window_start, window_end, cadence_minutes):
+    for t in prompt_grid(window_start, window_end, cadence_minutes, prompt_times):
         # THE no-lookahead line: only minutes <= t reach the model, whatever the frame holds.
         context = price_frame.loc[t - pd.Timedelta(minutes=CONTEXT_MINUTES) : t]
         out = simulate_fn(
@@ -145,9 +158,18 @@ def main() -> None:
     ap.add_argument("--time-increment", type=int, default=300)
     ap.add_argument("--time-length", type=int, default=86_400)
     ap.add_argument("--num-simulations", type=int, default=DEFAULT_NUM_SIMULATIONS)
+    ap.add_argument(
+        "--prompt-times",
+        type=Path,
+        default=None,
+        help="JSON list of ISO start_times to generate at, instead of the --cadence-minutes grid",
+    )
     args = ap.parse_args()
 
     start, end = _utc(args.window_start), _utc(args.window_end)
+    prompt_times = None
+    if args.prompt_times is not None:
+        prompt_times = [_utc(t) for t in json.loads(args.prompt_times.read_text())]
     prices = load_minute_prices(args.data_root, args.asset, start - pd.Timedelta(minutes=CONTEXT_MINUTES), end)
     n = generate(
         load_simulate(args.modeling),
@@ -160,6 +182,7 @@ def main() -> None:
         time_increment=args.time_increment,
         time_length=args.time_length,
         num_simulations=args.num_simulations,
+        prompt_times=prompt_times,
     )
     print(f"{args.asset} tl={args.time_length}: {n} predictions")
 

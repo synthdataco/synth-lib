@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -483,7 +485,9 @@ def test_the_verdict_records_the_seed(tmp_path):
         "mean_competition_percentile": 0.8,
         "per_competition": {},
     }
-    payload = rv.verdict_payload(result, "abc1234", ("2026-08-30", "2026-09-09"), seed=7, simulate_registration=None)
+    payload = rv.verdict_payload(
+        result, "abc1234", ("2026-08-30", "2026-09-09"), seed=7, simulate_registration=None, live_prompts=False
+    )
     assert payload["seed"] == 7
 
 
@@ -525,6 +529,7 @@ def test_simulate_registration_reaches_the_backtester_and_the_verdict(monkeypatc
         ("2026-08-30", "2026-09-09"),
         seed=0,
         simulate_registration=reg,
+        live_prompts=False,
     )
     assert payload["simulate_registration"] == reg.isoformat()
 
@@ -647,3 +652,70 @@ def test_the_verdict_directory_holds_the_frames_the_comparison_needs(monkeypatch
     assert set(pd.read_parquet(out / frames["field_rewards"])["miner_uid"]) == {128, 999}
     # the validator's own weight for the same miner in the same round, to check the rest against
     assert pd.read_parquet(out / frames["live_rewards"])["reward_weight"].tolist() == [0.42]
+
+
+def test_live_prompts_reach_the_sandbox(monkeypatch, tmp_path):
+    """The validator keeps one request per asset per bucket, at an arbitrary minute inside it. A
+    cadence grid matches that density but not its phase, so the candidate answers a prompt the field
+    never saw. The sandbox has no network, so the start_times have to be written into it."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    starts = {("BTC", 3_600): [pd.Timestamp("2026-08-30T00:04:00Z"), pd.Timestamp("2026-08-30T00:17:00Z")]}
+
+    commands: list[str] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: commands.append(" ".join(cmd)))
+    rv.generate_all(
+        tmp_path,
+        tmp_path,
+        tmp_path,
+        ("2026-08-30", "2026-09-09"),
+        gpus=False,
+        limits=(2, 4),
+        seed=7,
+        prompt_starts=starts,
+    )
+
+    written = tmp_path / rv.PROMPT_TIMES_DIR / "BTC_3600.json"
+    assert json.loads(written.read_text()) == ["2026-08-30T00:04:00+00:00", "2026-08-30T00:17:00+00:00"]
+    assert any(f"--prompt-times {rv.PROMPT_TIMES_DIR}/BTC_3600.json" in cmd for cmd in commands)
+
+
+def test_generation_without_live_prompts_writes_no_prompt_times(tmp_path, monkeypatch):
+    """The grid stays the default: the flag must not change an unflagged verdict."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    commands: list[str] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: commands.append(" ".join(cmd)))
+    rv.generate_all(tmp_path, tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), gpus=False, limits=(2, 4), seed=7)
+
+    assert not (tmp_path / rv.PROMPT_TIMES_DIR).exists()
+    assert commands and not any("--prompt-times" in cmd for cmd in commands)
+
+
+def test_live_prompt_starts_take_the_scored_set_not_the_issued_one(monkeypatch):
+    """The validator issues ten prompts for every one it keeps — /validation/prompts returns all of
+    them. Generating on the issued set would multiply the sandbox bill for prompts nobody scored,
+    so the start_times come from the scores, whose scored_time - time_length is the prompt's own."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    asked: list[tuple] = []
+
+    def fake_scores(start, end, asset, time_length, time_increment):
+        asked.append((asset, time_length, start))
+        return pd.DataFrame(
+            {
+                "start_time": pd.to_datetime(
+                    ["2026-08-29T23:50:00Z", "2026-08-30T00:04:00Z", "2026-08-30T00:04:00Z", "2026-09-09T00:11:00Z"],
+                    utc=True,
+                )
+            }
+        )
+
+    monkeypatch.setattr(rv, "get_miner_scores", fake_scores)
+    starts = rv.live_prompt_starts(("2026-08-30", "2026-09-09"), lead_in=False)
+
+    # deduped, and clipped to the generation range: 08-29 precedes it, 09-09 is the exclusive end
+    assert starts[("BTC", 3_600)] == [pd.Timestamp("2026-08-30T00:04:00Z")]
+    # scores are keyed on scored_time, so the query opens one horizon after the first prompt
+    assert ("BTC", 3_600, pd.Timestamp("2026-08-30T01:00:00Z").to_pydatetime()) in asked
+    assert ("BTC", 86_400, pd.Timestamp("2026-08-31T00:00:00Z").to_pydatetime()) in asked
