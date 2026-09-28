@@ -35,8 +35,8 @@ from synth_lib.backtester.loading import (
 from synth_lib.backtester.preparation import (
     _fill_gaps_from_realized_paths,
     _find_prediction_file,
-    _parse_prediction_filename_time,
     _slice_real_prices,
+    build_prediction_index,
 )
 from synth_lib.backtester.plots.crps import (
     plot_crps_by_day,
@@ -111,15 +111,15 @@ def backtest(
     if scoring_intervals is None:
         scoring_intervals = competition.scoring_intervals
 
-    # Discover prediction files and their date range
+    # Discover predictions and their date range
     predictions_root = predictions_dir or (DEFAULT_MINER_OUTPUT_ROOT / miner_name / "predictions")
-    prediction_files = sorted(p for p in predictions_root.glob("**/*.json") if not p.name.startswith("_"))
-    pred_times = [_parse_prediction_filename_time(p) for p in prediction_files]
-    pred_times = [t for t in pred_times if t is not None]
+    prediction_index = build_prediction_index(predictions_root)
+    pred_times = [t.to_pydatetime() for prompts in prediction_index.values() for t in prompts]
     if not pred_times:
         raise FileNotFoundError(
-            f"No valid prediction files found in {predictions_root}. "
-            "Expected filenames like 2026-03-28_00:00:00Z_BTC_86400.json"
+            f"No predictions found in {predictions_root}. Expected the day layout "
+            "<asset>/<time_length>_<time_increment>/date=*.npy, or one JSON per prompt "
+            "named like 2026-03-28_00:00:00Z_BTC_86400.json"
         )
     pred_start = min(pred_times)
     pred_end = max(pred_times)
@@ -257,7 +257,7 @@ def backtest(
         for _, asset_val, scored_time, time_len, time_incr in (
             scores_subset[["asset", "scored_time", "time_length", "time_increment"]].drop_duplicates().itertuples()
         ):
-            file_path = _find_prediction_file(prediction_files, start_time, asset_val, time_len)
+            file_path = _find_prediction_file(prediction_index, start_time, asset_val, time_len)
 
             # Pre-slice real prices in the main process (avoids pickling DataFrames)
             real_prices: list[float] = []

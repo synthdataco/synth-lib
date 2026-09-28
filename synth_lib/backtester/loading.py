@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 from tenacity import (
@@ -28,6 +29,7 @@ from synth_lib.backtester.config import (
     competition_for,
     slug_for,
 )
+from synth_lib.backtester.preparation import PredictionRef
 from synth_lib.preparation.config import SYNTHDATA_API_BASE
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.preparation.price_client import build_price_client
@@ -264,16 +266,31 @@ def get_daily_miner_pool_usd(
     return pd.Series(merged).sort_index()
 
 
-def load_prediction(path: Path) -> dict:
+def load_prediction(ref: PredictionRef | Path) -> dict:
     """
 
     Handles:
+      - Day file: `ref.row` of a float32 (prompts, simulations, steps) .npy, with the
+        metadata from the .json index beside it. Memory-mapped, so a worker reads only
+        its own prompt out of a file holding the whole day.
       - ArtifactManager format: {"simulation_input": {...}, "prediction": [meta, meta, path, ...]}
       - Notebook flat format:   {"start_timestamp": int, "paths": [...], ...}
 
     Always returns dict with keys: paths, num_simulations, num_steps, asset,
     time_increment, time_length.
     """
+    path = ref.path if isinstance(ref, PredictionRef) else ref
+    if isinstance(ref, PredictionRef) and ref.row is not None:
+        meta = json.loads(path.with_suffix(".json").read_text())
+        return {
+            "start_timestamp": meta["start_times"][ref.row],
+            "asset": meta["asset"],
+            "time_increment": meta["time_increment"],
+            "time_length": meta["time_length"],
+            "num_simulations": meta["num_simulations"],
+            "num_steps": meta["num_steps"],
+            "paths": np.load(path, mmap_mode="r")[ref.row],
+        }
     raw = json.loads(path.read_text())
     if "simulation_input" in raw:
         sim = raw["simulation_input"]
