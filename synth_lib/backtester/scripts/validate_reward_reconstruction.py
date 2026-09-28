@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from synth_lib.backtester.config import SLUG_TO_COMPETITION
+from synth_lib.backtester.config import OUTLIER_CAP_DATE, SLUG_TO_COMPETITION
 from synth_lib.backtester.loading import get_miner_scores, get_rewards_history
 from synth_lib.backtester.result import BacktestResult
 from synth_lib.backtester.scoring import (
@@ -56,13 +56,16 @@ WEIGHT_MATCH_TOL = 1e-3
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--competition", required=True,
-                        choices=sorted(SLUG_TO_COMPETITION.keys()),
-                        help="Single competition slug (required)")
-    parser.add_argument("--from", dest="from_date", required=True,
-                        help="Window start, YYYY-MM-DD (UTC midnight, inclusive)")
-    parser.add_argument("--to", dest="to_date", required=True,
-                        help="Window end, YYYY-MM-DD (UTC midnight, exclusive)")
+    parser.add_argument(
+        "--competition",
+        required=True,
+        choices=sorted(SLUG_TO_COMPETITION.keys()),
+        help="Single competition slug (required)",
+    )
+    parser.add_argument(
+        "--from", dest="from_date", required=True, help="Window start, YYYY-MM-DD (UTC midnight, inclusive)"
+    )
+    parser.add_argument("--to", dest="to_date", required=True, help="Window end, YYYY-MM-DD (UTC midnight, exclusive)")
     args = parser.parse_args(argv)
     args.from_dt = datetime.strptime(args.from_date, "%Y-%m-%d").replace(tzinfo=UTC)
     args.to_dt = datetime.strptime(args.to_date, "%Y-%m-%d").replace(tzinfo=UTC)
@@ -77,21 +80,31 @@ def build_asset_result(scores: pd.DataFrame, asset: str) -> BacktestResult:
     Mirrors backtest()'s "Step 12": groups crps per
     (scored_time, asset, time_length, time_increment) through
     _compute_prompt_score_stats_for_group to attach new_prompt_scores,
-    percentile95 and lowest_score. smoothed_scores carries only the unique
-    scored_times as `updated_at` so compute_combined_smoothed_scores has
+    percentile95 and lowest_score, splitting the groups on OUTLIER_CAP_DATE so each is
+    scored under the formula its scored_time was live under. smoothed_scores carries only
+    the unique scored_times as `updated_at` so compute_combined_smoothed_scores has
     timestamps to iterate.
     """
     df = scores.copy()
-    stats = df.groupby(
-        ["scored_time", "asset", "time_length", "time_increment"], group_keys=False
-    )["crps"].apply(_compute_prompt_score_stats_for_group)
+    keys = ["scored_time", "asset", "time_length", "time_increment"]
+    capped_era = pd.to_datetime(df["scored_time"], utc=True) >= OUTLIER_CAP_DATE
+    parts = [
+        df.loc[mask]
+        .groupby(keys, group_keys=False)["crps"]
+        .apply(_compute_prompt_score_stats_for_group, capped_era=era)
+        for era, mask in ((True, capped_era), (False, ~capped_era))
+        if mask.any()
+    ]
+    stats = pd.concat(parts).reindex(df.index)
     df["new_prompt_scores"] = stats["new_prompt_scores"]
     df["percentile95"] = stats["percentile95"]
     df["lowest_score"] = stats["lowest_score"]
 
-    smoothed = pd.DataFrame(
-        {"updated_at": pd.to_datetime(df["scored_time"].unique(), utc=True)}
-    ).sort_values("updated_at").reset_index(drop=True)
+    smoothed = (
+        pd.DataFrame({"updated_at": pd.to_datetime(df["scored_time"].unique(), utc=True)})
+        .sort_values("updated_at")
+        .reset_index(drop=True)
+    )
 
     return BacktestResult(
         miner_name=f"reconstruction_{asset}",
@@ -136,9 +149,7 @@ def align_weights(
         tolerance=tolerance,
     )
     merged = merged.dropna(subset=["reward_weight_real"])
-    merged["abs_err"] = (
-        merged["reward_weight_recon"] - merged["reward_weight_real"]
-    ).abs()
+    merged["abs_err"] = (merged["reward_weight_recon"] - merged["reward_weight_real"]).abs()
     return merged
 
 
@@ -147,8 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     competition = SLUG_TO_COMPETITION[args.competition]
 
     print(f"Competition: {args.competition} ({competition.label})")
-    print(f"Window: {args.from_date} → {args.to_date} "
-          f"({(args.to_dt - args.from_dt).days} days)")
+    print(f"Window: {args.from_date} → {args.to_date} " f"({(args.to_dt - args.from_dt).days} days)")
     print(f"Assets: {competition.asset_list}")
     print(f"window_days (moving-average lookback): {competition.window_days}")
     print()
@@ -180,12 +190,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     recon["updated_at"] = pd.to_datetime(recon["updated_at"], utc=True)
 
-    print(f"Fetching real /rewards/scores (prompt_name={args.competition}) ...",
-          flush=True)
+    print(f"Fetching real /rewards/scores (prompt_name={args.competition}) ...", flush=True)
     real = get_rewards_history(args.from_dt, args.to_dt, prompt_name=args.competition)
     if real.empty:
-        print("ERROR: /rewards/scores returned no rows for this window.",
-              file=sys.stderr)
+        print("ERROR: /rewards/scores returned no rows for this window.", file=sys.stderr)
         return 1
     real["updated_at"] = pd.to_datetime(real["updated_at"], utc=True)
 
@@ -199,8 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"On-chain reward rounds:    {real['updated_at'].nunique()}")
     print(f"Aligned rows (miner×round): {len(aligned)}")
     if aligned.empty:
-        print("No aligned rows within tolerance "
-              f"{ALIGN_TOLERANCE} — cannot measure weight error.")
+        print("No aligned rows within tolerance " f"{ALIGN_TOLERANCE} — cannot measure weight error.")
     else:
         mean_err = float(aligned["abs_err"].mean())
         max_err = float(aligned["abs_err"].max())
@@ -208,8 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Mean abs weight error:     {mean_err:.6e}")
         print(f"Max abs weight error:      {max_err:.6e}")
         print(f"Fraction within {WEIGHT_MATCH_TOL:g}:     {frac_within:.4f}")
-    print("\n=== Reconstructed per-round weight-sum sanity (target ≈ 1/3 = "
-          f"{1/3:.6f}) ===")
+    print("\n=== Reconstructed per-round weight-sum sanity (target ≈ 1/3 = " f"{1/3:.6f}) ===")
     print(f"Rounds:      {len(round_sums)}")
     print(f"Mean sum:    {float(round_sums.mean()):.6f}")
     print(f"Min/Max sum: {float(round_sums.min()):.6f} / {float(round_sums.max()):.6f}")
