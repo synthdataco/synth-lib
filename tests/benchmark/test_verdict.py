@@ -195,8 +195,9 @@ class _FakeResult:
     """Stand-in for synth_lib.backtester.backtest.BacktestResult.
 
     Only .summary is read by evaluate_candidate directly; .prompt_df and .smoothed_scores
-    exist purely to satisfy the BacktestResult shape passed on to (the stubbed)
-    compute_combined_smoothed_scores, which in these tests never reads them.
+    exist to satisfy the BacktestResult shape passed on to (the stubbed)
+    compute_combined_smoothed_scores, which in these tests never reads them, and to the frame
+    writer, which skips an empty one.
     """
 
     def __init__(self, mean_crps: float = 1.0, num_prompts: int = 24):
@@ -270,7 +271,7 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     monkeypatch.setattr(ev, "compute_combined_smoothed_scores", fake_compute_combined)
 
     result = ev.evaluate_candidate(
-        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, charts_dir=tmp_path / "charts"
+        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, out_dir=tmp_path / "charts"
     )
 
     assert len(backtest_calls) == 18  # 5 (crypto-24h) + 8 (com-equ-24h) + 5 (crypto-1h)
@@ -347,7 +348,7 @@ def test_all_assets_failed_competition_yields_none(monkeypatch, tmp_path):
     monkeypatch.setattr(ev, "compute_combined_smoothed_scores", fake_compute_combined)
 
     result = ev.evaluate_candidate(
-        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, charts_dir=tmp_path / "charts"
+        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, out_dir=tmp_path / "charts"
     )
 
     crypto_1h = result["per_competition"]["crypto-1h"]
@@ -435,7 +436,7 @@ def test_each_competition_writes_a_rank_chart(monkeypatch, tmp_path):
 
     charts = tmp_path / "verdict-charts"
     result = ev.evaluate_candidate(
-        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, charts_dir=charts
+        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, out_dir=charts
     )
 
     for slug in ("crypto-24h", "com-equ-24h", "crypto-1h"):
@@ -507,7 +508,7 @@ def test_simulate_registration_reaches_the_backtester_and_the_verdict(monkeypatc
         tmp_path,
         window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
         window_days=10,
-        charts_dir=tmp_path / "charts",
+        out_dir=tmp_path / "charts",
         simulate_registration=reg,
     )
     assert seen and all(s == reg for s in seen)
@@ -545,7 +546,7 @@ def test_the_default_verdict_simulates_no_registration(monkeypatch, tmp_path):
         tmp_path,
         window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
         window_days=10,
-        charts_dir=tmp_path / "charts",
+        out_dir=tmp_path / "charts",
     )
     assert seen and all(s is None for s in seen)
 
@@ -587,7 +588,7 @@ def test_the_onboarding_ramp_survives_the_combined_aggregation(monkeypatch, tmp_
         tmp_path,
         window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
         window_days=10,
-        charts_dir=tmp_path / "charts",
+        out_dir=tmp_path / "charts",
         simulate_registration=reg,
     )
     assert seen and all(s == reg for s in seen), "the combined aggregation must know too"
@@ -598,6 +599,51 @@ def test_the_onboarding_ramp_survives_the_combined_aggregation(monkeypatch, tmp_
         tmp_path,
         window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
         window_days=10,
-        charts_dir=tmp_path / "charts",
+        out_dir=tmp_path / "charts",
     )
     assert seen and all(s is None for s in seen)
+
+
+def test_the_verdict_directory_holds_the_frames_the_comparison_needs(monkeypatch, tmp_path):
+    """The verdict JSON reports one number per asset. Comparing a backtest against the same model
+    mining live needs the rows underneath it: per-prompt CRPS for the whole field, and the
+    recomputed smoothed scores and reward weights the rank is read off."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+
+    class _Result(_FakeResult):
+        def __init__(self):
+            super().__init__()
+            self.prompt_df = pd.DataFrame(
+                {
+                    "scored_time": [pd.Timestamp("2026-08-01T00:00:00Z")] * 2,
+                    "miner_uid": [128, 999],
+                    "crps": [1.5, 1.4],
+                }
+            )
+
+    monkeypatch.setattr(ev, "backtest", lambda **kw: _Result())
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", _fake_combined({128: 0.5, 999: 0.3}))
+    monkeypatch.setattr(
+        ev,
+        "get_rewards_history",
+        lambda start, end, prompt_name=None: pd.DataFrame(
+            {"updated_at": [pd.Timestamp("2026-08-01T00:00:00Z")], "miner_uid": [128], "reward_weight": [0.42]}
+        ),
+    )
+
+    out = tmp_path / "verdict-w-0917-0924"
+    result = ev.evaluate_candidate(
+        "cand", tmp_path, window_end=pd.Timestamp("2026-08-02T00:00:00Z"), window_days=1, out_dir=out
+    )
+
+    frames = result["per_competition"]["crypto-1h"]["frames"]
+    assert frames == {
+        "prompt_scores": "prompt_scores_crypto-1h.parquet",
+        "field_rewards": "field_rewards_crypto-1h.parquet",
+        "live_rewards": "live_rewards_crypto-1h.parquet",
+    }
+    prompts = pd.read_parquet(out / frames["prompt_scores"])
+    assert set(prompts["miner_uid"]) == {128, 999}  # the live uid and the candidate, one file
+    assert set(pd.read_parquet(out / frames["field_rewards"])["miner_uid"]) == {128, 999}
+    # the validator's own weight for the same miner in the same round, to check the rest against
+    assert pd.read_parquet(out / frames["live_rewards"])["reward_weight"].tolist() == [0.42]

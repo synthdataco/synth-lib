@@ -14,9 +14,10 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      evaluate.reward_metrics; the unweighted mean mirrors the subnet's 1/3-per-competition
      emission split, and the softmaxed reward_weight makes top positions worth more, which a
      rank percentile would flatten).
-  6. Write campaign_results/<campaign>/<leg>/verdict.json, and the per-competition
-     rank-evolution charts beside it in verdict-charts/ (one directory per verdict, so a
-     re-score under --tag cannot overwrite the charts of the verdict it is compared against).
+  6. Write campaign_results/<campaign>/<leg>/verdict-<tag>/ — the verdict.json, the
+     per-competition rank-evolution charts, the per-prompt CRPS frames and the recomputed field
+     rewards. One directory per verdict, so a re-score under --tag cannot overwrite the artifacts
+     of the verdict it is compared against.
 
 The synth_default baseline runs on the HOST (trusted repo code; note its known caveat below).
 
@@ -214,10 +215,10 @@ def score(
     predictions: Path,
     window_end: pd.Timestamp,
     window_days: int,
-    charts: Path,
+    out_dir: Path,
     simulate_registration: datetime | None = None,
 ) -> dict:
-    result = evaluate_candidate(name, predictions, window_end, window_days, charts, simulate_registration)
+    result = evaluate_candidate(name, predictions, window_end, window_days, out_dir, simulate_registration)
     mrt = result["mean_reward_vs_top"]
     result["score"] = round(100 * mrt, 1) if mrt is not None else None
     ranks = [c["rank"] for c in result["per_competition"].values() if c["rank"] is not None]
@@ -272,7 +273,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     ap.add_argument(
         "--tag",
         default=None,
-        help="write verdict-<tag>.json instead of verdict.json — use for extra windows (in-sample "
+        help="write into verdict-<tag>/ instead of verdict/ — use for extra windows (in-sample "
         "diagnostics) so they never overwrite the pre-registered window's canonical verdict",
     )
     ap.add_argument("--force", action="store_true", help="rescore legs whose verdict.json already exists")
@@ -326,12 +327,12 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print(f"docker daemon smaller than the reference box: sandboxes capped at {limits[0]} cpus / {limits[1]} GB")
     print(f"legs: {legs}; work dir: {work}", flush=True)
 
-    verdict_name = f"verdict-{args.tag}.json" if args.tag else "verdict.json"
-    charts_name = f"{Path(verdict_name).stem}-charts"
+    verdict_name = f"verdict-{args.tag}" if args.tag else "verdict"
     for leg in legs:
-        out = campaign_dir / leg / verdict_name
+        verdict_dir = campaign_dir / leg / verdict_name
+        out = verdict_dir / "verdict.json"
         if out.exists() and not args.force:
-            print(f"[{leg}] {verdict_name} already exists — SKIPPING (pass --force to rescore)", flush=True)
+            print(f"[{leg}] {out} already exists — SKIPPING (pass --force to rescore)", flush=True)
             continue
         champion = parse_champion(campaign_dir / leg / "CHAMPION")
         clone = work / leg
@@ -358,15 +359,17 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             lead_in=not args.no_lead_in,
         )
         print(f"[{leg}] scoring", flush=True)
-        result = score(leg, clone / "predictions", window_end, window_days, campaign_dir / leg / charts_name, sim_reg)
+        result = score(leg, clone / "predictions", window_end, window_days, verdict_dir, sim_reg)
+        verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(verdict_payload(result, champion.sha, window, args.seed, sim_reg), indent=2) + "\n")
         print(f"[{leg}] score={result['score']} mean_rank={result['mean_competition_rank']} -> {out}", flush=True)
         if not args.keep_work:
             shutil.rmtree(clone, ignore_errors=True)
 
-    baseline_out = campaign_dir / "baselines" / "synth_default" / verdict_name
+    baseline_dir = campaign_dir / "baselines" / "synth_default" / verdict_name
+    baseline_out = baseline_dir / "verdict.json"
     if not args.skip_baseline and baseline_out.exists() and not args.force:
-        print(f"[baseline] {verdict_name} already exists — SKIPPING (pass --force to rescore)", flush=True)
+        print(f"[baseline] {baseline_out} already exists — SKIPPING (pass --force to rescore)", flush=True)
     elif not args.skip_baseline:
         baseline_modeling = baseline_modeling_path(args.baseline_module)
         predictions = work / "baseline-predictions"
@@ -374,10 +377,8 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         generate_baseline(
             baseline_modeling, data_root, predictions, window, seed=args.seed, lead_in=not args.no_lead_in
         )
-        result = score(
-            "synth_default", predictions, window_end, window_days, baseline_out.parent / charts_name, sim_reg
-        )
-        baseline_out.parent.mkdir(parents=True, exist_ok=True)
+        result = score("synth_default", predictions, window_end, window_days, baseline_dir, sim_reg)
+        baseline_dir.mkdir(parents=True, exist_ok=True)
         baseline_out.write_text(json.dumps(verdict_payload(result, None, window, args.seed, sim_reg), indent=2) + "\n")
         print(
             f"[baseline] score={result['score']} mean_rank={result['mean_competition_rank']} -> {baseline_out}",
