@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,19 @@ from synth_lib.preparation.config import (
     utc_datetime,
 )
 from synth_lib.preparation.price_client import PriceClient, build_price_client
+
+logger = logging.getLogger(__name__)
+
+
+def _real_closes(path: Path) -> int:
+    """How many minutes of a stored partition carry a price. -1 when there is no partition."""
+    if not path.exists():
+        return -1
+    try:
+        return int(pd.read_parquet(path, columns=["close"])["close"].notna().sum())
+    except (OSError, ValueError, KeyError):
+        return -1  # unreadable or pre-dating the column: treat as nothing to protect
+
 
 # How far back from now the current day's fetch window has to end.
 #
@@ -106,12 +120,35 @@ class MinutePriceStore:
         frame["ingested_at"] = datetime.now(tz=UTC).replace(microsecond=0)
         frame["is_final"] = bool(is_final)
         frame = frame.reset_index(names="timestamp")
+        # A force-refresh must never trade real prices for nothing. Venues serve a limited window
+        # of history — Hyperliquid about 5000 minutes — so re-fetching a day that has aged out
+        # returns an empty frame, and writing it replaces a good partition with 1440 NaN rows.
+        # Nothing downstream can tell that apart from a day the venue never had.
+        stored = _real_closes(path)
+        fresh = int(frame["close"].notna().sum())
+        if stored > fresh:
+            logger.warning(
+                "%s %s: keeping the stored partition (%d real closes) over a refetch that returned %d",
+                self.asset,
+                day.isoformat(),
+                stored,
+                fresh,
+            )
+            return path
         frame.to_parquet(path, index=False)
         return path
 
     def refresh_recent(self, days: int = 8) -> list[Path]:
-        """Refresh recent days, including the current day."""
+        """Re-fetch the recent days the venue can still serve, including the current one.
+
+        Bounded by the client's retention: a forced re-fetch of a day the venue has dropped comes
+        back empty, and while ingest_day now refuses to overwrite real prices with it, asking at
+        all just spends requests to be told nothing.
+        """
         today = datetime.now(tz=UTC).date()
+        retention = getattr(self.client, "retention_minutes", None)
+        if retention is not None:
+            days = min(days, max(1, retention // MINUTES_PER_DAY))
         start_day = today - timedelta(days=max(1, days))
         return self.ingest_range(start_day, today, force_refresh=True)
 

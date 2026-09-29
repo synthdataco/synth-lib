@@ -17,6 +17,10 @@ from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 
 
 class PriceClient(Protocol):
+    # Minutes of history the venue still serves, or None when it serves its whole history.
+    # Callers that re-fetch settled days must not ask beyond it.
+    retention_minutes: int | None
+
     """Structural interface for minute-price fetchers."""
 
     def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame: ...

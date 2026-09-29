@@ -21,6 +21,9 @@ class HyperliquidClient:
     """Minute OHLCV from Hyperliquid, implementing the PriceClient protocol."""
 
     source_name = "hyperliquid"
+    # The venue serves only its last MAX_CANDLES minutes; asking for a day older than this
+    # returns nothing, which is indistinguishable downstream from a day that never traded.
+    retention_minutes = MAX_CANDLES
 
     def __init__(self) -> None:
         self._session = venue_session()

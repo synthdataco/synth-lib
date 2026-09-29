@@ -29,6 +29,7 @@ class BinanceClient:
     """Minute OHLCV from Binance spot, implementing the PriceClient protocol."""
 
     source_name = "binance"
+    retention_minutes = None  # serves the full history
 
     def __init__(self) -> None:
         self._session = venue_session()
