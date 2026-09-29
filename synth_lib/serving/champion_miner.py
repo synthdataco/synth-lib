@@ -18,6 +18,7 @@ annotations in this module evaluated.
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Callable
 
 from neurons.miner import Miner  # type: ignore[import-untyped]
@@ -28,6 +29,15 @@ from synth_lib.serving.serve import WARMUP_DAYS, serve_request, servable_assets,
 
 logger = logging.getLogger(__name__)
 
+# The champion reads its volatility off the most recent bars, so the age of the newest bar at
+# request time is a scoring cost, not just a cosmetic one. Today's partition is a single venue
+# call, cheap enough to top up every minute; the deep pass that force-refetches WARMUP_DAYS and
+# repairs older gaps stays on its slower cadence.
+#
+# Neither runs on the request path on purpose. A venue round-trip there would risk the response
+# deadline, and a missed prompt is filled at the field's 95th percentile — far more expensive than
+# a context that is a minute old.
+CURRENT_DAY_REFRESH_SECONDS = 60
 REFRESH_INTERVAL_SECONDS = 5 * 60
 
 
@@ -55,14 +65,25 @@ class ChampionMiner(Miner):
             self._refresh_started = True
             logger.info("ChampionMiner refresh thread started")
 
-    def _background_refresh(self) -> None:
-        while True:
-            for asset, store in self._stores.items():
-                try:
+    def _refresh_once(self, deep: bool) -> None:
+        """One pass over every store. A venue outage must not stop the others being refreshed."""
+        today = datetime.now(tz=timezone.utc).date()
+        for asset, store in self._stores.items():
+            try:
+                if deep:
                     store.refresh_recent(days=WARMUP_DAYS)
-                except Exception as exc:
-                    logger.warning("refresh failed for %s: %s", asset, exc)
-            time.sleep(REFRESH_INTERVAL_SECONDS)
+                else:
+                    store.ingest_day(today, force_refresh=True)
+            except Exception as exc:
+                logger.warning("refresh failed for %s: %s", asset, exc)
+
+    def _background_refresh(self) -> None:
+        deep_every = max(1, REFRESH_INTERVAL_SECONDS // CURRENT_DAY_REFRESH_SECONDS)
+        tick = 0
+        while True:
+            self._refresh_once(deep=tick % deep_every == 0)
+            tick += 1
+            time.sleep(CURRENT_DAY_REFRESH_SECONDS)
 
     async def forward_miner(self, synapse: Simulation) -> Simulation:
         self._ensure_refresh_thread()
