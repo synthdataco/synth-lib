@@ -460,6 +460,10 @@ def test_generation_hands_the_seed_to_every_sandbox(tmp_path, monkeypatch):
     assert commands, "no sandbox was launched"
     for cmd in commands:
         assert "-e" in cmd and f"{rv.SEED_ENV}=7" in cmd
+        # A champion that derives its own seed from hash() is reproducible only if this is pinned:
+        # Python salts string hashing per process, and rule 7's variable does not reach such a
+        # champion at all.
+        assert f"{rv.HASH_SEED_ENV}=7" in cmd
 
 
 def test_the_baseline_is_seeded_too(tmp_path, monkeypatch):
@@ -471,7 +475,7 @@ def test_the_baseline_is_seeded_too(tmp_path, monkeypatch):
 
     rv.generate_baseline(tmp_path / "m.py", tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), seed=7)
 
-    assert envs and all(e == {rv.SEED_ENV: "7"} for e in envs)
+    assert envs and all(e == {rv.SEED_ENV: "7", rv.HASH_SEED_ENV: "7"} for e in envs)
 
 
 def test_the_verdict_records_the_seed(tmp_path):

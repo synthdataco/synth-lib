@@ -67,7 +67,17 @@ DEFAULT_PREDICTIONS_CACHE = Path("predictions_cache")
 # Constitution rule 7: a champion that uses randomness seeds every generator from this, and it
 # is set only here, at evaluation. Absent during a campaign, so an agent's own runs vary.
 SEED_ENV = "SYNTH_BENCHMARK_SEED"
+# Python salts string hashing per process, so a champion that derives its own seed from hash() —
+# which rule 7 does not reach, and campaign-3's champion does — draws different paths on every
+# run. Pinning this makes those champions reproducible too. Must be set before the interpreter
+# starts, which is why it travels as an env var rather than being set in the generator.
+HASH_SEED_ENV = "PYTHONHASHSEED"
 DEFAULT_SEED = 0
+
+
+def generation_env(seed: int) -> dict[str, str]:
+    """What a generation process needs to be reproducible."""
+    return {SEED_ENV: str(seed), HASH_SEED_ENV: str(seed % 2**32)}
 
 
 def generation_start(window_start: str, time_length: int, lead_in: bool) -> str:
@@ -227,7 +237,7 @@ def generate_all(
                         gpus=gpus,
                         cpus=limits[0],
                         memory_gb=limits[1],
-                        env={SEED_ENV: str(seed)},
+                        env=generation_env(seed),
                         predictions=cache,
                     ),
                     f"generate {asset} tl={comp.time_length}",
@@ -276,7 +286,7 @@ def generate_baseline(
                         *(("--prompt-times", str(times)) if prompt_starts is not None else ()),
                     ],
                     f"baseline {asset} tl={comp.time_length}",
-                    env={SEED_ENV: str(seed)},
+                    env=generation_env(seed),
                 )
             except RuntimeError as exc:
                 print(f"  SKIP baseline {asset} tl={comp.time_length}: {str(exc).splitlines()[-1]}", flush=True)
