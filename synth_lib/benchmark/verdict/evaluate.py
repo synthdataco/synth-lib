@@ -239,6 +239,12 @@ def evaluate_candidate(
         combined = compute_combined_smoothed_scores(
             results, competition=comp, simulate_registration=simulate_registration
         )
+        if simulate_registration is not None and not combined.empty:
+            # The lookback is needed to compute the moving average, but the candidate did not exist
+            # in it. Its rows there carry the new-miner backfill's weight, and summing them would
+            # credit the champion with emissions from before it registered.
+            rounds = pd.to_datetime(combined["updated_at"], utc=True)
+            combined = combined.loc[rounds >= pd.Timestamp(simulate_registration)].reset_index(drop=True)
         has_candidate = not combined.empty and bool((combined["miner_uid"] == MINER_ID).any())
         if results and has_candidate:
             rank, field_size = final_rank(combined)

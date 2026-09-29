@@ -75,9 +75,13 @@ def day_files(out_dir: Path, asset: str, time_length: int, time_increment: int, 
     return root / f"date={day}.npy", root / f"date={day}.json"
 
 
-def covered_start_times(index_path: Path) -> set[str]:
-    """Prompt start_times the day file already holds, or nothing when it has none."""
-    if not index_path.exists():
+def covered_start_times(index_path: Path, paths_path: Path) -> set[str]:
+    """Prompt start_times the day file already holds, or nothing when it has none.
+
+    Both halves must be present. build_prediction_index skips an index whose .npy is missing, so
+    treating that state as covered here would skip generation for a day nothing can then score.
+    """
+    if not (index_path.exists() and paths_path.exists()):
         return set()
     try:
         return set(json.loads(index_path.read_text())["start_times"])
@@ -163,7 +167,7 @@ def generate_day(
     """
     paths_file, index_file = day_files(out_dir, asset, time_length, time_increment, day)
     wanted = [t.isoformat() for t in times]
-    if not set(wanted) - covered_start_times(index_file):
+    if not set(wanted) - covered_start_times(index_file, paths_file):
         return 0
 
     runs = []

@@ -32,6 +32,7 @@ Usage (on the box, after ingesting prices up to window_end + 1 day):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -149,14 +150,23 @@ def docker_limits() -> tuple[int, int]:
     return min(SANDBOX_CPUS, int(ncpu)), min(SANDBOX_MEMORY_GB, int(mem_bytes) // 1024**3)
 
 
-def predictions_cache(root: Path, champion: str, seed: int, live_prompts: bool) -> Path:
+def baseline_identity(modeling: Path) -> str:
+    """Short content hash of the baseline's source, so changing it cannot reuse its cache."""
+    return hashlib.sha256(modeling.read_bytes()).hexdigest()[:12]
+
+
+def predictions_cache(root: Path, champion: str, seed: int, live_prompts: bool, lead_in: bool) -> Path:
     """Where one champion's generated paths live, across runs.
 
-    --live-prompts gets its own subtree. Both modes answer the same window, so their prompts sit
-    minutes apart and the nearest-match in scoring would happily serve one run the other's
-    predictions — which is exactly the difference the flag exists to measure.
+    Everything that decides WHICH prompts get generated is in the path. Two runs that disagree on
+    any of it answer the same window at different instants, and scoring matches the nearest
+    prediction within half an hour — so a shared tree would serve one run the other's predictions,
+    silently reproducing the behaviour the differing flag exists to measure.
     """
-    return root / champion / f"seed={seed}" / ("live-prompts" if live_prompts else "cadence-grid")
+    mode = "live-prompts" if live_prompts else "cadence-grid"
+    if not lead_in:
+        mode += "-no-lead-in"
+    return root / champion / f"seed={seed}" / mode
 
 
 def sandbox(
@@ -460,7 +470,9 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             f"{leg} uv sync",
         )
         print(f"[{leg}] phase 2: generation (--network none)", flush=True)
-        cache = predictions_cache(args.predictions_cache, champion.sha, args.seed, args.live_prompts)
+        cache = predictions_cache(
+            args.predictions_cache, champion.sha, args.seed, args.live_prompts, not args.no_lead_in
+        )
         generate_all(
             clone,
             data_root,

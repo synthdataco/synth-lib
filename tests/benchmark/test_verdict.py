@@ -731,13 +731,20 @@ def test_the_two_prompt_modes_never_share_a_cache(tmp_path):
     is the whole difference the flag measures."""
     import synth_lib.benchmark.verdict.run_verdict as rv
 
-    grid = rv.predictions_cache(tmp_path, "abc1234", 0, live_prompts=False)
-    live = rv.predictions_cache(tmp_path, "abc1234", 0, live_prompts=True)
-    assert grid != live
-    # …but a champion and a seed do define one: a re-score of the same window reuses it
-    assert rv.predictions_cache(tmp_path, "abc1234", 0, live_prompts=True) == live
-    assert rv.predictions_cache(tmp_path, "abc1234", 7, live_prompts=True) != live
-    assert rv.predictions_cache(tmp_path, "def5678", 0, live_prompts=True) != live
+    cache = lambda **kw: rv.predictions_cache(  # noqa: E731 — a table of one-line variations
+        tmp_path,
+        kw.pop("sha", "abc1234"),
+        kw.pop("seed", 0),
+        kw.pop("live_prompts", True),
+        kw.pop("lead_in", True),
+    )
+    live = cache()
+    assert cache(live_prompts=False) != live  # the prompts sit minutes apart
+    assert cache(lead_in=False) != live  # --no-lead-in must not reuse lead-in prompts
+    assert cache(seed=7) != live
+    assert cache(sha="def5678") != live
+    # …but the same run reuses its own tree: that is the point of the cache
+    assert cache() == live
 
 
 def test_the_cache_is_mounted_where_generation_writes(tmp_path, monkeypatch):
@@ -754,3 +761,43 @@ def test_the_cache_is_mounted_where_generation_writes(tmp_path, monkeypatch):
 
     assert commands and all(f"{cache.resolve()}:/workspace/predictions:rw" in cmd for cmd in commands)
     assert all("--out-dir predictions" in cmd for cmd in commands)
+
+
+def test_simulated_registration_earns_nothing_before_it_registered(monkeypatch, tmp_path):
+    """The moving average needs the lookback, but the candidate did not exist in it — its rows
+    there are the new-miner backfill's weight. Summing them credits emissions it never earned and
+    stops the Score answering what a champion makes in its first live days."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+
+    reg = pd.Timestamp("2026-08-30T00:00:00Z")
+    before, after = reg - pd.Timedelta(days=1), reg + pd.Timedelta(days=1)
+
+    def fake_combined(results, competition=None, cutoff_days=None, simulate_registration=None):
+        return pd.DataFrame(
+            {
+                "updated_at": [before, before, after, after],
+                "miner_uid": [1, 999, 1, 999],
+                "new_smoothed_score": [1.0, 9.0, 1.0, 2.0],
+                "reward_weight": [0.5, 0.25, 0.5, 0.25],
+            }
+        )
+
+    monkeypatch.setattr(ev, "backtest", lambda **kw: _FakeResult())
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", fake_combined)
+    monkeypatch.setattr(ev, "get_rewards_history", lambda *a, **k: pd.DataFrame())
+
+    out = tmp_path / "v"
+    result = ev.evaluate_candidate(
+        "cand",
+        tmp_path,
+        window_end=pd.Timestamp("2026-09-09T00:00:00Z"),
+        window_days=10,
+        out_dir=out,
+        simulate_registration=reg.to_pydatetime(),
+    )
+
+    rewards = result["per_competition"]["crypto-1h"]["rewards"]
+    # one post-registration round of 0.25, not two rounds of 0.25
+    assert rewards["reward_share"] == pytest.approx(0.25 / 0.75)
+    frame = pd.read_parquet(out / result["per_competition"]["crypto-1h"]["frames"]["field_rewards"])
+    assert pd.to_datetime(frame["updated_at"], utc=True).min() >= reg
