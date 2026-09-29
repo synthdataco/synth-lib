@@ -9,9 +9,12 @@ That is what lets it serve three duties with one implementation:
   - the CI contract gate runs it on the host against any miner exposing simulate();
   - an operator can run it standalone against any modeling.py.
 
-No-lookahead guarantee: for each prompt at time t the model receives ONLY minutes <= t —
-`frame.loc[t - 7d : t]` — regardless of how much data the frame holds. The model's sole market
-input is that DataFrame; simulate() takes no data root.
+No-lookahead guarantee: for each prompt at time t the model receives only what a miner answering
+that prompt could have held. The validator issues a prompt BEFORE the start_time it scores from
+(ISSUANCE_LEAD_SECONDS), and the store labels a minute bar by its OPEN time, so the bar labelled t
+closes at t + 60s and its close is the first point the prompt is scored against. Ending the context
+at t would therefore hand the model that exact value. The context ends one bar before the issuance
+instead. The model's sole market input is that DataFrame; simulate() takes no data root.
 
 Predictions land one file per day, under
 `<out>/<asset>/<time_length>_<time_increment>/date=<YYYY-MM-DD>.npy` — float32, shaped
@@ -46,6 +49,21 @@ OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "trade_count"]
 # upward for small N, so scoring at fewer paths than the field unfairly penalizes the candidate.
 DEFAULT_NUM_SIMULATIONS = 1000
 STORE_SUBDIR = "prices"
+# How far before a prompt's start_time the validator issues it, per format — measured from
+# `validator_requests.request_time - start_time`. A miner answers within seconds of issuance, so
+# nothing that closes after this instant can be in its hands.
+ISSUANCE_LEAD_SECONDS = {3_600: 60, 86_400: 120}
+# The store's bar width. A bar labelled b covers [b, b+BAR_SECONDS), so its close is known only at
+# b + BAR_SECONDS; the newest bar a miner holds at time c is the one labelled c - BAR_SECONDS.
+BAR_SECONDS = 60
+
+
+def context_end(start: pd.Timestamp, time_length: int, issuance_lead: int | None = None) -> pd.Timestamp:
+    """Label of the last bar a miner answering the prompt at `start` could have held."""
+    lead = ISSUANCE_LEAD_SECONDS.get(time_length, 0) if issuance_lead is None else issuance_lead
+    return start - pd.Timedelta(seconds=lead + BAR_SECONDS)
+
+
 # float32 is what the validator stores miner predictions as, so the field's CRPS was computed at
 # this precision too. It also quarters the cache: a day of crypto-1h is 35 MB instead of 170.
 PATH_DTYPE = "float32"
@@ -135,6 +153,7 @@ def generate_day(
     time_increment: int,
     time_length: int,
     num_simulations: int,
+    issuance_lead: int | None = None,
 ) -> int:
     """Generate one day's prompts and write the pair. Returns how many were generated, 0 if the
     day was already covered.
@@ -149,8 +168,11 @@ def generate_day(
 
     runs = []
     for t in times:
-        # THE no-lookahead line: only minutes <= t reach the model, whatever the frame holds.
-        context = price_frame.loc[t - pd.Timedelta(minutes=CONTEXT_MINUTES) : t]
+        # THE no-lookahead line: the context stops at the last bar the prompt's issuance allows,
+        # never at t — the bar labelled t closes after the prompt starts.
+        context = price_frame.loc[
+            t - pd.Timedelta(minutes=CONTEXT_MINUTES) : context_end(t, time_length, issuance_lead)
+        ]
         out = simulate_fn(
             asset=asset,
             start_time=t.isoformat(),
@@ -191,6 +213,7 @@ def generate(
     time_length: int,
     num_simulations: int = DEFAULT_NUM_SIMULATIONS,
     prompt_times: list[pd.Timestamp] | None = None,
+    issuance_lead: int | None = None,
 ) -> tuple[int, int]:
     """Returns (generated, reused) prompt counts."""
     by_day: dict[str, list[pd.Timestamp]] = {}
@@ -200,7 +223,16 @@ def generate(
     generated = reused = 0
     for day, times in sorted(by_day.items()):
         made = generate_day(
-            simulate_fn, asset, day, times, price_frame, out_dir, time_increment, time_length, num_simulations
+            simulate_fn,
+            asset,
+            day,
+            times,
+            price_frame,
+            out_dir,
+            time_increment,
+            time_length,
+            num_simulations,
+            issuance_lead,
         )
         generated += made
         reused += 0 if made else len(times)
@@ -224,6 +256,13 @@ def main() -> None:
     ap.add_argument("--time-increment", type=int, default=300)
     ap.add_argument("--time-length", type=int, default=86_400)
     ap.add_argument("--num-simulations", type=int, default=DEFAULT_NUM_SIMULATIONS)
+    ap.add_argument(
+        "--issuance-lead-seconds",
+        type=int,
+        default=None,
+        help=f"override how far before start_time the prompt is issued (default per format: "
+        f"{ISSUANCE_LEAD_SECONDS})",
+    )
     ap.add_argument(
         "--prompt-times",
         type=Path,
@@ -249,6 +288,7 @@ def main() -> None:
         time_length=args.time_length,
         num_simulations=args.num_simulations,
         prompt_times=prompt_times,
+        issuance_lead=args.issuance_lead_seconds,
     )
     print(f"{args.asset} tl={args.time_length}: {generated} predictions ({reused} reused)")
 

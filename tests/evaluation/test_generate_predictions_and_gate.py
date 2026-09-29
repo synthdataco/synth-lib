@@ -19,6 +19,7 @@ from synth.simulation_input import SimulationInput  # type: ignore[import-untype
 from synth.validator import response_validation_v2  # type: ignore[import-untyped]
 
 from synth_lib.benchmark.generate_predictions import (
+    context_end,
     CONTEXT_MINUTES,
     generate,
     load_minute_prices,
@@ -77,7 +78,9 @@ def test_context_never_reaches_past_the_prompt(tmp_path):
     )
     assert n == (4, 0) and len(seen) == 4  # 00:00, 06:00, 12:00, 18:00 — 24:00 excluded (t < window_end)
     for t, lo, hi in seen:
-        assert hi <= t, f"context leaked past the prompt: {hi} > {t}"
+        # The bar labelled t closes at t + 60s and its close is the prompt's first scored point, so
+        # "up to t" would already be a leak. A 24h prompt is issued 120s early, plus the bar width.
+        assert hi <= t - pd.Timedelta(seconds=180), f"context leaked past the issuance: {hi} vs {t}"
         assert lo >= t - pd.Timedelta(minutes=CONTEXT_MINUTES)
 
 
@@ -216,3 +219,16 @@ def test_gate_wrapped_output_passes_the_live_contract():
         *[[float(f"{v:.7e}") for v in path] for path in raw[2:]],
     )
     assert _gate(wrapped, sim_input) == "CORRECT"
+
+
+def test_the_context_stops_before_the_first_scored_point():
+    """The store labels a bar by its OPEN time, so the bar labelled t closes at t+60s — and that
+    close is real_prices[0], the first point the prompt is scored against. Ending the context at t
+    hands the model the answer to its own first step. crypto-1h is issued 60s early, the 24h
+    competitions 120s, and a miner cannot hold a bar that has not closed by then."""
+    t = pd.Timestamp("2026-09-20T12:00:00Z")
+    assert context_end(t, 3_600) == t - pd.Timedelta(seconds=120)
+    assert context_end(t, 86_400) == t - pd.Timedelta(seconds=180)
+    assert context_end(t, 3_600, issuance_lead=0) == t - pd.Timedelta(seconds=60)
+    # never at or past t, whatever the format
+    assert all(context_end(t, tl) < t for tl in (3_600, 86_400, 999))
