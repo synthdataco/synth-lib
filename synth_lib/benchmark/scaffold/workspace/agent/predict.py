@@ -9,6 +9,12 @@ CRPS + rank vs the real field via the Synth API).
 (PromptConfig.num_simulations). Lowering it (e.g. for a quick local iteration loop) speeds up
 generation at the cost of a slightly pessimistic CRPS: empirical CRPS is biased upward for
 fewer sampled paths, and the real field's CRPS was computed at 1000.
+
+The context a prompt gets ends BEFORE its start_time, and that is not an off-by-one. The store
+labels a minute bar by its OPEN time, so the bar labelled t closes at t+60s — and that close is
+the first point the prompt is scored against. A prompt is also issued before the start_time it is
+scored from (ISSUANCE_LEAD_SECONDS). Ending the context at t would hand the model the answer to
+its own first step, and a model tuned that way is optimising a problem it will not be scored on.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from pathlib import Path
 import pandas as pd
 
 from synth_lib.backtester.orchestration import backtest
+from synth_lib.benchmark.generate_predictions import context_end
 from synth_lib.preparation.config import OHLCV_COLUMNS, STORE_SUBDIR
 from synth_lib.preparation.market_data import MinutePriceStore
 
@@ -99,7 +106,8 @@ def generate(
     for t in pd.date_range(start, end, freq=f"{cadence_minutes}min", tz="UTC"):
         if t >= end_ts:
             break
-        context = prices.loc[:t][-CONTEXT_MINUTES:]
+        # Never `prices.loc[:t]` — see the module docstring. Same cut the scored evaluation uses.
+        context = prices.loc[: context_end(t, time_length)][-CONTEXT_MINUTES:]
         out = simulate(
             asset=asset,
             start_time=t.isoformat(),
