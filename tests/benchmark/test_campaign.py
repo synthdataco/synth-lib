@@ -55,6 +55,38 @@ def test_non_positive_sandbox_limits_rejected(tmp_path, field):
         load_campaign(_write(tmp_path, VALID_YAML + f"\n{field}: 0\n"))
 
 
+def test_effort_ultracode_and_goal_load_per_model(tmp_path):
+    text = VALID_YAML.replace(
+        "{id: claude, cli: claude-code, model: claude-model}",
+        "{id: claude, cli: claude-code, model: claude-model, effort: max, ultracode: true, goal: true}",
+    ).replace("wire_api: responses}", "wire_api: responses, effort: ultra}")
+    claude, codex, gemini = load_campaign(_write(tmp_path, text)).models
+    assert (claude.effort, claude.ultracode, claude.goal) == ("max", True, True)
+    assert (codex.effort, codex.ultracode, codex.goal) == ("ultra", False, False)
+    assert (gemini.effort, gemini.ultracode, gemini.goal) == (None, False, False)  # defaults: the CLI's own
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "{id: claude, cli: claude-code, model: claude-model, effort: maximum}",  # claude would run at its default
+        "{id: claude, cli: claude-code, model: claude-model, effort: ultra}",  # a codex level
+        "{id: claude, cli: gemini-cli, model: gemini-2.5-pro, effort: high}",  # no effort wired for gemini
+    ],
+)
+def test_effort_outside_the_cli_levels_rejected(tmp_path, model):
+    bad = VALID_YAML.replace("{id: claude, cli: claude-code, model: claude-model}", model)
+    with pytest.raises(ValueError, match="effort"):
+        load_campaign(_write(tmp_path, bad))
+
+
+@pytest.mark.parametrize("flag", ["ultracode", "goal"])
+def test_claude_code_settings_rejected_on_other_clis(tmp_path, flag):
+    bad = VALID_YAML.replace("wire_api: responses}", f"wire_api: responses, {flag}: true}}")
+    with pytest.raises(ValueError, match=flag):
+        load_campaign(_write(tmp_path, bad))
+
+
 def test_duplicate_model_ids_rejected(tmp_path):
     bad = VALID_YAML.replace("id: codex", "id: claude", 1)
     with pytest.raises(ValueError, match="unique"):

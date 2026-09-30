@@ -2,11 +2,25 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from synth_lib.benchmark.campaign import ModelSpec
 
 FAKE_CLI_PATH = Path(__file__).parent / "fake_cli.py"
+# The stopping condition a claude-code session is held to, the same rules as the constitution's envelope.
+# Its evaluator sees only the transcript and the hook arguments, so each case names what proves it.
+# "LANDING ORDER" is in the heading of budget.LANDING_ORDER and in driver.LANDING_PROMPT.
+GOAL_CONDITION = (
+    "The agent may stop only in one of three cases. (1) A LANDING ORDER has arrived, printed from "
+    "agent/BUDGET.md or sent by the harness, and the agent's command output shows it carried out: "
+    "agent/journal.md finalized, agent/report.md written, agent/CHAMPION written, `git cat-file -t` on its "
+    "sha printing `commit`, and `git status --short` printing nothing after the last commit. (2) The same "
+    "deliverables, committed and verified the same way, alongside journal entries whose measured CRPS shows "
+    "that further iteration would not improve the champion. (3) `background_tasks` in the arguments lists "
+    "a running workflow or subagent: the session waits for that work, and its result starts the next turn. "
+    "A plan, a claim, or a CHAMPION file alone is not enough."
+)
 
 
 class CLIAdapter:
@@ -32,25 +46,14 @@ class CLIAdapter:
 
 class ClaudeCodeAdapter(CLIAdapter):
     def launch_cmd(self, prompt: str) -> list[str]:
-        return [
-            "claude",
-            "-p",
-            prompt,
-            "--model",
-            self.spec.model,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--dangerously-skip-permissions",
-        ]
+        return ["claude", "-p", prompt, *self._flags()]
 
     def resume_cmd(self, prompt: str) -> list[str] | None:
         # -c: resumes the most recent session in the current directory (the workspace)
-        return [
-            "claude",
-            "-c",
-            "-p",
-            prompt,
+        return ["claude", "-c", "-p", prompt, *self._flags()]
+
+    def _flags(self) -> list[str]:
+        flags = [
             "--model",
             self.spec.model,
             "--output-format",
@@ -58,9 +61,34 @@ class ClaudeCodeAdapter(CLIAdapter):
             "--verbose",
             "--dangerously-skip-permissions",
         ]
+        if self.spec.effort:
+            flags += ["--effort", self.spec.effort]
+        # Settings are per launch: a resumed session has ultracode and the goal hook only if they are passed again.
+        settings = self._settings()
+        if settings:
+            flags += ["--settings", json.dumps(settings)]
+        return flags
+
+    def _settings(self) -> dict:
+        settings: dict = {}
+        if self.spec.ultracode:
+            settings["ultracode"] = True
+        if self.spec.goal:
+            # The prompt-based Stop hook that /goal installs; timeout in seconds, the evaluator reads the
+            # whole transcript.
+            hook = {"type": "prompt", "prompt": GOAL_CONDITION, "model": self.spec.model, "timeout": 300}
+            settings["hooks"] = {"Stop": [{"hooks": [hook]}]}
+        return settings
 
     def env(self) -> dict[str, str]:
-        return {"ANTHROPIC_BASE_URL": self.proxy_url, "ANTHROPIC_AUTH_TOKEN": self.virtual_key}
+        return {
+            "ANTHROPIC_BASE_URL": self.proxy_url,
+            "ANTHROPIC_AUTH_TOKEN": self.virtual_key,
+            # Subagents, teammates and workflow agents run on the leg's model, whatever a script names.
+            "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+            # 0 = no ceiling: -p otherwise stops waiting for a background workflow after 10 idle minutes.
+            "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0",
+        }
 
 
 class CodexAdapter(CLIAdapter):
@@ -88,15 +116,20 @@ class CodexAdapter(CLIAdapter):
         return {"LITELLM_KEY_CODEX": self.virtual_key}
 
     def provision_files(self) -> dict[str, str]:
+        effort = f'model_reasoning_effort = "{self.spec.effort}"\n' if self.spec.effort else ""
         return {
             "~/.codex/config.toml": (
                 f'model = "{self.spec.model}"\n'
+                f"{effort}"
                 'model_provider = "litellm"\n\n'
                 "[model_providers.litellm]\n"
                 'name = "LiteLLM"\n'
                 f'base_url = "{self.proxy_url}/v1"\n'
                 'env_key = "LITELLM_KEY_CODEX"\n'
-                f'wire_api = "{self.spec.wire_api}"\n'
+                f'wire_api = "{self.spec.wire_api}"\n\n'
+                # Sub-agents inherit the leg's model and effort: spawn_agent offers no override of either.
+                "[features.multi_agent_v2]\n"
+                "expose_spawn_agent_model_overrides = false\n"
             )
         }
 

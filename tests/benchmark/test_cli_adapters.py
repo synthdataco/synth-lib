@@ -1,5 +1,8 @@
+import json
+import tomllib
+
 from synth_lib.benchmark.campaign import ModelSpec
-from synth_lib.benchmark.cli_adapters import build_adapter
+from synth_lib.benchmark.cli_adapters import GOAL_CONDITION, build_adapter
 
 
 def test_claude_adapter_cmd_and_env():
@@ -15,6 +18,28 @@ def test_claude_adapter_cmd_and_env():
     assert env["ANTHROPIC_BASE_URL"] == "http://localhost:4000"
     assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-v"
     assert a.resume_cmd("continue") is not None  # claude can resume via a generic session id (-c)
+    assert "--effort" not in cmd and "--settings" not in cmd  # defaults: the CLI's own effort, no hook
+    # every subagent and workflow agent on the leg's model; background workflows waited for
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
+    assert env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == "0"
+
+
+def test_claude_adapter_carries_effort_ultracode_and_goal_into_every_launch():
+    a = build_adapter(
+        ModelSpec(id="c", cli="claude-code", model="claude-opus-5-model", effort="max", ultracode=True, goal=True),
+        proxy_url="http://localhost:4000",
+        virtual_key="sk-v",
+    )
+    # a resumed session gets its settings from the command line again, or it runs without them
+    for cmd in (a.launch_cmd("Read CAMPAIGN.md and start."), a.resume_cmd("continue")):
+        assert cmd[cmd.index("--effort") + 1] == "max"
+        settings = json.loads(cmd[cmd.index("--settings") + 1])
+        assert settings["ultracode"] is True
+        (hook,) = settings["hooks"]["Stop"][0]["hooks"]
+        assert hook["type"] == "prompt" and hook["prompt"] == GOAL_CONDITION
+        assert hook["model"] == "claude-opus-5-model"  # the evaluator runs on the leg's own served alias
+    # the goal rides in the settings: the prompt is the driver's, unchanged
+    assert a.launch_cmd("Read CAMPAIGN.md and start.")[2] == "Read CAMPAIGN.md and start."
 
 
 def test_codex_adapter_writes_config_and_env():
@@ -35,6 +60,22 @@ def test_codex_adapter_writes_config_and_env():
     assert resume[:2] == ["codex", "exec"]
     assert resume.index("--sandbox") < resume.index("resume") < resume.index("--last")
     assert resume[-1] == "go"
+    parsed = tomllib.loads(cfg)
+    assert "model_reasoning_effort" not in parsed  # default: the model catalog's own level
+    # sub-agents stay on the leg's model: the spawn tool cannot pick another one
+    assert parsed["features"]["multi_agent_v2"] == {"expose_spawn_agent_model_overrides": False}
+
+
+def test_codex_adapter_sets_the_reasoning_effort_at_top_level():
+    a = build_adapter(
+        ModelSpec(id="x", cli="codex", model="gpt-6-sol", effort="ultra"),
+        proxy_url="http://localhost:4000",
+        virtual_key="sk-v",
+    )
+    parsed = tomllib.loads(a.provision_files()["~/.codex/config.toml"])
+    # a key written after a [table] header would belong to that table instead
+    assert parsed["model_reasoning_effort"] == "ultra"
+    assert parsed["model"] == "gpt-6-sol" and parsed["model_providers"]["litellm"]["wire_api"] == "responses"
 
 
 def test_gemini_adapter_env_disables_sandbox():

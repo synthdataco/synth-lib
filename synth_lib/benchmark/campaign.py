@@ -10,6 +10,11 @@ from pathlib import Path
 import yaml
 
 KNOWN_CLIS = ("claude-code", "codex", "gemini-cli", "kimi-code", "fake")
+# The reasoning-effort levels each CLI accepts, by its own names; a CLI absent here has no effort wired.
+EFFORT_LEVELS = {
+    "claude-code": ("low", "medium", "high", "xhigh", "max"),
+    "codex": ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+}
 PRIMARY_METRIC = "synth_competition_rank"
 # CampaignConfig fields that must be strictly positive (checked in _validate).
 POSITIVE_FIELDS = (
@@ -27,6 +32,9 @@ class ModelSpec:
     cli: str
     model: str
     wire_api: str = "responses"  # codex only — "chat" was removed in 0.145.0
+    effort: str | None = None  # an EFFORT_LEVELS name for the leg's CLI; None = the CLI's default for the model
+    ultracode: bool = False  # claude-code only: a dynamic workflow for every substantive task
+    goal: bool = False  # claude-code only: an evaluator holds the session to cli_adapters.GOAL_CONDITION
 
 
 PACKAGED_BASELINE = "synth_lib.benchmark.verdict.baseline_default"
@@ -118,8 +126,7 @@ def _validate(cfg: CampaignConfig) -> None:
     if len(ids) != len(set(ids)):
         raise ValueError("model ids must be unique")
     for m in cfg.models:
-        if m.cli not in KNOWN_CLIS:
-            raise ValueError(f"unknown cli: {m.cli!r} (expected: {KNOWN_CLIS})")
+        _validate_model(m)
     # New way: add a strictly-positive field to POSITIVE_FIELDS rather than another `if` here —
     # one branch each was pushing _validate past flake8's max-complexity.
     for name in POSITIVE_FIELDS:
@@ -131,3 +138,16 @@ def _validate(cfg: CampaignConfig) -> None:
         raise ValueError(f"data_start ({cfg.data_start}) must be <= data_cutoff ({cfg.data_cutoff})")
     if cfg.primary_metric != PRIMARY_METRIC:
         raise ValueError(f"primary_metric is pre-registered: {PRIMARY_METRIC}")
+
+
+def _validate_model(m: ModelSpec) -> None:
+    if m.cli not in KNOWN_CLIS:
+        raise ValueError(f"unknown cli: {m.cli!r} (expected: {KNOWN_CLIS})")
+    # An unknown level does not fail the launch: claude warns and runs at its default effort.
+    levels = EFFORT_LEVELS.get(m.cli, ())
+    if m.effort is not None and m.effort not in levels:
+        raise ValueError(f"{m.id}: effort {m.effort!r} is not a {m.cli} level (expected one of: {levels})")
+    if m.ultracode and m.cli != "claude-code":
+        raise ValueError(f"{m.id}: ultracode is a claude-code setting")
+    if m.goal and m.cli != "claude-code":
+        raise ValueError(f"{m.id}: goal is a claude-code setting")
