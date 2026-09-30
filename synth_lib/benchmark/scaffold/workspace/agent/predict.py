@@ -5,6 +5,10 @@ Generates predictions from agent/modeling.py over a grid of past prompts (covere
 snapshot), writes them in the standard format, then scores them with backtest() (validator
 CRPS + rank vs the real field via the Synth API).
 
+Works on every asset, including the ones whose minutes do not all trade. Prices load through the
+same lenient path the scored evaluation uses, so a NaN close reaches simulate() rather than
+stopping the run — your model must tolerate them (drop, never interpolate).
+
 --num-simulations defaults to 1000, matching the validator's real serving size
 (PromptConfig.num_simulations). Lowering it (e.g. for a quick local iteration loop) speeds up
 generation at the cost of a slightly pessimistic CRPS: empirical CRPS is biased upward for
@@ -29,9 +33,8 @@ from pathlib import Path
 import pandas as pd
 
 from synth_lib.backtester.orchestration import backtest
-from synth_lib.benchmark.generate_predictions import context_end
-from synth_lib.preparation.config import OHLCV_COLUMNS, STORE_SUBDIR
-from synth_lib.preparation.market_data import MinutePriceStore
+from synth_lib.benchmark.generate_predictions import context_end, load_minute_prices
+from synth_lib.preparation.config import STORE_SUBDIR
 
 # All paths are resolved from the location of THIS file, never from the cwd: the
 # script therefore works whether launched from the workspace root (`uv run agent/predict.py`)
@@ -97,9 +100,13 @@ def generate(
     time_length: int = 86_400,
     num_simulations: int = 1000,
 ) -> int:
-    store = MinutePriceStore(asset, root=store_root(asset))
-    df = store.load_range(start - timedelta(minutes=CONTEXT_MINUTES), end).set_index("timestamp")
-    prices = df[OHLCV_COLUMNS]
+    # The same loader the scored evaluation uses. NOT MinutePriceStore.load_range, which raises
+    # on a single NaN close: an untraded minute is normal on the thin markets (42% of AAPLX
+    # minutes never trade), so that loader cannot read 9 of the 13 assets at all. NaN reaches
+    # simulate() untouched, which is the contract — never interpolate it away.
+    prices = load_minute_prices(
+        WORKSPACE / "market_data", asset, pd.Timestamp(start) - pd.Timedelta(minutes=CONTEXT_MINUTES), pd.Timestamp(end)
+    )
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     end_ts = pd.Timestamp(end)
     n = 0
