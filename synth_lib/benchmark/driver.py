@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -20,8 +21,9 @@ from synth_lib.benchmark.nomination import probe_simulate_subprocess
 INITIAL_PROMPT = "Read the CAMPAIGN.md file in your agent folder and start your research campaign."
 RESUME_PROMPT = (
     "You are resuming after an interruption. Re-read CAMPAIGN.md, BUDGET.md, and your journal.md, "
-    "then continue the work. Nobody reads your questions: a turn that ends by asking what to do next is a wasted turn. "
+    "then continue the work. No one is available to answer mid-run, so decide and record the decision. "
     "If your deliverables are complete and envelope remains, keep iterating or amend your nomination. "
+    "There is more to try: measure something, change one thing, measure again."
     "Believe in yourself and continue your research campaign. "
     "I know you can do it. You can improve your model and achieve better results. "
     "Carry on with determination. Explore new ideas."
@@ -31,6 +33,11 @@ LANDING_PROMPT = (
     "write agent/report.md, write the agent/CHAMPION file, commit all your work, That's it."
 )
 DELIVERABLES = ("report.md", "journal.md", "CHAMPION", "suggestions.md")
+# A safety classifier can decline a turn and the API can serve it from a different model instead.
+# Routing is then sticky for about an hour, so one declined turn can hand the rest of a leg to a
+# model the campaign never chose — and the transcript is the only place it shows. A leg whose
+# champion came from a substitute model does not measure the model on the panel.
+FALLBACK_MARKER = b"model_refusal_fallback"
 
 
 @dataclass
@@ -42,6 +49,9 @@ class RunResult:
     voluntary_resumes: int
     landing_relaunches: int
     final_spend_usd: float
+    # Models that served a turn in place of the one asked for. Non-empty means this leg does not
+    # measure the model on the panel.
+    substituted_models: tuple[str, ...] = ()
 
 
 class ModelRun:
@@ -103,6 +113,27 @@ class ModelRun:
         finally:
             log.close()  # the parent no longer needs its fd; the child keeps its own via dup()
         return proc
+
+    def substituted_models(self) -> set[str]:
+        """Models that served a turn in place of the one this leg asked for, from the transcripts."""
+        served: set[str] = set()
+        for path in sorted(self.artifacts_dir.glob("transcript-*.log")):
+            try:
+                blob = path.read_bytes()
+            except OSError:
+                continue
+            if FALLBACK_MARKER not in blob:
+                continue
+            for line in blob.splitlines():
+                if FALLBACK_MARKER not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if name := event.get("fallback_model"):
+                    served.add(str(name))
+        return served
 
     def _launch(self, prompt: str, resume: bool = False) -> subprocess.Popen:
         if self.container_name:
@@ -285,6 +316,9 @@ class ModelRun:
             f"leg END: landed={champion is not None} spend=${status.spend_usd:.2f} "
             f"crash_resumes={crash_resumes} voluntary={voluntary_resumes} landing_relaunches={landing_relaunches}"
         )
+        substituted = tuple(sorted(self.substituted_models()))
+        if substituted:
+            self._log(f"WARNING: turns were served by {', '.join(substituted)} instead of {self.model.model}")
         return RunResult(
             model_id=self.model.id,
             landed=champion is not None,
@@ -293,6 +327,7 @@ class ModelRun:
             voluntary_resumes=voluntary_resumes,
             landing_relaunches=landing_relaunches,
             final_spend_usd=status.spend_usd,
+            substituted_models=substituted,
         )
 
     def _collect(self) -> None:

@@ -39,6 +39,7 @@ from synth_lib.backtester.preparation import (
     _fill_gaps_from_realized_paths,
     _find_prediction_file,
     _parse_prediction_filename_time,
+    build_prediction_index,
     _slice_real_prices,
 )
 from synth_lib.backtester.result import BacktestResult, NoScoresAvailable
@@ -188,28 +189,26 @@ class TestParseFilenameTime:
 # Matching a scored prompt time to the closest prediction file (by asset, time_length, and tolerance).
 class TestFindPredictionFile:
     def test_outside_tolerance(self, predictions_dir: Path) -> None:
-        files = list(predictions_dir.glob("*.json"))
+        index = build_prediction_index(predictions_dir)
         far_time = T0 + timedelta(hours=2)
-        found = _find_prediction_file(files, far_time, ASSET, TIME_LENGTH, tolerance_minutes=30)
+        found = _find_prediction_file(index, far_time, ASSET, TIME_LENGTH, tolerance_minutes=30)
         assert found is None
 
     def test_wrong_asset(self, predictions_dir: Path) -> None:
-        files = list(predictions_dir.glob("*.json"))
-        assert _find_prediction_file(files, T0, "ETH", TIME_LENGTH) is None
+        index = build_prediction_index(predictions_dir)
+        assert _find_prediction_file(index, T0, "ETH", TIME_LENGTH) is None
 
     def test_closest_of_multiple_within_tolerance(self, tmp_path: Path) -> None:
-        """When multiple files are within tolerance, the closest should be selected."""
-        fname_exact = T0.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{ASSET}_{TIME_LENGTH}.json"
-        t_near = T0 + timedelta(minutes=15)
-        fname_near = t_near.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{ASSET}_{TIME_LENGTH}.json"
-        (tmp_path / fname_exact).write_text("{}")
-        (tmp_path / fname_near).write_text("{}")
+        """When multiple prompts are within tolerance, the closest should be selected."""
+        for t in (T0, T0 + timedelta(minutes=15)):
+            name = t.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{ASSET}_{TIME_LENGTH}.json"
+            (tmp_path / name).write_text("{}")
 
-        files = list(tmp_path.glob("*.json"))
+        index = build_prediction_index(tmp_path)
         query_time = T0 + timedelta(minutes=5)
-        found = _find_prediction_file(files, query_time, ASSET, TIME_LENGTH, tolerance_minutes=30)
+        found = _find_prediction_file(index, query_time, ASSET, TIME_LENGTH, tolerance_minutes=30)
         assert found is not None
-        assert "00:00:00Z" in found.name
+        assert "00:00:00Z" in found.path.name
 
 
 # Loading prediction JSON files in both formats: flat (notebook) and ArtifactManager.
@@ -1610,3 +1609,86 @@ class TestOutlierCapCutover:
             assert stats["new_prompt_scores"].iloc[3] == pytest.approx(
                 stats["percentile95"].iloc[0] - stats["lowest_score"].iloc[0]
             )
+
+
+class TestRegistrationLookback:
+    """The field must be fetched from before the candidate existed, whatever the predictions cover."""
+
+    def _queried_start(self, monkeypatch, tmp_path, simulate_registration):
+        import synth_lib.backtester.orchestration as orch
+
+        seen = {}
+
+        def fake_scores(*, start_time, end_time, asset, time_length, time_increment):
+            seen["start"] = start_time
+            raise NoScoresAvailable("stop here — the query bound is what this test is about")
+
+        monkeypatch.setattr(orch, "get_miner_scores", fake_scores)
+        monkeypatch.setattr(orch, "download_price_data", lambda *a, **k: pd.DataFrame())
+        # one prediction file, one horizon before registration, exactly as generate_all produces
+        preds = tmp_path / "predictions"
+        preds.mkdir()
+        start = pd.Timestamp(simulate_registration) - pd.Timedelta(seconds=CRYPTO_24H.time_length)
+        name = start.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_BTC_{CRYPTO_24H.time_length}.json"
+        (preds / name).write_text(json.dumps({"paths": [[1.0, 2.0]]}))
+        with pytest.raises(NoScoresAvailable):
+            backtest(
+                miner_name="m",
+                asset="BTC",
+                time_length=CRYPTO_24H.time_length,
+                time_increment=CRYPTO_24H.time_increment,
+                n_backtest_days=10,
+                predictions_dir=preds,
+                competition=CRYPTO_24H,
+                eval_end=(pd.Timestamp(simulate_registration) + pd.Timedelta(days=10)).to_pydatetime(),
+                simulate_registration=simulate_registration,
+            )
+        return pd.Timestamp(seen["start"])
+
+    def test_the_lookback_is_a_full_moving_average_window_not_one_horizon(self, monkeypatch, tmp_path):
+        reg = pd.Timestamp("2026-08-30T00:00:00Z")
+        start = self._queried_start(monkeypatch, tmp_path, reg.to_pydatetime())
+        # Clamping to prediction coverage would put this one horizon back; the backfill needs ten days.
+        assert start <= reg - pd.Timedelta(days=CRYPTO_24H.window_days)
+
+
+def test_a_day_file_scores_the_same_prompt_as_its_json_twin(tmp_path):
+    """The day layout is a storage change, not a scoring one: the paths that come back out of a
+    .npy row must be the paths that went in, and the metadata must survive with them."""
+    start = pd.Timestamp("2026-09-17T00:00:00Z")
+    paths = np.array([[100.0, 101.0, 102.0], [100.0, 99.0, 98.0]], dtype=np.float32)
+
+    root = tmp_path / "BTC" / "3600_60"
+    root.mkdir(parents=True)
+    np.save(root / "date=2026-09-17.npy", paths[None, :, :])
+    (root / "date=2026-09-17.json").write_text(
+        json.dumps(
+            {
+                "start_times": [start.isoformat()],
+                "asset": "BTC",
+                "time_increment": 60,
+                "time_length": 3600,
+                "num_simulations": 2,
+                "num_steps": 3,
+            }
+        )
+    )
+
+    index = build_prediction_index(tmp_path)
+    ref = _find_prediction_file(index, start.to_pydatetime(), "BTC", 3600)
+    assert ref is not None and ref.row == 0
+
+    loaded = load_prediction(ref)
+    assert np.array_equal(np.asarray(loaded["paths"]), paths)
+    assert loaded["asset"] == "BTC" and loaded["num_steps"] == 3 and loaded["time_length"] == 3600
+
+
+def test_an_index_without_its_paths_is_not_a_prompt(tmp_path):
+    """An interrupted write leaves the .json behind. Serving it would crash scoring on a file that
+    does not exist; the prompt has to read as missing instead."""
+    root = tmp_path / "BTC" / "3600_60"
+    root.mkdir(parents=True)
+    (root / "date=2026-09-17.json").write_text(
+        json.dumps({"start_times": ["2026-09-17T00:00:00+00:00"], "asset": "BTC", "time_length": 3600})
+    )
+    assert build_prediction_index(tmp_path) == {}

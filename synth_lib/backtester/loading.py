@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 from tenacity import (
@@ -28,6 +29,7 @@ from synth_lib.backtester.config import (
     competition_for,
     slug_for,
 )
+from synth_lib.backtester.preparation import PredictionRef
 from synth_lib.preparation.config import SYNTHDATA_API_BASE
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.preparation.price_client import build_price_client
@@ -74,14 +76,9 @@ def get_miner_scores(
 
     offline = _offline_root()
     if offline is not None:
-        path = (
-            offline
-            / f"miner_scores_{asset}_{slug_for(competition_for(asset, time_length))}.parquet"
-        )
+        path = offline / f"miner_scores_{asset}_{slug_for(competition_for(asset, time_length))}.parquet"
         if not path.exists():
-            raise FileNotFoundError(
-                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
-            )
+            raise FileNotFoundError(f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first.")
         df = pd.read_parquet(path)
         df = _filter_time_range(df, "scored_time", start_time, end_time)
         if df.empty:
@@ -120,9 +117,7 @@ def get_miner_scores(
             chunks.append(pd.DataFrame(data))
         cursor = chunk_end
 
-    _warn_on_middle_gap(
-        chunk_log, label=f"miner_scores asset={asset} time_length={time_length}"
-    )
+    _warn_on_middle_gap(chunk_log, label=f"miner_scores asset={asset} time_length={time_length}")
 
     df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
     if df.empty:
@@ -130,9 +125,9 @@ def get_miner_scores(
     df["scored_time"] = pd.to_datetime(df["scored_time"], utc=True)
     df = df.drop_duplicates(subset=["miner_uid", "scored_time", "asset", "time_length"])
     df["time_increment"] = time_increment
-    # API does not return start_time. Approximate as scored_time - time_length.
-    # The real start_time is a few minutes earlier (scoring delay), but this is
-    # close enough — _find_prediction_file does closest-match on the filename.
+    # API does not return start_time; derive it as scored_time - time_length. That IS the
+    # prompt's own start: the validator scores a prompt exactly time_length after it starts, so
+    # every derived value lands on a real validator_requests.start_time.
     df["start_time"] = df["scored_time"] - pd.Timedelta(seconds=time_length)
     return df
 
@@ -156,9 +151,7 @@ def get_rewards_history(
         suffix = prompt_name or "all"
         path = offline / f"rewards_history_{suffix}.parquet"
         if not path.exists():
-            raise FileNotFoundError(
-                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
-            )
+            raise FileNotFoundError(f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first.")
         df = pd.read_parquet(path)
         df = _filter_time_range(df, "updated_at", start_time, end_time)
         if df.empty:
@@ -179,9 +172,7 @@ def get_rewards_history(
         }
         if prompt_name is not None:
             params["prompt_name"] = prompt_name
-        resp = _http_get(
-            f"{SYNTHDATA_API_BASE}/rewards/scores", params=params, timeout=30
-        )
+        resp = _http_get(f"{SYNTHDATA_API_BASE}/rewards/scores", params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         chunk_log.append((cursor, chunk_end, len(data) if data else 0))
@@ -218,23 +209,13 @@ def get_daily_miner_pool_usd(
     if offline is not None:
         path = offline / "miner_pool_usd.parquet"
         if not path.exists():
-            raise FileNotFoundError(
-                f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first."
-            )
+            raise FileNotFoundError(f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first.")
         df = pd.read_parquet(path)
         if df.empty:
             return pd.Series(dtype=float)
         df["date"] = pd.to_datetime(df["date"], utc=True)
-        start_ts = (
-            pd.Timestamp(start_date)
-            if start_date.tzinfo
-            else pd.Timestamp(start_date, tz="UTC")
-        )
-        end_ts = (
-            pd.Timestamp(end_date)
-            if end_date.tzinfo
-            else pd.Timestamp(end_date, tz="UTC")
-        )
+        start_ts = pd.Timestamp(start_date) if start_date.tzinfo else pd.Timestamp(start_date, tz="UTC")
+        end_ts = pd.Timestamp(end_date) if end_date.tzinfo else pd.Timestamp(end_date, tz="UTC")
         mask = (df["date"] >= start_ts) & (df["date"] < end_ts)
         sub = df.loc[mask].sort_values("date")
         return pd.Series(
@@ -264,23 +245,36 @@ def get_daily_miner_pool_usd(
     return pd.Series(merged).sort_index()
 
 
-def load_prediction(path: Path) -> dict:
+def load_prediction(ref: PredictionRef | Path) -> dict:
     """
 
     Handles:
+      - Day file: `ref.row` of a float32 (prompts, simulations, steps) .npy, with the
+        metadata from the .json index beside it. Memory-mapped, so a worker reads only
+        its own prompt out of a file holding the whole day.
       - ArtifactManager format: {"simulation_input": {...}, "prediction": [meta, meta, path, ...]}
       - Notebook flat format:   {"start_timestamp": int, "paths": [...], ...}
 
     Always returns dict with keys: paths, num_simulations, num_steps, asset,
     time_increment, time_length.
     """
+    path = ref.path if isinstance(ref, PredictionRef) else ref
+    if isinstance(ref, PredictionRef) and ref.row is not None:
+        meta = json.loads(path.with_suffix(".json").read_text())
+        return {
+            "start_timestamp": meta["start_times"][ref.row],
+            "asset": meta["asset"],
+            "time_increment": meta["time_increment"],
+            "time_length": meta["time_length"],
+            "num_simulations": meta["num_simulations"],
+            "num_steps": meta["num_steps"],
+            "paths": np.load(path, mmap_mode="r")[ref.row],
+        }
     raw = json.loads(path.read_text())
     if "simulation_input" in raw:
         sim = raw["simulation_input"]
         return {
-            "start_timestamp": int(
-                datetime.fromisoformat(sim["start_time"]).timestamp()
-            ),
+            "start_timestamp": int(datetime.fromisoformat(sim["start_time"]).timestamp()),
             "asset": sim["asset"],
             "time_increment": sim["time_increment"],
             "time_length": sim["time_length"],
@@ -332,9 +326,5 @@ def download_price_data(
 
     frame = pd.concat(frames, ignore_index=True)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    frame = (
-        frame.sort_values("timestamp")
-        .drop_duplicates("timestamp")
-        .set_index("timestamp")
-    )
+    frame = frame.sort_values("timestamp").drop_duplicates("timestamp").set_index("timestamp")
     return frame[["close"]].loc[start_time:end_time].resample(freq).last()

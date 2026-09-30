@@ -13,9 +13,37 @@ class LiteLLMAdmin:
         self._timeout = timeout
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=1, max=30), reraise=True)
+    def delete_key_alias(self, alias: str) -> bool:
+        """Drop a virtual key by alias. True when the proxy accepted it, False when it had none.
+
+        Aliases are unique proxy-wide, so a key left behind by an earlier setup blocks the next
+        one. Its plaintext existed only in the generate response, so an orphan cannot be reused —
+        deleting is the only way back.
+        """
+        resp = requests.post(
+            f"{self._base}/key/delete",
+            headers=self._headers,
+            json={"key_aliases": [alias]},
+            timeout=self._timeout,
+        )
+        if resp.status_code in (400, 404):
+            return False  # nothing by that alias, which is the state we wanted
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"{resp.status_code} on /key/delete for alias {alias!r}: {resp.text[:500]}", response=resp
+            )
+        return True
+
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(min=1, max=30), reraise=True)
     def generate_key(self, alias: str, max_budget_usd: float | None) -> str:
         """max_budget_usd=None mints an UNCAPPED key: no proxy-side enforcement, the driver's
-        ledger polling is the only budget control."""
+        ledger polling is the only budget control.
+
+        Deletes any key already holding the alias first. setup is not atomic — it can die partway
+        through a panel, leaving some aliases taken — and the plaintext of those is unrecoverable,
+        so a rerun could otherwise never get past the first one without manual cleanup.
+        """
+        self.delete_key_alias(alias)
         resp = requests.post(
             f"{self._base}/key/generate",
             headers=self._headers,

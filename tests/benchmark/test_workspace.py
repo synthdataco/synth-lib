@@ -198,34 +198,23 @@ def test_scaffolded_predict_anchors_paths_to_workspace_not_cwd(tmp_path, monkeyp
 
     captured: dict = {}
 
-    class StubStore:
-        def __init__(self, asset, root=None, client=None):
-            captured["root"] = root
+    def stub_load(data_root, asset, start, end):
+        captured["data_root"] = data_root
+        idx = pd.date_range(start, end, freq="1min", tz="UTC")
+        return pd.DataFrame({c: 100.0 for c in ("open", "high", "low", "close", "volume", "trade_count")}, index=idx)
 
-        def load_range(self, start, end):
-            idx = pd.date_range(start, end, freq="1min", tz="UTC")
-            return pd.DataFrame(
-                {
-                    "timestamp": idx,
-                    "open": 100.0,
-                    "high": 100.0,
-                    "low": 100.0,
-                    "close": 100.0,
-                    "volume": 1.0,
-                    "trade_count": 1.0,
-                }
-            )
-
-    monkeypatch.setattr(predict, "MinutePriceStore", StubStore)
+    monkeypatch.setattr(predict, "load_minute_prices", stub_load)
     start = datetime(2026, 7, 10, tzinfo=timezone.utc)
     end = datetime(2026, 7, 10, 3, tzinfo=timezone.utc)
     n = predict.generate("BTC", start, end, cadence_minutes=60)
 
     assert n == 3
-    root = captured["root"]
-    assert root is not None and Path(root).is_absolute(), f"cwd-relative root: {root}"
-    assert ws in Path(root).parents, f"root outside the workspace: {root}"
-    assert Path(root) == ws / "market_data" / "prices" / "BTC" / "1m"
+    data_root = captured["data_root"]
+    assert data_root is not None and Path(data_root).is_absolute(), f"cwd-relative root: {data_root}"
+    assert ws in Path(data_root).parents, f"root outside the workspace: {data_root}"
+    assert Path(data_root) == ws / "market_data"
+    # store_root stays the anchor the coverage check uses, and must not drift back to the cwd
+    assert predict.store_root("BTC") == ws / "market_data" / "prices" / "BTC" / "1m"
 
 
 def _scaffold_and_import(tmp_path, monkeypatch):

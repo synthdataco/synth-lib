@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import bisect
+import json
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -113,32 +116,69 @@ def _parse_prediction_filename_time(path: Path) -> datetime | None:
     return datetime.strptime(time_str, "%Y-%m-%d_%H:%M:%SZ").replace(tzinfo=UTC)
 
 
+@dataclass(frozen=True)
+class PredictionRef:
+    """Where one prompt's paths live. `row` indexes into a day file; None means the
+    file is the prompt, which is how predictions were written before the day layout."""
+
+    path: Path
+    row: int | None = None
+
+
+PredictionIndex = dict[tuple[str, int], dict[pd.Timestamp, PredictionRef]]
+
+
+def build_prediction_index(root: Path) -> PredictionIndex:
+    """Map (asset, time_length) -> {start_time: PredictionRef} over a predictions tree.
+
+    Reads the day layout written by generate_predictions
+    (`<asset>/<time_length>_<time_increment>/date=*.npy` beside a `.json` index) and
+    the one-JSON-per-prompt trees that predate it, so an archived champion still scores.
+    """
+    index: PredictionIndex = {}
+    for day_index in sorted(root.glob("*/*/date=*.json")):
+        meta = json.loads(day_index.read_text())
+        paths_file = day_index.with_suffix(".npy")
+        if not paths_file.exists():
+            continue  # an index without its paths is an interrupted write, not a prompt
+        key = (meta["asset"], meta["time_length"])
+        for row, start in enumerate(meta["start_times"]):
+            index.setdefault(key, {})[pd.Timestamp(start)] = PredictionRef(
+                paths_file, row
+            )
+    for prompt_file in sorted(root.glob("**/*.json")):
+        start = _parse_prediction_filename_time(prompt_file)
+        if start is None or prompt_file.name.startswith("_"):
+            continue
+        parts = prompt_file.stem.split("_")
+        key = (parts[2], int(parts[3]))
+        index.setdefault(key, {})[pd.Timestamp(start)] = PredictionRef(prompt_file)
+    return index
+
+
 def _find_prediction_file(
-    prediction_files: list[Path],
+    index: PredictionIndex,
     start_time: datetime,
     asset: str,
     time_length: int,
     tolerance_minutes: int = PREDICTION_MATCH_TOLERANCE_MINUTES,
-) -> Path | None:
-    """Find the closest prediction file matching the given start_time, asset, and time_length.
+) -> PredictionRef | None:
+    """The closest prediction to start_time for this (asset, time_length), or None.
 
-    start_time is approximate (derived from scored_time - time_length). The real
-    prediction file start_time is a few minutes earlier due to scoring delay, so
-    we match the closest file within tolerance_minutes.
+    start_time is approximate (derived from scored_time - time_length), so the match is
+    nearest within tolerance_minutes rather than exact. Bisects the sorted start_times:
+    a window holds thousands of prompts and this runs once per prompt.
     """
-    suffix = f"_{asset}_{time_length}.json"
-    candidates = [p for p in prediction_files if p.name.endswith(suffix)]
-
-    best_path = None
+    prompts = index.get((asset, time_length))
+    if not prompts:
+        return None
+    starts = sorted(prompts)
+    target = pd.Timestamp(start_time)
+    position = bisect.bisect_left(starts, target)
+    best: pd.Timestamp | None = None
     best_delta = timedelta(minutes=tolerance_minutes)
-
-    for path in candidates:
-        file_time = _parse_prediction_filename_time(path)
-        if file_time is None:
-            continue
-        delta = abs(start_time - file_time)
+    for candidate in starts[max(0, position - 1) : position + 1]:
+        delta = abs(target - candidate).to_pytimedelta()
         if delta < best_delta:
-            best_delta = delta
-            best_path = path
-
-    return best_path
+            best_delta, best = delta, candidate
+    return prompts[best] if best is not None else None

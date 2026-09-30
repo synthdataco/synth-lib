@@ -21,9 +21,12 @@ therefore appear in the verdict report, and a candidate with failures is not str
 comparable to a candidate without failures — comparability is judged at the meta-report
 level, not here.
 
-Each competition also writes a rank-evolution chart into `charts_dir`, the candidate's rank
-per scoring round against the field it faced. The verdict reports the first and last round; the
-chart is the only place the path between them is visible.
+Each competition also writes into `out_dir`, beside the verdict JSON: a rank-evolution chart (the
+candidate's rank per scoring round against the field it faced — the verdict reports only the first
+and last round), the per-prompt CRPS frame, and the recomputed smoothed scores and reward weights
+of the whole field. The last two carry every miner, not just the candidate, so a champion that is
+also mining live can be read twice out of one file: uid 999 as the backtester scored it, and its
+live uid as the validator did.
 
 Validator realized sourcing (Binance/HL), scores API paginated 1 day, CRPS = the
 validator's official function — all handled by synth-lib.
@@ -34,16 +37,21 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
 from synth.validator.competition_config import COM_EQU_24H, CRYPTO_1H, CRYPTO_24H  # type: ignore[import-untyped]
 from synth_lib.backtester.config import _OFFLINE_ENV_VAR, slug_for  # type: ignore[import-untyped]
+from synth_lib.backtester.loading import get_rewards_history  # type: ignore[import-untyped]
 from synth_lib.backtester.orchestration import backtest  # type: ignore[import-untyped]
 from synth_lib.backtester.plots.rank import plot_total_rank_evolution  # type: ignore[import-untyped]
 from synth_lib.backtester.scoring import compute_combined_smoothed_scores  # type: ignore[import-untyped]
-from synth_lib.backtester.scripts.build_offline_bundle import build_bundle  # type: ignore[import-untyped]
+from synth_lib.backtester.scripts.build_offline_bundle import (  # type: ignore[import-untyped]
+    build_bundle,
+    coerce_numeric_columns,
+)
 
 COMPETITIONS = (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H)
 MINER_ID = 999  # uid used to inject the candidate into the field (synth-lib default)
@@ -101,17 +109,66 @@ def final_rank(smoothed_scores: pd.DataFrame, miner_id: int = MINER_ID) -> tuple
     return rank, int(len(last))
 
 
-def _rank_chart(results: list, combined: pd.DataFrame, slug: str, charts_dir: Path) -> str | None:
+def _rank_chart(results: list, combined: pd.DataFrame, slug: str, out_dir: Path) -> str | None:
     """Write the competition's rank-evolution chart and return its filename.
 
     A chart is a report, not a result: a failure here must not lose a scoring run that has already
     spent its sandbox time, so it is reported and the verdict is written without it.
     """
     try:
-        return plot_total_rank_evolution(results, combined, slug, charts_dir).name
+        return plot_total_rank_evolution(results, combined, slug, out_dir).name
     except (RuntimeError, ValueError, KeyError) as exc:
         print(f"  [{slug}] rank chart failed: {exc}")
         return None
+
+
+def _live_rewards(combined: pd.DataFrame, slug: str) -> pd.DataFrame | None:
+    """The validator's own smoothed_score and reward_weight over the rounds the backtest recomputed.
+
+    Read from the same offline bundle, so it costs nothing and cannot drift from what was scored.
+    It is the reference the recomputed field_rewards is checked against: a miner present in both
+    should hold the same weight in the same round, and the candidate's rank is only meaningful if
+    the rest of the field reconstructs.
+    """
+    if combined.empty:
+        return None
+    rounds = pd.to_datetime(combined["updated_at"], utc=True)
+    live = get_rewards_history(
+        rounds.min().to_pydatetime(), (rounds.max() + pd.Timedelta(seconds=1)).to_pydatetime(), prompt_name=slug
+    )
+    return None if live.empty else live
+
+
+def _frames(results: list, combined: pd.DataFrame, slug: str, out_dir: Path) -> dict[str, str]:
+    """Write the competition's per-prompt CRPS, recomputed field rewards and the validator's own,
+    and name what landed.
+
+    `prompt_scores` is every BacktestResult.prompt_df concatenated — one row per (prompt, miner),
+    carrying crps, new_prompt_scores, percentile95 and lowest_score. `field_rewards` is the frame
+    the rank and the Score are read off: updated_at, miner_uid, new_smoothed_score, reward_weight.
+    `live_rewards` is the same two quantities as the validator published them.
+    Reported like the chart rather than raised: a write failure must not lose a scored run.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames = {
+        "prompt_scores": pd.concat([r.prompt_df for r in results], ignore_index=True) if results else None,
+        "field_rewards": combined if not combined.empty else None,
+        "live_rewards": _live_rewards(combined, slug),
+    }
+    written: dict[str, str] = {}
+    for kind, frame in frames.items():
+        if frame is None or frame.empty:
+            continue
+        name = f"{kind}_{slug}.parquet"
+        try:
+            # A miner posting a score beyond int64 types the column `object`, which pyarrow
+            # refuses mid-write.
+            coerce_numeric_columns(frame).to_parquet(out_dir / name, index=False)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"  [{slug}] {name} failed: {exc}")
+            continue
+        written[kind] = name
+    return written
 
 
 def evaluate_candidate(
@@ -119,7 +176,8 @@ def evaluate_candidate(
     predictions_dir: Path,
     window_end: pd.Timestamp,
     window_days: int,
-    charts_dir: Path,
+    out_dir: Path,
+    simulate_registration: datetime | None = None,
 ) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
@@ -132,7 +190,13 @@ def evaluate_candidate(
     percentiles. The candidate's (uid 999) rank/percentile in this combined field is computed by
     final_rank(). Percentile = 1 - (rank-1)/field_size.
 
-    One rank-evolution chart per competition lands in `charts_dir`, named for the competition.
+    Per competition, `out_dir` receives a rank-evolution chart, the per-prompt CRPS frame and the
+    recomputed field rewards, each named for the competition.
+
+    `simulate_registration` scores the champion as a miner that registered that day: its CRPS rows
+    before it are dropped, the validator's moving average classifies it as a late joiner, and the
+    preceding `competition.window_days` are backfilled at the field's worst score. That is what a
+    champion actually earns in its first days live, and it is NOT comparable to a Score without it.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []
@@ -153,6 +217,7 @@ def evaluate_candidate(
                     predictions_dir=predictions_dir,
                     eval_end=window_end.to_pydatetime(),
                     competition=comp,
+                    simulate_registration=simulate_registration,
                 )
                 results.append(result)
                 per_asset[asset] = {
@@ -168,7 +233,18 @@ def evaluate_candidate(
                 assets_failed.append(asset)
                 per_asset[asset] = {"error": repr(exc)}
 
-        combined = compute_combined_smoothed_scores(results, competition=comp)
+        # Also here, not only per asset: without it _trim_warmup drops the first
+        # competition.window_days of rounds — exactly the backfilled onboarding period the
+        # flag exists to show — and the headline rank, rewards and charts all read this frame.
+        combined = compute_combined_smoothed_scores(
+            results, competition=comp, simulate_registration=simulate_registration
+        )
+        if simulate_registration is not None and not combined.empty:
+            # The lookback is needed to compute the moving average, but the candidate did not exist
+            # in it. Its rows there carry the new-miner backfill's weight, and summing them would
+            # credit the champion with emissions from before it registered.
+            rounds = pd.to_datetime(combined["updated_at"], utc=True)
+            combined = combined.loc[rounds >= pd.Timestamp(simulate_registration)].reset_index(drop=True)
         has_candidate = not combined.empty and bool((combined["miner_uid"] == MINER_ID).any())
         if results and has_candidate:
             rank, field_size = final_rank(combined)
@@ -178,13 +254,14 @@ def evaluate_candidate(
             # rank_over_rounds averages the candidate's rank across every scoring round of the
             # window — the requested per-competition average rank, robust to a lucky last round.
             rank_over_rounds = asset_rank_stats(combined)
-            rank_chart = _rank_chart(results, combined, slug, charts_dir)
+            rank_chart = _rank_chart(results, combined, slug, out_dir)
         else:
             rank = field_size = None
             percentile = None
             rewards = None
             rank_over_rounds = None
             rank_chart = None
+        frames = _frames(results, combined, slug, out_dir)
 
         per_competition[slug] = {
             "rank": rank,
@@ -192,6 +269,7 @@ def evaluate_candidate(
             "percentile": percentile,
             "rank_over_rounds": rank_over_rounds,
             "rank_chart": rank_chart,
+            "frames": frames,
             "rewards": rewards,
             "assets_failed": assets_failed,
             "per_asset": per_asset,
@@ -225,7 +303,12 @@ def write_verdict(candidates: list[dict], out_path: Path) -> None:
     out_path.write_text(json.dumps({"ranking": [c["name"] for c in ranked], "candidates": ranked}, indent=2))
 
 
-def prepare_offline_bundle(window_end: pd.Timestamp, window_days: int, out_root: Path | None = None) -> Path:
+def prepare_offline_bundle(
+    window_end: pd.Timestamp,
+    window_days: int,
+    out_root: Path | None = None,
+    simulate_registration: datetime | None = None,
+) -> Path:
     """Builds the synth-lib offline bundle for the three competitions (mandatory for a
     window > ~3 days, since the live scores API rejects wider ranges) and exports
     SYNTH_BACKTESTER_OFFLINE_DATA_ROOT. Thin wrapper around build_bundle
@@ -235,11 +318,15 @@ def prepare_offline_bundle(window_end: pd.Timestamp, window_days: int, out_root:
     bundle directory.
     """
     anchor = window_end.to_pydatetime()
-    out = out_root or Path("offline_data") / f"verdict_{anchor:%Y%m%d}_{window_days}d"
+    # Simulating registration pushes the frame back another competition.window_days before the
+    # registration day, so the field has to be bundled for a period the candidate did not exist in.
+    extra = max(c.window_days for c in COMPETITIONS) if simulate_registration is not None else 0
+    days = window_days + extra
+    out = out_root or Path("offline_data") / f"verdict_{anchor:%Y%m%d}_{days}d"
     for comp in COMPETITIONS:
         build_bundle(
             slug=slug_for(comp),
-            days=window_days,
+            days=days,
             eval_end=anchor,
             assets=list(comp.asset_list),
             chunk_days=2.0,

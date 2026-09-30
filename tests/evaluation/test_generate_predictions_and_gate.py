@@ -19,6 +19,7 @@ from synth.simulation_input import SimulationInput  # type: ignore[import-untype
 from synth.validator import response_validation_v2  # type: ignore[import-untyped]
 
 from synth_lib.benchmark.generate_predictions import (
+    context_end,
     CONTEXT_MINUTES,
     generate,
     load_minute_prices,
@@ -75,37 +76,74 @@ def test_context_never_reaches_past_the_prompt(tmp_path):
         time_length=86_400,
         num_simulations=3,
     )
-    assert n == 4 == len(seen)  # 00:00, 06:00, 12:00, 18:00 — 24:00 excluded (t < window_end)
+    assert n == (4, 0) and len(seen) == 4  # 00:00, 06:00, 12:00, 18:00 — 24:00 excluded (t < window_end)
     for t, lo, hi in seen:
-        assert hi <= t, f"context leaked past the prompt: {hi} > {t}"
+        # The bar labelled t closes at t + 60s and its close is the prompt's first scored point, so
+        # "up to t" would already be a leak. A 24h prompt is issued 120s early, plus the bar width.
+        assert hi <= t - pd.Timedelta(seconds=180), f"context leaked past the issuance: {hi} vs {t}"
         assert lo >= t - pd.Timedelta(minutes=CONTEXT_MINUTES)
 
 
-def test_prediction_file_format(tmp_path):
-    series = _series("2026-07-23", 9)
-    simulate = load_simulate(SCAFFOLD_MODELING)
-    generate(
-        simulate,
+def _generate_one_day(tmp_path, window_end="2026-07-30 01:00"):
+    return generate(
+        load_simulate(SCAFFOLD_MODELING),
         "BTC",
         pd.Timestamp("2026-07-30", tz="UTC"),
-        pd.Timestamp("2026-07-30 01:00", tz="UTC"),
-        _frame(series),
+        pd.Timestamp(window_end, tz="UTC"),
+        _frame(_series("2026-07-23", 9)),
         tmp_path,
         cadence_minutes=60,
         time_increment=300,
         time_length=86_400,
         num_simulations=5,
     )
-    files = list(tmp_path.glob("*.json"))
-    assert [f.name for f in files] == ["2026-07-30_00:00:00Z_BTC_86400.json"]
-    payload = json.loads(files[0].read_text())
-    assert payload["num_steps"] == 289 and len(payload["paths"]) == 5
-    assert all(len(p) == 289 for p in payload["paths"])
+
+
+def test_prediction_file_format(tmp_path):
+    """One file per day, float32, shaped (prompts, simulations, steps), with an index naming the
+    prompt start_times it holds — that index is what makes a re-run skippable."""
+    assert _generate_one_day(tmp_path) == (1, 0)
+
+    root = tmp_path / "BTC" / "86400_300"
+    assert sorted(f.name for f in root.iterdir()) == ["date=2026-07-30.json", "date=2026-07-30.npy"]
+    paths = np.load(root / "date=2026-07-30.npy")
+    assert paths.shape == (1, 5, 289) and paths.dtype == np.float32
+    index = json.loads((root / "date=2026-07-30.json").read_text())
+    assert index["start_times"] == ["2026-07-30T00:00:00+00:00"]
+    assert index["num_simulations"] == 5 and index["num_steps"] == 289
+
+
+def test_a_day_already_generated_is_not_generated_again(tmp_path):
+    """The point of the cache: a re-score of a window reuses the paths instead of paying for them."""
+    assert _generate_one_day(tmp_path) == (1, 0)
+    before = (tmp_path / "BTC" / "86400_300" / "date=2026-07-30.npy").stat().st_mtime_ns
+
+    assert _generate_one_day(tmp_path) == (0, 1)
+    assert (tmp_path / "BTC" / "86400_300" / "date=2026-07-30.npy").stat().st_mtime_ns == before
+
+
+def test_a_day_missing_a_prompt_is_regenerated(tmp_path):
+    """A wider window over the same day wants prompts the file does not hold; a partial day is
+    never served, so an interrupted run cannot silently score fewer prompts."""
+    assert _generate_one_day(tmp_path) == (1, 0)
+    assert _generate_one_day(tmp_path, window_end="2026-07-30 03:00") == (3, 0)
+    index = json.loads((tmp_path / "BTC" / "86400_300" / "date=2026-07-30.json").read_text())
+    assert len(index["start_times"]) == 3
 
 
 def test_prompt_grid_keeps_last_prompt_on_unaligned_end():
     grid = prompt_grid(pd.Timestamp("2026-07-30", tz="UTC"), pd.Timestamp("2026-07-30 02:30", tz="UTC"), 60)
     assert [t.hour for t in grid] == [0, 1, 2]  # 02:00 kept despite the unaligned end
+
+
+def test_explicit_prompt_times_replace_the_grid_and_stay_inside_the_window():
+    """The validator's kept requests sit at arbitrary minutes, so the list is not a grid — but it
+    is still bounded by the window, and anything outside it has no realized path yet."""
+    times = [pd.Timestamp(t, tz="UTC") for t in ("2026-07-29 23:50", "2026-07-30 00:04", "2026-07-30 02:31")]
+    grid = prompt_grid(
+        pd.Timestamp("2026-07-30", tz="UTC"), pd.Timestamp("2026-07-30 02:30", tz="UTC"), 60, prompt_times=times
+    )
+    assert [str(t) for t in grid] == ["2026-07-30 00:04:00+00:00"]
 
 
 def test_store_root_resolves_under_prices(tmp_path):
@@ -181,3 +219,16 @@ def test_gate_wrapped_output_passes_the_live_contract():
         *[[float(f"{v:.7e}") for v in path] for path in raw[2:]],
     )
     assert _gate(wrapped, sim_input) == "CORRECT"
+
+
+def test_the_context_stops_before_the_first_scored_point():
+    """The store labels a bar by its OPEN time, so the bar labelled t closes at t+60s — and that
+    close is real_prices[0], the first point the prompt is scored against. Ending the context at t
+    hands the model the answer to its own first step. crypto-1h is issued 60s early, the 24h
+    competitions 120s, and a miner cannot hold a bar that has not closed by then."""
+    t = pd.Timestamp("2026-09-20T12:00:00Z")
+    assert context_end(t, 3_600) == t - pd.Timedelta(seconds=120)
+    assert context_end(t, 86_400) == t - pd.Timedelta(seconds=180)
+    assert context_end(t, 3_600, issuance_lead=0) == t - pd.Timedelta(seconds=60)
+    # never at or past t, whatever the format
+    assert all(context_end(t, tl) < t for tl in (3_600, 86_400, 999))

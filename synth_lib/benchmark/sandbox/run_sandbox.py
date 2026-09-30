@@ -44,6 +44,7 @@ def sandbox_cmd(
     inner_cmd: str,
     name: str | None = None,
     gpus: bool = True,
+    predictions: Path | None = None,
 ) -> list[str]:
     # docker requires ABSOLUTE host paths (a relative path is read as a volume name)
     workspace, snapshot, home = workspace.resolve(), snapshot.resolve(), home.resolve()
@@ -72,6 +73,10 @@ def sandbox_cmd(
         "-w",
         "/workspace",
     ]
+    # Outlives the workspace, so a re-score reuses the paths instead of regenerating them.
+    if predictions is not None:
+        predictions.mkdir(parents=True, exist_ok=True)
+        cmd += ["-v", f"{predictions.resolve()}:/workspace/predictions:rw"]
     if name is not None:
         cmd += ["--name", name]
     for k, v in env.items():

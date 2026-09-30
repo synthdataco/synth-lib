@@ -8,15 +8,18 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      built, and that needs the network. It fetches only pinned packages, never prices.
   4. Phase 2 (network=none): one sandbox run per (competition, asset) generating predictions.
      The data root is mounted read-only at /workspace/market_data; the model itself only ever
-     receives the pre-prompt context Series (see generate_predictions.py).
+     receives the pre-prompt context Series (see generate_predictions.py). Predictions are
+     written to a cache mounted at /workspace/predictions that outlives the workspace, one file
+     per day, so a re-score of a window already generated skips straight to scoring.
   5. On the host: evaluate_candidate() against the offline bundle -> per-competition rank +
      simulated emissions -> Score = 100 x mean over competitions of reward_vs_top (see
      evaluate.reward_metrics; the unweighted mean mirrors the subnet's 1/3-per-competition
      emission split, and the softmaxed reward_weight makes top positions worth more, which a
      rank percentile would flatten).
-  6. Write campaign_results/<campaign>/<leg>/verdict.json, and the per-competition
-     rank-evolution charts beside it in verdict-charts/ (one directory per verdict, so a
-     re-score under --tag cannot overwrite the charts of the verdict it is compared against).
+  6. Write campaign_results/<campaign>/<leg>/verdict-<tag>/ — the verdict.json, the
+     per-competition rank-evolution charts, the per-prompt CRPS frames and the recomputed field
+     rewards. One directory per verdict, so a re-score under --tag cannot overwrite the artifacts
+     of the verdict it is compared against.
 
 The synth_default baseline runs on the HOST (trusted repo code; note its known caveat below).
 
@@ -29,16 +32,18 @@ Usage (on the box, after ingesting prices up to window_end + 1 day):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
+from synth_lib.backtester.loading import get_miner_scores
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
@@ -48,14 +53,32 @@ GENERATE_SCRIPT = Path(__file__).resolve().parents[1] / "generate_predictions.py
 SANDBOX_IMAGE = DEFAULT_IMAGE
 SANDBOX_MEMORY_GB = 12
 SANDBOX_CPUS = 12
-# Prompt grid density per format: hourly for the 24h competitions, 10-minute for crypto-1h —
-# roughly how the field itself is sampled by the scores API.
+# Prompt grid density per format: hourly for the 24h competitions, 10-minute for crypto-1h. It is
+# the density the validator scores at — one request per asset per hour for the 24h competitions,
+# one per 10 minutes for crypto-1h — but not the phase: the kept request sits at an arbitrary
+# minute inside its bucket, so a grid prompt is up to half a cadence from the one the field
+# answered. --live-prompts replaces the grid with the real start_times.
 CADENCE_MINUTES = {86_400: 60, 3_600: 10}
+# Written into the workspace for --live-prompts; the generator reads one file per (asset, format).
+PROMPT_TIMES_DIR = "prompt_times"
+# A prompt's paths depend on the champion's code and on the seed it was generated with, so both
+# are in the cache path: nothing else distinguishes two runs of the same window.
+DEFAULT_PREDICTIONS_CACHE = Path("predictions_cache")
 
 # Constitution rule 7: a champion that uses randomness seeds every generator from this, and it
 # is set only here, at evaluation. Absent during a campaign, so an agent's own runs vary.
 SEED_ENV = "SYNTH_BENCHMARK_SEED"
+# Python salts string hashing per process, so a champion that derives its own seed from hash() —
+# which rule 7 does not reach, and campaign-3's champion does — draws different paths on every
+# run. Pinning this makes those champions reproducible too. Must be set before the interpreter
+# starts, which is why it travels as an env var rather than being set in the generator.
+HASH_SEED_ENV = "PYTHONHASHSEED"
 DEFAULT_SEED = 0
+
+
+def generation_env(seed: int) -> dict[str, str]:
+    """What a generation process needs to be reproducible."""
+    return {SEED_ENV: str(seed), HASH_SEED_ENV: str(seed % 2**32)}
 
 
 def generation_start(window_start: str, time_length: int, lead_in: bool) -> str:
@@ -78,6 +101,38 @@ def generation_start(window_start: str, time_length: int, lead_in: bool) -> str:
     return start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def live_prompt_starts(window: tuple[str, str], lead_in: bool) -> dict[tuple[str, int], list[pd.Timestamp]]:
+    """The start_times the validator actually scored, per (asset, time_length).
+
+    Read from the offline bundle, which is built first: `scored_time - time_length` is the prompt's
+    own start, and the bundle already holds only the density-tapered set the validator kept — one
+    request per asset per hour for the 24h competitions, one per 10 minutes for crypto-1h. The
+    issued set behind it is ten times larger and was never scored.
+    """
+    out: dict[tuple[str, int], list[pd.Timestamp]] = {}
+    for comp in COMPETITIONS:
+        start = pd.Timestamp(generation_start(window[0], comp.time_length, lead_in)).to_pydatetime()
+        end = pd.Timestamp(window[1], tz="UTC").to_pydatetime()
+        for asset in comp.asset_list:
+            # The scores are keyed on scored_time, so ask from one horizon after the first prompt.
+            scores = get_miner_scores(
+                start + timedelta(seconds=comp.time_length), end, asset, comp.time_length, comp.time_increment
+            )
+            starts = [] if scores.empty else sorted(pd.to_datetime(scores["start_time"], utc=True).unique())
+            out[(asset, comp.time_length)] = [t for t in starts if start <= t.to_pydatetime() < end]
+            print(f"  {asset} tl={comp.time_length}: {len(out[(asset, comp.time_length)])} prompts", flush=True)
+    return out
+
+
+def write_prompt_times(root: Path, prompt_starts: dict[tuple[str, int], list[pd.Timestamp]]) -> None:
+    """One JSON list of start_times per (asset, time_length), named as the generator expects."""
+    directory = root / PROMPT_TIMES_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    for (asset, time_length), starts in prompt_starts.items():
+        path = directory / f"{asset}_{time_length}.json"
+        path.write_text(json.dumps([pd.Timestamp(t).isoformat() for t in starts]))
+
+
 def run(cmd: list[str], what: str, env: dict[str, str] | None = None) -> None:
     result = subprocess.run(cmd, capture_output=True, env={**os.environ, **env} if env else None)
     if result.returncode != 0:
@@ -95,6 +150,25 @@ def docker_limits() -> tuple[int, int]:
     return min(SANDBOX_CPUS, int(ncpu)), min(SANDBOX_MEMORY_GB, int(mem_bytes) // 1024**3)
 
 
+def baseline_identity(modeling: Path) -> str:
+    """Short content hash of the baseline's source, so changing it cannot reuse its cache."""
+    return hashlib.sha256(modeling.read_bytes()).hexdigest()[:12]
+
+
+def predictions_cache(root: Path, champion: str, seed: int, live_prompts: bool, lead_in: bool) -> Path:
+    """Where one champion's generated paths live, across runs.
+
+    Everything that decides WHICH prompts get generated is in the path. Two runs that disagree on
+    any of it answer the same window at different instants, and scoring matches the nearest
+    prediction within half an hour — so a shared tree would serve one run the other's predictions,
+    silently reproducing the behaviour the differing flag exists to measure.
+    """
+    mode = "live-prompts" if live_prompts else "cadence-grid"
+    if not lead_in:
+        mode += "-no-lead-in"
+    return root / champion / f"seed={seed}" / mode
+
+
 def sandbox(
     workspace: Path,
     data_root: Path,
@@ -105,6 +179,7 @@ def sandbox(
     cpus: int = SANDBOX_CPUS,
     memory_gb: int = SANDBOX_MEMORY_GB,
     env: dict[str, str] | None = None,
+    predictions: Path | None = None,
 ) -> list[str]:
     return sandbox_cmd(
         workspace=workspace,
@@ -117,6 +192,7 @@ def sandbox(
         env=env or {},
         inner_cmd=inner,
         gpus=gpus,
+        predictions=predictions,
     )
 
 
@@ -134,13 +210,18 @@ def generate_all(
     limits: tuple[int, int],
     seed: int,
     lead_in: bool = True,
+    prompt_starts: dict[tuple[str, int], list[pd.Timestamp]] | None = None,
+    cache: Path | None = None,
 ) -> None:
     """One --network none sandbox run per (competition, asset).
 
-    The sandbox inherits nothing from the host, so the seed has to be handed to it explicitly."""
+    The sandbox inherits nothing from the host, so the seed and the prompt start_times have to be
+    handed to it explicitly — the latter as files in the workspace, since it has no network."""
     if not GENERATE_SCRIPT.exists():  # packaging regression: it must ship with the package
         raise FileNotFoundError(f"generation core missing at {GENERATE_SCRIPT}")
     shutil.copy(GENERATE_SCRIPT, workspace / "generate_predictions.py")
+    if prompt_starts is not None:
+        write_prompt_times(workspace, prompt_starts)
     for comp in COMPETITIONS:
         for asset in comp.asset_list:
             inner = (
@@ -153,6 +234,8 @@ def generate_all(
                 f" --cadence-minutes {CADENCE_MINUTES[comp.time_length]}"
                 f" --time-increment {comp.time_increment} --time-length {comp.time_length}"
             )
+            if prompt_starts is not None:
+                inner += f" --prompt-times {PROMPT_TIMES_DIR}/{asset}_{comp.time_length}.json"
             try:
                 run(
                     sandbox(
@@ -164,7 +247,8 @@ def generate_all(
                         gpus=gpus,
                         cpus=limits[0],
                         memory_gb=limits[1],
-                        env={SEED_ENV: str(seed)},
+                        env=generation_env(seed),
+                        predictions=cache,
                     ),
                     f"generate {asset} tl={comp.time_length}",
                 )
@@ -178,13 +262,23 @@ def generate_all(
 
 
 def generate_baseline(
-    modeling: Path, data_root: Path, out_dir: Path, window: tuple[str, str], seed: int, lead_in: bool = True
+    modeling: Path,
+    data_root: Path,
+    out_dir: Path,
+    window: tuple[str, str],
+    seed: int,
+    lead_in: bool = True,
+    prompt_starts: dict[tuple[str, int], list[pd.Timestamp]] | None = None,
 ) -> None:
     """Host-side, trusted repo code. Known caveat: the subnet's default generator ignores
     context_prices and anchors on a price it fetches ITSELF — for past prompts that anchor may be
     wrong, so read the baseline's verdict with suspicion and drop it from the article if broken."""
+    if prompt_starts is not None:
+        write_prompt_times(out_dir.parent, prompt_starts)
+    out_dir.mkdir(parents=True, exist_ok=True)
     for comp in COMPETITIONS:
         for asset in comp.asset_list:
+            times = out_dir.parent / PROMPT_TIMES_DIR / f"{asset}_{comp.time_length}.json"
             try:
                 run(
                     [
@@ -199,9 +293,10 @@ def generate_baseline(
                         *("--data-root", str(data_root), "--out-dir", str(out_dir)),
                         *("--cadence-minutes", str(CADENCE_MINUTES[comp.time_length])),
                         *("--time-increment", str(comp.time_increment), "--time-length", str(comp.time_length)),
+                        *(("--prompt-times", str(times)) if prompt_starts is not None else ()),
                     ],
                     f"baseline {asset} tl={comp.time_length}",
-                    env={SEED_ENV: str(seed)},
+                    env=generation_env(seed),
                 )
             except RuntimeError as exc:
                 print(f"  SKIP baseline {asset} tl={comp.time_length}: {str(exc).splitlines()[-1]}", flush=True)
@@ -209,8 +304,15 @@ def generate_baseline(
             print(f"  baseline {asset} tl={comp.time_length}", flush=True)
 
 
-def score(name: str, predictions: Path, window_end: pd.Timestamp, window_days: int, charts: Path) -> dict:
-    result = evaluate_candidate(name, predictions, window_end, window_days, charts)
+def score(
+    name: str,
+    predictions: Path,
+    window_end: pd.Timestamp,
+    window_days: int,
+    out_dir: Path,
+    simulate_registration: datetime | None = None,
+) -> dict:
+    result = evaluate_candidate(name, predictions, window_end, window_days, out_dir, simulate_registration)
     mrt = result["mean_reward_vs_top"]
     result["score"] = round(100 * mrt, 1) if mrt is not None else None
     ranks = [c["rank"] for c in result["per_competition"].values() if c["rank"] is not None]
@@ -221,7 +323,14 @@ def score(name: str, predictions: Path, window_end: pd.Timestamp, window_days: i
     return result
 
 
-def verdict_payload(result: dict, sha: str | None, window: tuple[str, str], seed: int) -> dict:
+def verdict_payload(
+    result: dict,
+    sha: str | None,
+    window: tuple[str, str],
+    seed: int,
+    simulate_registration: datetime | None,
+    live_prompts: bool,
+) -> dict:
     return {
         "score": result["score"],
         "mean_competition_rank": result["mean_competition_rank"],
@@ -245,6 +354,13 @@ def verdict_payload(result: dict, sha: str | None, window: tuple[str, str], seed
         # What a stochastic champion was seeded with. Without it "seeded" is unverifiable and
         # a re-score of this window cannot reproduce the number above.
         "seed": seed,
+        # A Score with a simulated registration includes the onboarding backfill every real
+        # miner pays once. It answers a different question from the steady-state Score and the
+        # two must never be read as the same number.
+        "simulate_registration": simulate_registration.isoformat() if simulate_registration else None,
+        # False means the candidate answered a cadence grid and cadence_minutes describes it; True
+        # means it answered the validator's own scored start_times and the grid was not used.
+        "live_prompts": live_prompts,
     }
 
 
@@ -259,7 +375,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     ap.add_argument(
         "--tag",
         default=None,
-        help="write verdict-<tag>.json instead of verdict.json — use for extra windows (in-sample "
+        help="write into verdict-<tag>/ instead of verdict/ — use for extra windows (in-sample "
         "diagnostics) so they never overwrite the pre-registered window's canonical verdict",
     )
     ap.add_argument("--force", action="store_true", help="rescore legs whose verdict.json already exists")
@@ -277,11 +393,35 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         help="dotted module path or file path exposing simulate() (default: the packaged control)",
     )
     ap.add_argument(
+        "--simulate-registration",
+        action="store_true",
+        help="score the champion as a miner that registered on --window-start: its rows before that "
+        "day are dropped, so the validator's moving average treats it as a late joiner and backfills "
+        "the preceding window at the field's worst score. This is what a champion earns in its first "
+        "days live, and it is NOT comparable to a Score without it — give it its own --tag.",
+    )
+    ap.add_argument(
+        "--live-prompts",
+        action="store_true",
+        help="generate at the start_times the validator actually scored, instead of an even cadence "
+        "grid. Same number of prompts, different minutes: the kept request sits at an arbitrary "
+        "minute in its bucket, so without this the candidate answers up to half a cadence away from "
+        "the prompt the field answered and is scored against that prompt's realized path.",
+    )
+    ap.add_argument(
         "--seed",
         type=int,
         default=DEFAULT_SEED,
         help=f"value of {SEED_ENV} for generation, recorded in the verdict. Constitution rule 7 "
         "has a stochastic champion seed every generator from it, so a re-score reproduces",
+    )
+    ap.add_argument(
+        "--predictions-cache",
+        type=Path,
+        default=DEFAULT_PREDICTIONS_CACHE,
+        help="where generated paths are kept between runs, under <sha>/seed=<n>/<prompt mode>. A day already "
+        "covering every prompt of a re-score is reused instead of regenerated. Roughly 5 GB per "
+        "champion per 10-day window, so prune it rather than letting it grow",
     )
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--keep-work", action="store_true", help="keep clones + predictions for inspection")
@@ -293,8 +433,14 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     window_days = (date.fromisoformat(args.window_end) - date.fromisoformat(args.window_start)).days
     data_root = args.data_root.resolve()
 
+    # The registration day is the window's first: the champion is deployed as the window opens.
+    sim_reg = pd.Timestamp(args.window_start, tz="UTC").to_pydatetime() if args.simulate_registration else None
     print("building the offline scores bundle for the scoring window (network, resumable)...", flush=True)
-    prepare_offline_bundle(window_end, window_days)  # also exports SYNTH_BACKTESTER_OFFLINE_DATA_ROOT
+    prepare_offline_bundle(window_end, window_days, simulate_registration=sim_reg)
+    prompt_starts = None
+    if args.live_prompts:
+        print("reading the validator's scored prompt start_times from the bundle...", flush=True)
+        prompt_starts = live_prompt_starts(window, lead_in=not args.no_lead_in)
 
     legs = args.legs or sorted(p.name for p in campaign_dir.iterdir() if p.is_dir() and (p / "CHAMPION").exists())
     work = Path(tempfile.mkdtemp(prefix=f"verdict-{args.campaign}-"))
@@ -303,12 +449,12 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print(f"docker daemon smaller than the reference box: sandboxes capped at {limits[0]} cpus / {limits[1]} GB")
     print(f"legs: {legs}; work dir: {work}", flush=True)
 
-    verdict_name = f"verdict-{args.tag}.json" if args.tag else "verdict.json"
-    charts_name = f"{Path(verdict_name).stem}-charts"
+    verdict_name = f"verdict-{args.tag}" if args.tag else "verdict"
     for leg in legs:
-        out = campaign_dir / leg / verdict_name
+        verdict_dir = campaign_dir / leg / verdict_name
+        out = verdict_dir / "verdict.json"
         if out.exists() and not args.force:
-            print(f"[{leg}] {verdict_name} already exists — SKIPPING (pass --force to rescore)", flush=True)
+            print(f"[{leg}] {out} already exists — SKIPPING (pass --force to rescore)", flush=True)
             continue
         champion = parse_champion(campaign_dir / leg / "CHAMPION")
         clone = work / leg
@@ -324,6 +470,9 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             f"{leg} uv sync",
         )
         print(f"[{leg}] phase 2: generation (--network none)", flush=True)
+        cache = predictions_cache(
+            args.predictions_cache, champion.sha, args.seed, args.live_prompts, not args.no_lead_in
+        )
         generate_all(
             clone,
             data_root,
@@ -333,33 +482,43 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             limits=limits,
             seed=args.seed,
             lead_in=not args.no_lead_in,
+            prompt_starts=prompt_starts,
+            cache=cache,
         )
         print(f"[{leg}] scoring", flush=True)
-        result = score(leg, clone / "predictions", window_end, window_days, campaign_dir / leg / charts_name)
-        out.write_text(json.dumps(verdict_payload(result, champion.sha, window, args.seed), indent=2) + "\n")
+        result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg)
+        payload = verdict_payload(result, champion.sha, window, args.seed, sim_reg, args.live_prompts)
+        verdict_dir.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2) + "\n")
         print(f"[{leg}] score={result['score']} mean_rank={result['mean_competition_rank']} -> {out}", flush=True)
         if not args.keep_work:
             shutil.rmtree(clone, ignore_errors=True)
 
-    baseline_out = campaign_dir / "baselines" / "synth_default" / verdict_name
+    baseline_dir = campaign_dir / "baselines" / "synth_default" / verdict_name
+    baseline_out = baseline_dir / "verdict.json"
     if not args.skip_baseline and baseline_out.exists() and not args.force:
-        print(f"[baseline] {verdict_name} already exists — SKIPPING (pass --force to rescore)", flush=True)
+        print(f"[baseline] {baseline_out} already exists — SKIPPING (pass --force to rescore)", flush=True)
     elif not args.skip_baseline:
         baseline_modeling = baseline_modeling_path(args.baseline_module)
-        predictions = work / "baseline-predictions"
+        predictions = predictions_cache(args.predictions_cache, "synth_default", args.seed, args.live_prompts)
         print("[baseline] generating (host)", flush=True)
         generate_baseline(
-            baseline_modeling, data_root, predictions, window, seed=args.seed, lead_in=not args.no_lead_in
+            baseline_modeling,
+            data_root,
+            predictions,
+            window,
+            seed=args.seed,
+            lead_in=not args.no_lead_in,
+            prompt_starts=prompt_starts,
         )
-        result = score("synth_default", predictions, window_end, window_days, baseline_out.parent / charts_name)
-        baseline_out.parent.mkdir(parents=True, exist_ok=True)
-        baseline_out.write_text(json.dumps(verdict_payload(result, None, window, args.seed), indent=2) + "\n")
+        result = score("synth_default", predictions, window_end, window_days, baseline_dir, sim_reg)
+        payload = verdict_payload(result, None, window, args.seed, sim_reg, args.live_prompts)
+        baseline_dir.mkdir(parents=True, exist_ok=True)
+        baseline_out.write_text(json.dumps(payload, indent=2) + "\n")
         print(
             f"[baseline] score={result['score']} mean_rank={result['mean_competition_rank']} -> {baseline_out}",
             flush=True,
         )
-        if not args.keep_work:
-            shutil.rmtree(predictions, ignore_errors=True)
 
     if not args.keep_work:
         shutil.rmtree(work, ignore_errors=True)

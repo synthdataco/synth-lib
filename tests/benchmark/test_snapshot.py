@@ -84,3 +84,27 @@ def test_render_data_md_measures_the_snapshot(tmp_path):
     assert "| BTC | 2026-07-01 | 2026-07-02 | 2 | 5.0% |" in md  # skeleton day excluded, NaN measured
     assert "2026-07-01 → 2026-07-10" in md  # offline bundle coverage
     assert "NaN close" in md and "Missing file" in md  # semantics block present
+
+
+def _realized(root: Path, asset: str, days: list[str]) -> None:
+    d = root / "realized" / asset / "86400_300"
+    d.mkdir(parents=True, exist_ok=True)
+    for day in days:
+        (d / f"date={day}.parquet").write_bytes(b"")
+
+
+def test_data_md_states_the_realized_path_span(tmp_path):
+    """The agent is told which prompts can fall back on validator truth — measured, not asserted."""
+    from synth_lib.benchmark.snapshot import render_data_md
+
+    _realized(tmp_path, "BTC", ["2026-07-02", "2026-07-20"])
+    _realized(tmp_path, "ETH", ["2026-07-11"])
+    md = render_data_md(tmp_path)
+    assert "**Cached realized paths** (2 assets): **2026-07-02 → 2026-07-20**" in md
+
+
+def test_data_md_omits_the_span_when_nothing_is_cached(tmp_path):
+    """No paths cached is not a span of zero; the line must not appear at all."""
+    from synth_lib.benchmark.snapshot import render_data_md
+
+    assert "Cached realized paths" not in render_data_md(tmp_path)
