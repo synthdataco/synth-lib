@@ -98,6 +98,11 @@ HOTKEY_NAME="$${HOTKEY_NAME:-default}"
 PORT="$${PORT:-8091}"
 VALIDATOR_MIN_STAKE="$${VALIDATOR_MIN_STAKE:-65000}"
 
+# The verdict's seeds (generation_env in synth_lib/benchmark/verdict/run_verdict.py), so a live
+# response replays offline. PYTHONHASHSEED only works when set before the interpreter starts.
+export SYNTH_BENCHMARK_SEED="$${SYNTH_BENCHMARK_SEED:-0}"
+export PYTHONHASHSEED="$${PYTHONHASHSEED:-0}"
+
 exec uv run python3.12 "$${SCRIPT_DIR}/miner.py" \\
     --subtensor.network "$$NETWORK" \\
     --netuid "$$NETUID" \\
