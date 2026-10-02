@@ -235,6 +235,20 @@ def test_unpack_copies_the_whole_champion_tree(tmp_path):
     assert "workspace.bundle" in provenance and sha in provenance
 
 
+def test_unpack_reads_the_published_champion_source_tree(tmp_path):
+    """The archive publishes the workspace at CHAMPION.sha under champion_source/; when it is there,
+    it is what gets unpacked, ahead of the bundle."""
+    results_dir = _make_bundle(tmp_path)
+    published = SCAFFOLD_MODELING.read_text() + "\n# from the published tree\n"
+    tree = results_dir / "test-camp" / "fake" / "champion_source" / "agent"
+    tree.mkdir(parents=True)
+    (tree / "modeling.py").write_text(published)
+
+    dest = unpack("test-camp", "fake", None, results_dir, tmp_path / "champions")
+
+    assert (dest / "modeling.py").read_text() == published
+
+
 def test_allow_missing_data_unpacks_a_dead_reference_and_discloses_it(tmp_path):
     """A named data file is not necessarily a needed one: a champion can keep an experiment it
     discarded behind an env-var-gated branch. The default refuses; the flag unpacks and records it,
