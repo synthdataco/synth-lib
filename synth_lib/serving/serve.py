@@ -25,13 +25,16 @@ com-equ scores, or pre-populate the store from your own archive.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Sequence
 
 import pandas as pd
+import requests
 from synth.simulation_input import SimulationInput  # type: ignore[import-untyped]
 from synth.validator.competition_config import ALL_COMPETITIONS  # type: ignore[import-untyped]
 
+from synth_lib.benchmark.generate_predictions import context_end
 from synth_lib.preparation.config import (
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
@@ -46,6 +49,12 @@ logger = logging.getLogger(__name__)
 WARMUP_DAYS = 8  # 7-day context + 1 day of slack
 CONTEXT_MINUTES = 7 * 24 * 60
 MIN_REAL_BARS = 60  # below this a trimmed context is worse than a slightly stale one
+# Prompts whose context is topped up at request time (crypto-1h); the 24 h formats are not.
+FRESH_TAIL_TIME_LENGTH = 3_600
+FRESH_TAIL_MINUTES = 15
+# The request path's venue call: no retries, and far inside the response deadline.
+FRESH_TAIL_TIMEOUT_SECONDS = 1.5
+EMPTY_TAIL = pd.DataFrame(columns=["timestamp", *OHLCV_COLUMNS])
 
 
 def wrap_output(raw: Sequence, start_time: datetime, time_increment: int) -> tuple:
@@ -94,8 +103,44 @@ def warm_up(assets: Sequence[str], days: int = WARMUP_DAYS) -> None:
             logger.warning("warm-up incomplete for %s: %s", asset, exc)
 
 
+class FreshTail:
+    """One asset's newest bars, fetched at request time up to the bar the verdict's context ends on.
+
+    One fetch per minute, shared by every prompt for that minute: several validators send the same
+    asset at the same minute boundary. Any failure yields no bars, so the context falls back to the
+    store."""
+
+    def __init__(self, asset: str, client=None):
+        self.asset = asset
+        self._client = client or build_price_client(
+            asset, session=requests.Session(), timeout=FRESH_TAIL_TIMEOUT_SECONDS
+        )
+        self._lock = threading.Lock()
+        self._end: datetime | None = None
+        self._bars = EMPTY_TAIL
+
+    def bars(self, start_time: datetime, now: datetime | None = None) -> pd.DataFrame:
+        now = now or datetime.now(tz=UTC)
+        # The newest closed bar, never past the label the verdict ends this prompt's context on.
+        newest_closed = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+        end = min(context_end(start_time, FRESH_TAIL_TIME_LENGTH), newest_closed)
+        with self._lock:
+            if end != self._end:
+                self._end = end
+                try:
+                    start = end - timedelta(minutes=FRESH_TAIL_MINUTES - 1)
+                    self._bars = self._client.fetch_range(self.asset, start, end)
+                except Exception as exc:
+                    logger.warning("fresh tail unavailable for %s at %s: %s", self.asset, end.isoformat(), exc)
+                    self._bars = EMPTY_TAIL
+            return self._bars
+
+
 def build_context(
-    store: MinutePriceStore, start_time: datetime, window_minutes: int = CONTEXT_MINUTES
+    store: MinutePriceStore,
+    start_time: datetime,
+    window_minutes: int = CONTEXT_MINUTES,
+    tail: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """The 7-day minute OHLCV context ending at `start_time`, lenient enough to serve from.
 
@@ -108,6 +153,9 @@ def build_context(
 
     Only `close` is filled. A carried-forward high/low would assert a range that no candle traded,
     so the other columns stay NaN on minutes the venue did not report.
+
+    `tail` (FreshTail's bars) wins over the store for the same minute: today's partition holds a
+    NaN row for every minute its last refresh had not settled yet.
     """
     context_start = start_time - timedelta(minutes=window_minutes)
     frames = []
@@ -120,12 +168,15 @@ def build_context(
             except ValueError as exc:  # pyarrow's ArrowInvalid, on a column the file lacks
                 raise ValueError(legacy_partition_error(path)) from exc
         day += timedelta(days=1)
+    if tail is not None and not tail.empty:
+        frames.append(tail[["timestamp", *OHLCV_COLUMNS]])
     if not frames:
         raise ValueError(f"no partitions for {store.asset} in {context_start.isoformat()}..{start_time.isoformat()}")
 
     frame = pd.concat(frames, ignore_index=True)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    frame = frame.sort_values("timestamp").drop_duplicates("timestamp")
+    # stable sort + keep="last": the tail, appended last, wins a minute the store also holds
+    frame = frame.sort_values("timestamp", kind="stable").drop_duplicates("timestamp", keep="last")
     grid = pd.date_range(context_start, start_time, freq="1min", tz="UTC")
     raw = frame.set_index("timestamp")[OHLCV_COLUMNS].apply(pd.to_numeric, errors="coerce").reindex(grid)
 
@@ -142,12 +193,21 @@ def build_context(
         raise ValueError(f"no usable closes for {store.asset} ending {start_time.isoformat()}")
     return trimmed
 
-def serve_request(simulate_fn: Callable, store: MinutePriceStore, simulation_input: SimulationInput) -> tuple:
-    """Build the live context, run the champion, adapt the output to the live contract."""
+
+def start_time_of(simulation_input: SimulationInput) -> datetime:
     start_time = datetime.fromisoformat(simulation_input.start_time)
-    if start_time.tzinfo is None:
-        start_time = start_time.replace(tzinfo=UTC)
-    context = build_context(store, start_time)
+    return start_time if start_time.tzinfo is not None else start_time.replace(tzinfo=UTC)
+
+
+def serve_request(
+    simulate_fn: Callable,
+    store: MinutePriceStore,
+    simulation_input: SimulationInput,
+    tail: pd.DataFrame | None = None,
+) -> tuple:
+    """Build the live context, run the champion, adapt the output to the live contract."""
+    start_time = start_time_of(simulation_input)
+    context = build_context(store, start_time, tail=tail)
     raw = simulate_fn(
         asset=simulation_input.asset,
         start_time=simulation_input.start_time,

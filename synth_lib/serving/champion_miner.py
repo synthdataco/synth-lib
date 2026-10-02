@@ -2,8 +2,9 @@
 
 Subclasses set `simulate_fn` and nothing else — `unpack_champion.py` generates that subclass.
 Startup blocks on a venue warm-up (see serve.py), then a background thread keeps every
-venue-routed minute store fresh; each request slices the trailing 7-day context and adapts the
-champion's output to the live validator contract.
+venue-routed minute store fresh; each request slices the trailing 7-day context — a crypto-1h one
+topped up with the bars that closed since the last refresh — and adapts the champion's output to the
+live validator contract.
 
 No guards: an unservable asset, a data hole, or an exploding path crashes the request so it
 shows up in monitoring instead of silently degrading.
@@ -15,6 +16,7 @@ with `TypeError: issubclass() arg 1 must be a class` and the miner cannot start 
 annotations in this module evaluated.
 """
 
+import asyncio
 import logging
 import threading
 import time
@@ -25,7 +27,16 @@ from neurons.miner import Miner  # type: ignore[import-untyped]
 from synth.protocol import Simulation  # type: ignore[import-untyped]
 
 from synth_lib.preparation.minute_price_store import MinutePriceStore
-from synth_lib.serving.serve import WARMUP_DAYS, serve_request, servable_assets, venue_store, warm_up
+from synth_lib.serving.serve import (
+    FRESH_TAIL_TIME_LENGTH,
+    WARMUP_DAYS,
+    FreshTail,
+    serve_request,
+    servable_assets,
+    start_time_of,
+    venue_store,
+    warm_up,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +45,8 @@ logger = logging.getLogger(__name__)
 # call, cheap enough to top up every minute; the deep pass that force-refetches WARMUP_DAYS and
 # repairs older gaps stays on its slower cadence.
 #
-# Neither runs on the request path on purpose. A venue round-trip there would risk the response
-# deadline, and a missed prompt is filled at the field's 95th percentile — far more expensive than
-# a context that is a minute old.
+# Neither runs on the request path. The one venue call there is FreshTail's, for crypto-1h prompts
+# only: no retries, a short timeout, and the stored context when it fails.
 CURRENT_DAY_REFRESH_SECONDS = 60
 REFRESH_INTERVAL_SECONDS = 5 * 60
 
@@ -54,6 +64,7 @@ class ChampionMiner(Miner):
         logger.info("warming up %d assets from their venues...", len(assets))
         warm_up(assets)
         self._stores: dict[str, MinutePriceStore] = {asset: venue_store(asset) for asset in assets}
+        self._tails: dict[str, FreshTail] = {asset: FreshTail(asset) for asset in assets}
         self._refresh_started = False
         self._refresh_lock = threading.Lock()
 
@@ -88,7 +99,13 @@ class ChampionMiner(Miner):
     async def forward_miner(self, synapse: Simulation) -> Simulation:
         self._ensure_refresh_thread()
         simulation_input = synapse.simulation_input
+        tail = None
+        if simulation_input.time_length == FRESH_TAIL_TIME_LENGTH:
+            # Only the venue call leaves the event loop: champions keep module state, so simulate()
+            # must not run on two threads at once.
+            fresh_tail = self._tails[simulation_input.asset]
+            tail = await asyncio.to_thread(fresh_tail.bars, start_time_of(simulation_input))
         synapse.simulation_output = serve_request(
-            type(self).simulate_fn, self._stores[simulation_input.asset], simulation_input
+            type(self).simulate_fn, self._stores[simulation_input.asset], simulation_input, tail=tail
         )
         return synapse

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import pandas as pd
+import requests
 
 from synth_lib.preparation.config import HYPERLIQUID_SYMBOLS, OHLCV_COLUMNS, utc_datetime, venue_session
 
@@ -25,8 +26,9 @@ class HyperliquidClient:
     # returns nothing, which is indistinguishable downstream from a day that never traded.
     retention_minutes = MAX_CANDLES
 
-    def __init__(self) -> None:
-        self._session = venue_session()
+    def __init__(self, session: requests.Session | None = None, timeout: float = 60) -> None:
+        self._session = session or venue_session()
+        self._timeout = timeout
 
     def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         start_time = utc_datetime(start_time)
@@ -47,7 +49,7 @@ class HyperliquidClient:
                     "endTime": end_ms + 60_000,
                 },
             },
-            timeout=60,
+            timeout=self._timeout,
         )
         response.raise_for_status()
         candles = response.json()

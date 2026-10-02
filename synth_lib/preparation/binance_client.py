@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 
 import pandas as pd
+import requests
 
 from synth_lib.preparation.config import BINANCE_SYMBOLS, OHLCV_COLUMNS, utc_datetime, venue_session
 
@@ -31,8 +32,9 @@ class BinanceClient:
     source_name = "binance"
     retention_minutes = None  # serves the full history
 
-    def __init__(self) -> None:
-        self._session = venue_session()
+    def __init__(self, session: requests.Session | None = None, timeout: float = 30) -> None:
+        self._session = session or venue_session()
+        self._timeout = timeout
 
     def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame:
         start_time = utc_datetime(start_time)
@@ -78,7 +80,7 @@ class BinanceClient:
                     "endTime": end_ms + MINUTE_MS,
                     "limit": MAX_KLINES_PER_REQUEST,
                 },
-                timeout=30,
+                timeout=self._timeout,
             )
             response.raise_for_status()
             batch = response.json()
