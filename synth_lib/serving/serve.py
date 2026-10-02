@@ -14,7 +14,7 @@ for such an asset then raises in the miner, which is loud in monitoring, by desi
 There are NO defensive guards in this module: a hole in the data or an exploding path must crash
 the request, not be papered over silently.
 
-Warm-up: `warm_up(...)` fills the local minute store from each asset's own venue before serving.
+Warm-up: `warm_up(...)` fills the local minute store from each asset's own venue before it is served.
 Be aware of the retention asymmetry — Binance serves deep minute history, while Hyperliquid's
 candle endpoint keeps roughly the last 5000 minutes (~3.5 days). A freshly-started miner therefore
 has a full 7-day context for the cryptos and a shorter one for the HL-routed assets, which fills

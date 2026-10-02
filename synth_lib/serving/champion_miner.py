@@ -1,10 +1,10 @@
 """ChampionMiner: a generic Bittensor SN50 miner that serves one benchmark champion.
 
 Subclasses set `simulate_fn` and nothing else — `unpack_champion.py` generates that subclass.
-Startup blocks on a venue warm-up (see serve.py), then a background thread keeps every
-venue-routed minute store fresh; each request slices the trailing 7-day context — a crypto-1h one
-topped up with the bars that closed since the last refresh — and adapts the champion's output to the
-live validator contract.
+Startup does not wait for data: a background thread warms each venue-routed minute store up, asset
+by asset, then keeps them all fresh, and an asset is served as soon as its own warm-up is done. Each
+request slices the trailing 7-day context — a crypto-1h one topped up with the bars that closed
+since the last refresh — and adapts the champion's output to the live validator contract.
 
 No guards: an unservable asset, a data hole, or an exploding path crashes the request so it
 shows up in monitoring instead of silently degrading.
@@ -60,21 +60,24 @@ class ChampionMiner(Miner):
         super().__init__(*args, **kwargs)
         if type(self).simulate_fn is None:
             raise TypeError("subclass must set simulate_fn (see synth_lib/serving/unpack_champion.py)")
-        assets = servable_assets()
-        logger.info("warming up %d assets from their venues...", len(assets))
-        warm_up(assets)
+        self._start(servable_assets())
+
+    def _start(self, assets: list[str]) -> None:
+        """Binds the stores and starts the background thread. Returns before any venue call, so the
+        axon comes up while the data is still being fetched."""
         self._stores: dict[str, MinutePriceStore] = {asset: venue_store(asset) for asset in assets}
         self._tails: dict[str, FreshTail] = {asset: FreshTail(asset) for asset in assets}
-        self._refresh_started = False
-        self._refresh_lock = threading.Lock()
+        # An asset joins once its whole warm-up window is in: a partly warmed store can end days back.
+        self._ready: set[str] = set()
+        threading.Thread(target=self._warm_up_then_refresh, daemon=True).start()
+        logger.info("warming up %d assets in the background", len(assets))
 
-    def _ensure_refresh_thread(self) -> None:
-        with self._refresh_lock:
-            if self._refresh_started:
-                return
-            threading.Thread(target=self._background_refresh, daemon=True).start()
-            self._refresh_started = True
-            logger.info("ChampionMiner refresh thread started")
+    def _warm_up_then_refresh(self) -> None:
+        for asset in self._stores:
+            warm_up([asset])
+            self._ready.add(asset)
+        logger.info("warm-up complete; refreshing every %d s", CURRENT_DAY_REFRESH_SECONDS)
+        self._background_refresh()
 
     def _refresh_once(self, deep: bool) -> None:
         """One pass over every store. A venue outage must not stop the others being refreshed."""
@@ -97,15 +100,15 @@ class ChampionMiner(Miner):
             time.sleep(CURRENT_DAY_REFRESH_SECONDS)
 
     async def forward_miner(self, synapse: Simulation) -> Simulation:
-        self._ensure_refresh_thread()
         simulation_input = synapse.simulation_input
+        store = self._stores[simulation_input.asset]
+        if simulation_input.asset not in self._ready:
+            raise RuntimeError(f"{simulation_input.asset} is still warming up")
         tail = None
         if simulation_input.time_length == FRESH_TAIL_TIME_LENGTH:
             # Only the venue call leaves the event loop: champions keep module state, so simulate()
             # must not run on two threads at once.
             fresh_tail = self._tails[simulation_input.asset]
             tail = await asyncio.to_thread(fresh_tail.bars, start_time_of(simulation_input))
-        synapse.simulation_output = serve_request(
-            type(self).simulate_fn, self._stores[simulation_input.asset], simulation_input, tail=tail
-        )
+        synapse.simulation_output = serve_request(type(self).simulate_fn, store, simulation_input, tail=tail)
         return synapse

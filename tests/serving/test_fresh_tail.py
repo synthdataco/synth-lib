@@ -6,7 +6,6 @@ the bar labelled start - 2 min. FreshTail fetches what closed in between, at req
 """
 
 import asyncio
-import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -112,8 +111,7 @@ def test_only_crypto_1h_prompts_fetch_a_tail(monkeypatch):
     served = []
     monkeypatch.setattr(cm, "serve_request", lambda fn, store, sim_input, tail: served.append(tail) or ("ok",))
     miner = object.__new__(ChampionMiner)  # Miner.__init__ needs a wallet, a subtensor and a chain
-    miner._stores, miner._tails = {"BTC": None}, {"BTC": _Tail()}
-    miner._refresh_started, miner._refresh_lock = True, threading.Lock()
+    miner._stores, miner._tails, miner._ready = {"BTC": None}, {"BTC": _Tail()}, {"BTC"}
 
     asyncio.run(miner.forward_miner(_synapse(86_400)))
     assert miner._tails["BTC"].calls == 0 and served == [None]
