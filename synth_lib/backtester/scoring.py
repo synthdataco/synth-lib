@@ -80,6 +80,21 @@ def _compute_prompt_score_stats_for_group(crps: pd.Series, capped_era: bool = Tr
     )
 
 
+# A prompt scored in the minute before an update is not yet counted by it. Measured on 352 live
+# crypto-24h updates (2026-09-12 -> 09-23): every update with a prompt in that minute pointed there.
+_UPDATE_LAG = pd.Timedelta(minutes=1)
+
+
+def _live_window(prepared: pd.DataFrame, updated_at: Any, cutoff_days: int) -> pd.DataFrame:
+    """The rows the validator's update at `updated_at` averages: scored in (u - cutoff_days, u - 1 min).
+
+    The lower bound is the validator's SQL (`scored_time > :min_scored_time`); the upper one is
+    behavioural, see _UPDATE_LAG. Both ends are open.
+    """
+    scored = prepared["scored_time"]
+    return prepared.loc[(scored > updated_at - pd.Timedelta(days=cutoff_days)) & (scored < updated_at - _UPDATE_LAG)]
+
+
 def calculate_smoothed_scores(
     all_scores: pd.DataFrame,
     rewards_history: pd.DataFrame,
@@ -107,8 +122,7 @@ def calculate_smoothed_scores(
 
     result_rows = []
     for updated_at in rewards_history["updated_at"].sort_values().unique():
-        cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
+        window_df = _live_window(prepared, updated_at, cutoff_days)
         rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, competition)
         if rewards is None:
             continue
@@ -191,8 +205,7 @@ def compute_combined_smoothed_scores(
 
     result_rows = []
     for updated_at in sorted(timestamps):
-        cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
+        window_df = _live_window(prepared, updated_at, cutoff_days)
         rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, competition)
         if rewards is None:
             continue
