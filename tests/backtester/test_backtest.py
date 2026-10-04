@@ -372,6 +372,31 @@ class TestBacktestIntegration:
     @patch("synth_lib.backtester.orchestration.download_price_data")
     @patch("synth_lib.backtester.orchestration.get_rewards_history")
     @patch("synth_lib.backtester.orchestration.get_miner_scores")
+    def test_registrations_reach_the_smoothing(
+        self,
+        mock_scores: object,
+        mock_rewards: object,
+        mock_prices: object,
+        mock_crps: object,
+        predictions_dir: Path,
+    ) -> None:
+        """A field uid re-registered mid-window goes through backtest() without changing our scoring."""
+        mock_scores.return_value = _make_scores_df()  # type: ignore[union-attr]
+        mock_rewards.return_value = _make_rewards_df()  # type: ignore[union-attr]
+        mock_prices.return_value = _make_price_df(T0, SCORED_T1)  # type: ignore[union-attr]
+        mock_crps.return_value = (FAKE_CRPS, [{"interval": "stub"}])  # type: ignore[union-attr]
+        kwargs = dict(miner_name="test_miner", asset=ASSET, time_length=TIME_LENGTH, n_backtest_days=5)
+
+        plain = backtest(predictions_dir=predictions_dir, **kwargs)
+        split = backtest(predictions_dir=predictions_dir, registrations={2: SCORED_T1}, **kwargs)
+
+        assert split.summary["mean_crps"] == plain.summary["mean_crps"]
+        assert split.smoothed_scores["miner_uid"].isna().sum() == 0
+
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
     def test_partial_predictions_fill_crps_minus_one(
         self,
         mock_scores: object,

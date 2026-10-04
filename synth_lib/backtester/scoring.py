@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,7 @@ from synth_lib.backtester.config import (
     slug_for,
 )
 from synth_lib.backtester.loading import load_prediction
-from synth_lib.backtester.miner_data_handler import _BACKTEST_MDH
+from synth_lib.backtester.miner_data_handler import _BACKTEST_MDH, _BacktestMinerDataHandler
 from synth_lib.backtester.prompt_scores_legacy import compute_prompt_scores_pre_cap
 from synth_lib.backtester.result import BacktestResult
 
@@ -80,14 +81,110 @@ def _compute_prompt_score_stats_for_group(crps: pd.Series, capped_era: bool = Tr
     )
 
 
+# A prompt scored in the minute before an update is not yet counted by it. Measured on 352 live
+# crypto-24h updates (2026-09-12 -> 09-23): every update with a prompt in that minute pointed there.
+_UPDATE_LAG = pd.Timedelta(minutes=1)
+
+
+def _live_window(prepared: pd.DataFrame, updated_at: Any, cutoff_days: int) -> pd.DataFrame:
+    """The rows the validator's update at `updated_at` averages: scored in (u - cutoff_days, u - 1 min).
+
+    The lower bound is the validator's SQL (`scored_time > :min_scored_time`); the upper one is
+    behavioural, see _UPDATE_LAG. Both ends are open.
+    """
+    scored = prepared["scored_time"]
+    return prepared.loc[(scored > updated_at - pd.Timedelta(days=cutoff_days)) & (scored < updated_at - _UPDATE_LAG)]
+
+
+# miner_id given to the previous occupant of a re-registered uid: uid + this, far above any uid.
+_PREVIOUS_OCCUPANT = 1_000_000
+
+
+def _split_reregistered(
+    df: pd.DataFrame, registrations: Mapping[int, datetime] | None, time_length: int
+) -> pd.DataFrame:
+    """Give the previous occupant of each re-registered uid its own miner_id.
+
+    Live keys a miner by hotkey, the public scores by uid. A uid re-registered at R is two miners
+    live: the rows of prompts started before R belong to the previous occupant, the rest to the new
+    one, which `prepare_df_for_moving_average` then backfills as a late joiner. `df` carries
+    `miner_id` (= uid) and `scored_time`; a prompt starts `time_length` seconds before it is scored.
+    Only the latest registration of a uid is known here, so an earlier one inside the span stays
+    merged.
+    """
+    if not registrations:
+        return df
+    df = df.copy()
+    start = pd.to_datetime(df["scored_time"], utc=True) - pd.Timedelta(seconds=time_length)
+    for uid, registered_at in registrations.items():
+        previous = (df["miner_id"] == uid) & (start < pd.Timestamp(registered_at))
+        df.loc[previous, "miner_id"] = uid + _PREVIOUS_OCCUPANT
+    return df
+
+
+class _RegisteredAtUpdate(_BacktestMinerDataHandler):
+    """miner_id -> uid only for miners registered at the update being computed.
+
+    `compute_smoothed_score` drops a miner whose uid resolves to None, which is how the validator
+    leaves a deregistered hotkey out of the softmax. Set `updated_at` before each call.
+    """
+
+    def __init__(self, registrations: Mapping[int, datetime], scores: pd.DataFrame) -> None:
+        super().__init__()
+        self.registrations = {uid: pd.Timestamp(t) for uid, t in registrations.items()}
+        # The new occupant's first real row. Before it is in a window, live has no rows for the
+        # new occupant, so it is absent; the whole-frame backfill would otherwise pay it the worst
+        # score from R on. `scores` is the split frame, before prepare_df_for_moving_average.
+        mine = scores.loc[scores["miner_id"].isin(self.registrations)]
+        self.first_scored = pd.to_datetime(mine["scored_time"], utc=True).groupby(mine["miner_id"]).min().to_dict()
+        self.updated_at: pd.Timestamp | None = None
+
+    def populate_miner_uid_in_miner_data(self, miner_data: list[dict]) -> list[dict]:
+        u = pd.Timestamp(self.updated_at)
+        for row in miner_data:
+            miner_id = int(row["miner_id"])
+            if miner_id >= _PREVIOUS_OCCUPANT:
+                uid = miner_id - _PREVIOUS_OCCUPANT
+                row["miner_uid"] = uid if u < self.registrations[uid] else None
+            else:
+                registered_at = self.registrations.get(miner_id)
+                first = self.first_scored.get(miner_id)
+                counted = first is not None and first < u - _UPDATE_LAG
+                row["miner_uid"] = miner_id if registered_at is None or (u >= registered_at and counted) else None
+        return miner_data
+
+
+def _miner_data_handler(
+    registrations: Mapping[int, datetime] | None, scores: pd.DataFrame
+) -> _BacktestMinerDataHandler:
+    return _RegisteredAtUpdate(registrations, scores) if registrations else _BACKTEST_MDH
+
+
+def _smoothed_at(
+    mdh: _BacktestMinerDataHandler,
+    prepared: pd.DataFrame,
+    updated_at: Any,
+    cutoff_days: int,
+    competition: CompetitionConfig,
+) -> list[dict] | None:
+    if isinstance(mdh, _RegisteredAtUpdate):
+        mdh.updated_at = pd.Timestamp(updated_at)
+    return compute_smoothed_score(mdh, _live_window(prepared, updated_at, cutoff_days), updated_at, competition)
+
+
 def calculate_smoothed_scores(
     all_scores: pd.DataFrame,
     rewards_history: pd.DataFrame,
     cutoff_days: int = 10,
     scores_column: str = "new_prompt_scores",
     competition: CompetitionConfig = CRYPTO_24H,
+    registrations: Mapping[int, datetime] | None = None,
 ) -> pd.DataFrame:
     """Compute smoothed scores and reward weights using synth's compute_smoothed_score.
+
+    `registrations` maps a uid to the chain time its current occupant registered. With it, a uid
+    re-registered inside the data is scored as two miners, as live does (see _split_reregistered);
+    without it, every uid is one miner.
 
     Delegates to synth.validator.moving_average.compute_smoothed_score for each
     rewards_history timestamp, using a fake MinerDataHandler (miner_uid == miner_id).
@@ -101,15 +198,15 @@ def calculate_smoothed_scores(
         input_df = input_df.drop(columns=["miner_id"])
     input_df = input_df.rename(columns={"miner_uid": "miner_id", scores_column: "prompt_score_v3"})
     input_df["scored_time"] = pd.to_datetime(input_df["scored_time"])
+    input_df = _split_reregistered(input_df, registrations, competition.time_length)
 
     # Prepare the df (backfill new miners, etc.)
     prepared = prepare_df_for_moving_average(input_df)
 
+    mdh = _miner_data_handler(registrations, input_df)
     result_rows = []
     for updated_at in rewards_history["updated_at"].sort_values().unique():
-        cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
-        rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, competition)
+        rewards = _smoothed_at(mdh, prepared, updated_at, cutoff_days, competition)
         if rewards is None:
             continue
 
@@ -131,6 +228,7 @@ def compute_combined_smoothed_scores(
     competition: CompetitionConfig = CRYPTO_24H,
     cutoff_days: int | None = None,
     simulate_registration: datetime | None = None,
+    registrations: Mapping[int, datetime] | None = None,
 ) -> pd.DataFrame:
     """Real-validator-equivalent cross-asset smoothed scores.
 
@@ -143,7 +241,7 @@ def compute_combined_smoothed_scores(
 
     Returns DataFrame with columns: updated_at, miner_uid, new_smoothed_score,
     reward_weight. reward_weight sums to SMOOTHED_SCORE_COEFFICIENT (1/3)
-    across miners per timestamp.
+    across miners per timestamp. `registrations`: as in calculate_smoothed_scores.
     """
     if not results:
         return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
@@ -178,6 +276,7 @@ def compute_combined_smoothed_scores(
         combined_crps = combined_crps.drop(columns=["miner_id"])
     combined_crps = combined_crps.rename(columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"})
     combined_crps["scored_time"] = pd.to_datetime(combined_crps["scored_time"])
+    combined_crps = _split_reregistered(combined_crps, registrations, competition.time_length)
 
     prepared = prepare_df_for_moving_average(combined_crps)
 
@@ -189,11 +288,10 @@ def compute_combined_smoothed_scores(
         for t in pd.to_datetime(r.smoothed_scores["updated_at"]).unique():
             timestamps.add(pd.Timestamp(t))
 
+    mdh = _miner_data_handler(registrations, combined_crps)
     result_rows = []
     for updated_at in sorted(timestamps):
-        cutoff = updated_at - pd.Timedelta(days=cutoff_days)
-        window_df = prepared.loc[(prepared["scored_time"] >= cutoff) & (prepared["scored_time"] <= updated_at)]
-        rewards = compute_smoothed_score(_BACKTEST_MDH, window_df, updated_at, competition)
+        rewards = _smoothed_at(mdh, prepared, updated_at, cutoff_days, competition)
         if rewards is None:
             continue
         for row in rewards:

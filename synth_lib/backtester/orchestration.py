@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -100,9 +101,12 @@ def backtest(
     eval_end: datetime | None = None,
     simulate_registration: datetime | None = None,
     simulate_deregistration: datetime | None = None,
+    registrations: Mapping[int, datetime] | None = None,
 ) -> BacktestResult:
     """Backtest a local miner against Synth subnet scoring data.
     Loads predictions from predictions_dir (or miner_outputs/{miner_name}/predictions/).
+    `registrations` (uid -> chain registration time of its current occupant, see
+    `fetch_registrations`) splits re-registered field uids into two miners, as live does.
     """
     if competition is None:
         competition = competition_for(asset, time_length)
@@ -421,6 +425,7 @@ def backtest(
         cutoff_days=competition.window_days,
         scores_column="new_prompt_scores",
         competition=competition,
+        registrations=registrations,
     )
     print(
         f"{log_prefix} smoothed scores done in {perf_counter()-t_smooth:.1f}s "
@@ -470,6 +475,7 @@ def run_backtest(
     eval_end: datetime | None = None,
     simulate_registration: datetime | None = None,
     simulate_deregistration: datetime | None = None,
+    registrations: Mapping[int, datetime] | None = None,
 ) -> tuple[list[BacktestResult], pd.DataFrame]:
     """Run the full backtest for all assets in a prompt config.
 
@@ -519,6 +525,7 @@ def run_backtest(
                 eval_end=eval_end,
                 simulate_registration=simulate_registration,
                 simulate_deregistration=simulate_deregistration,
+                registrations=registrations,
             ): asset
             for asset in assets
         }
@@ -601,6 +608,7 @@ def run_backtest(
                 results,
                 competition,
                 simulate_registration=simulate_registration,
+                registrations=registrations,
             )
         except Exception as e:
             print(f"  Combined smoothed scores failed: {e}")
