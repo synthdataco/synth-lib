@@ -17,7 +17,8 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      emission split, and the softmaxed reward_weight makes top positions worth more, which a
      rank percentile would flatten). Field uids that changed hands are split as live does, from
      registrations read from the Synth API once per window and kept in local files: the
-     window's offline bundle and each verdict. A re-score reads those first.
+     window's offline bundle and each verdict. A re-score reads those first. Late joiners are
+     backfilled from each minute's first-saved prompt, read the same way into the bundle.
   6. Write campaign_results/<campaign>/<leg>/verdict-<tag>/ — the verdict.json, the
      per-competition rank-evolution charts, the per-prompt CRPS frames and the recomputed field
      rewards. One directory per verdict, so a re-score under --tag cannot overwrite the artifacts
@@ -41,13 +42,14 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
-from synth_lib.backtester.loading import get_miner_scores, get_registrations
-from synth_lib.backtester.scoring import Registrations
+from synth_lib.backtester.loading import get_miner_scores, get_registrations, get_scores_save_order
+from synth_lib.backtester.scoring import Registrations, SaveOrder
 from synth_lib.benchmark import workspace
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
@@ -71,6 +73,7 @@ PROMPT_TIMES_DIR = "prompt_times"
 DEFAULT_PREDICTIONS_CACHE = Path("predictions_cache")
 # Beside the scores and rewards in the window's offline bundle (prepare_offline_bundle).
 REGISTRATIONS_FILE = "registrations.json"
+SAVE_ORDER_FILE = "scores_save_order.json"
 
 # Constitution rule 7: a champion that uses randomness seeds every generator from this, and it
 # is set only here, at evaluation. Absent during a campaign, so an agent's own runs vary.
@@ -368,6 +371,26 @@ def window_registrations(bundle: Path, campaign_dir: Path, span: tuple[datetime,
     return record
 
 
+def window_save_order(bundle: Path, span: tuple[datetime, datetime]) -> dict[int, SaveOrder]:
+    """time_length -> the validator's save order over `span` (`get_scores_save_order`), from the
+    window's offline bundle before the API. Written into the bundle when it lacked it."""
+    cached = bundle / SAVE_ORDER_FILE
+    if cached.exists() and _covers(record := json.loads(cached.read_text()), span):
+        orders = record["orders"]
+    else:
+        print("reading the validator's save order from the Synth API...", flush=True)
+        orders = {
+            str(time_length): [
+                {"scored_time": t.isoformat(), "assets": assets}
+                for t, assets in get_scores_save_order(*span, time_length).items()
+            ]
+            for time_length in sorted({c.time_length for c in COMPETITIONS})
+        }
+        record = {"since": span[0].isoformat(), "until": span[1].isoformat(), "orders": orders}
+        cached.write_text(json.dumps(record, indent=2) + "\n")
+    return {int(tl): {pd.Timestamp(row["scored_time"]): row["assets"] for row in rows} for tl, rows in orders.items()}
+
+
 def engine_rev() -> str | None:
     """The synth-lib commit this host scores with, or None when it was not installed from git."""
     try:
@@ -384,9 +407,10 @@ def score(
     out_dir: Path,
     simulate_registration: datetime | None = None,
     registrations: Registrations | None = None,
+    save_order: Mapping[int, SaveOrder] | None = None,
 ) -> dict:
     result = evaluate_candidate(
-        name, predictions, window_end, window_days, out_dir, simulate_registration, registrations
+        name, predictions, window_end, window_days, out_dir, simulate_registration, registrations, save_order
     )
     mrt = result["mean_reward_vs_top"]
     result["score"] = round(100 * mrt, 1) if mrt is not None else None
@@ -527,6 +551,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     span = registration_span(window, sim_reg)
     record = window_registrations(bundle, campaign_dir, span)
     registrations = registrations_from(record)
+    save_order = window_save_order(bundle, span)
     print(f"{len(record['rows'])} field registrations in {span[0]:%Y-%m-%d} -> {span[1]:%Y-%m-%d}", flush=True)
     engine = engine_rev()
 
@@ -574,7 +599,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             cache=cache,
         )
         print(f"[{leg}] scoring", flush=True)
-        result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg, registrations)
+        result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg, registrations, save_order)
         payload = verdict_payload(result, champion.sha, window, args.seed, sim_reg, args.live_prompts, record, engine)
         verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n")
@@ -601,7 +626,9 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             lead_in=not args.no_lead_in,
             prompt_starts=prompt_starts,
         )
-        result = score("synth_default", predictions, window_end, window_days, baseline_dir, sim_reg, registrations)
+        result = score(
+            "synth_default", predictions, window_end, window_days, baseline_dir, sim_reg, registrations, save_order
+        )
         payload = verdict_payload(result, None, window, args.seed, sim_reg, args.live_prompts, record, engine)
         baseline_dir.mkdir(parents=True, exist_ok=True)
         baseline_out.write_text(json.dumps(payload, indent=2) + "\n")

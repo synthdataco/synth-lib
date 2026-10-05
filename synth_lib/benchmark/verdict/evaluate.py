@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -49,6 +50,7 @@ from synth_lib.backtester.orchestration import backtest  # type: ignore[import-u
 from synth_lib.backtester.plots.rank import plot_total_rank_evolution  # type: ignore[import-untyped]
 from synth_lib.backtester.scoring import (  # type: ignore[import-untyped]
     Registrations,
+    SaveOrder,
     compute_combined_smoothed_scores,
 )
 from synth_lib.backtester.scripts.build_offline_bundle import (  # type: ignore[import-untyped]
@@ -184,6 +186,7 @@ def evaluate_candidate(
     out_dir: Path,
     simulate_registration: datetime | None = None,
     registrations: Registrations | None = None,
+    save_order: Mapping[int, SaveOrder] | None = None,
 ) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
@@ -206,6 +209,8 @@ def evaluate_candidate(
 
     `registrations` (uid -> registration times of its occupants inside the scored data, see
     `get_registrations`) scores each field uid that changed hands as the miners live sees.
+    `save_order` (time_length -> `get_scores_save_order`) backfills late joiners from each minute's
+    first-saved prompt, as live does.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []
@@ -247,7 +252,11 @@ def evaluate_candidate(
         # competition.window_days of rounds — exactly the backfilled onboarding period the
         # flag exists to show — and the headline rank, rewards and charts all read this frame.
         combined = compute_combined_smoothed_scores(
-            results, competition=comp, simulate_registration=simulate_registration, registrations=registrations
+            results,
+            competition=comp,
+            simulate_registration=simulate_registration,
+            registrations=registrations,
+            save_order=save_order.get(comp.time_length) if save_order else None,
         )
         if simulate_registration is not None and not combined.empty:
             # The lookback is needed to compute the moving average, but the candidate did not exist
