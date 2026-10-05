@@ -179,6 +179,10 @@ horizon before the window and yours is never treated as late.
 - The `BUDGET.md` file in your workspace is maintained by the harness: READ IT AT THE START OF
   EACH ITERATION. When it contains a LANDING ORDER, it is non-negotiable.
 - Hardware: $hardware. ONLY ONE GPU job at a time; cap the memory of your heavy jobs.
+- **Parallel work shares this envelope.** Every agent or job you start — subagents, workflows,
+  background runs — spends from the same credit budget and runs on the same machine. The budget in
+  `BUDGET.md` and the hardware above are totals, whatever a tool's own guidance says about token
+  cost.
 - **You are expected to use your envelope.** Iterating is the job: measure, change one thing,
   measure again. **Nominating is final** — the first time you stop while `agent/CHAMPION`
   exists, your campaign is over: you will not be resumed, and every remaining dollar and hour
