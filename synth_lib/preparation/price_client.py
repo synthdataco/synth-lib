@@ -26,13 +26,14 @@ class PriceClient(Protocol):
     def fetch_range(self, asset: str, start_time: datetime, end_time: datetime) -> pd.DataFrame: ...
 
 
-def build_price_client(asset: str) -> PriceClient:
+def build_price_client(asset: str, **client_kwargs) -> PriceClient:
     """Return the price client for an asset, mirroring the validator's routing.
 
-    Precedence matches PriceDataProvider.fetch_data: Binance, then Hyperliquid.
+    Precedence matches PriceDataProvider.fetch_data: Binance, then Hyperliquid. `client_kwargs`
+    (`session`, `timeout`) reach the client unchanged.
     """
     if asset in BINANCE_SYMBOLS:
-        return BinanceClient()
+        return BinanceClient(**client_kwargs)
     if asset in HYPERLIQUID_SYMBOLS:
-        return HyperliquidClient()
+        return HyperliquidClient(**client_kwargs)
     raise ValueError(f"Unsupported asset: {asset}. Supported: {list(ALL_SYMBOLS.keys())}")

@@ -1,7 +1,7 @@
 """Unpack a published champion into a runnable miner directory.
 
-Takes a leg from a results archive — either an unpacked `champion/` source tree (how the public
-results repo publishes them) or a `workspace.bundle` checked out at `CHAMPION.sha`, so the
+Takes a leg from a results archive — either an unpacked `champion_source/` tree (how the archive
+procedure publishes them) or a `workspace.bundle` checked out at `CHAMPION.sha`, so the
 deployed code is provably the nominated code — copies that tree verbatim and adds the thin serving
 shell: `miner.py` (a `ChampionMiner` subclass), `entrypoint.sh`, `PROVENANCE.md`. The bundle itself
 is copied in too when the leg publishes one, so the deployed champion carries the history that
@@ -98,6 +98,11 @@ HOTKEY_NAME="$${HOTKEY_NAME:-default}"
 PORT="$${PORT:-8091}"
 VALIDATOR_MIN_STAKE="$${VALIDATOR_MIN_STAKE:-65000}"
 
+# The verdict's seeds (generation_env in synth_lib/benchmark/verdict/run_verdict.py), so a live
+# response replays offline. PYTHONHASHSEED only works when set before the interpreter starts.
+export SYNTH_BENCHMARK_SEED="$${SYNTH_BENCHMARK_SEED:-0}"
+export PYTHONHASHSEED="$${PYTHONHASHSEED:-0}"
+
 exec uv run python3.12 "$${SCRIPT_DIR}/miner.py" \\
     --subtensor.network "$$NETWORK" \\
     --netuid "$$NETUID" \\
@@ -179,19 +184,22 @@ BUNDLE_NAME = "workspace.bundle"
 CHAMPION_NAME = "CHAMPION"
 AGENT_CHAMPION_NAME = "CHAMPION.agent"
 GENERATED = ("miner.py", "entrypoint.sh", "PROVENANCE.md", BUNDLE_NAME, AGENT_CHAMPION_NAME)
+# The published tree beside CHAMPION. Not `champion/`: on a case-insensitive filesystem that is the
+# CHAMPION file's own path.
+CHAMPION_SOURCE_DIR = "champion_source"
 
 
 def champion_source(leg_dir: Path, champion: Champion, tmp: Path) -> Path:
-    """Directory holding the champion's modeling.py: the published `champion/` tree if present,
+    """Directory holding the champion's modeling.py: the published `champion_source/` tree if present,
     otherwise a clone of `workspace.bundle` checked out at CHAMPION.sha."""
-    unpacked = leg_dir / "champion" / champion.agent_dir
+    unpacked = leg_dir / CHAMPION_SOURCE_DIR / champion.agent_dir
     if (unpacked / "modeling.py").exists():
         return unpacked
-    if (leg_dir / "champion" / "modeling.py").exists():  # published flat
-        return leg_dir / "champion"
+    if (leg_dir / CHAMPION_SOURCE_DIR / "modeling.py").exists():  # published flat
+        return leg_dir / CHAMPION_SOURCE_DIR
     bundle = leg_dir / BUNDLE_NAME
     if not bundle.exists():
-        raise FileNotFoundError(f"no champion source in {leg_dir}: expected champion/ or {BUNDLE_NAME}")
+        raise FileNotFoundError(f"no champion source in {leg_dir}: expected {CHAMPION_SOURCE_DIR}/ or {BUNDLE_NAME}")
     clone = tmp / "clone"
     run(["git", "clone", "-q", str(bundle), str(clone)], f"clone {bundle}")
     run(["git", "-C", str(clone), "checkout", "-q", champion.sha], f"checkout {champion.sha}")

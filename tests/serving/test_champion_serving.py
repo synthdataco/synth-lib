@@ -1,5 +1,6 @@
 """Serving wrapper: live-contract adaptation, venue routing (never Pyth), and the unpacker."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from synth.simulation_input import SimulationInput  # type: ignore[import-untype
 from synth.validator import response_validation_v2  # type: ignore[import-untyped]
 
 from synth_lib.benchmark.generate_predictions import load_simulate
+from synth_lib.benchmark.verdict.run_verdict import DEFAULT_SEED, HASH_SEED_ENV, SEED_ENV, generation_env
 from synth_lib.serving.serve import serve_request, servable_assets, venue_store, wrap_output
 from synth_lib.serving.unpack_champion import class_name_for, unpack
 from synth_lib.preparation.binance_client import BinanceClient
@@ -155,6 +157,18 @@ def test_unpack_generates_a_servable_agent(tmp_path):
         unpack("test-camp", "fake", None, results_dir, dest_root)
 
 
+def test_the_entrypoint_pins_the_verdicts_seeds(tmp_path):
+    """A live response replays offline only when both seeds are the ones the verdict generated with."""
+    dest = unpack("test-camp", "fake", None, _make_bundle(tmp_path), tmp_path / "champions")
+    exports = [line for line in (dest / "entrypoint.sh").read_text().splitlines() if line.startswith("export ")]
+    script = "\n".join([*exports, f'echo "${SEED_ENV} ${HASH_SEED_ENV}"'])
+    seeds = subprocess.run(
+        ["bash", "-c", script], env={"PATH": os.environ["PATH"]}, capture_output=True, text=True, check=True
+    ).stdout.split()
+    expected = generation_env(DEFAULT_SEED)
+    assert seeds == [expected[SEED_ENV], expected[HASH_SEED_ENV]]
+
+
 def test_unpack_refuses_a_champion_that_fails_the_gate(tmp_path):
     results_dir = _make_bundle(tmp_path)
     leg_dir = results_dir / "test-camp" / "fake"
@@ -233,6 +247,20 @@ def test_unpack_copies_the_whole_champion_tree(tmp_path):
         == sha
     ), "the copied bundle must resolve the sha PROVENANCE.md claims"
     assert "workspace.bundle" in provenance and sha in provenance
+
+
+def test_unpack_reads_the_published_champion_source_tree(tmp_path):
+    """The archive publishes the workspace at CHAMPION.sha under champion_source/; when it is there,
+    it is what gets unpacked, ahead of the bundle."""
+    results_dir = _make_bundle(tmp_path)
+    published = SCAFFOLD_MODELING.read_text() + "\n# from the published tree\n"
+    tree = results_dir / "test-camp" / "fake" / "champion_source" / "agent"
+    tree.mkdir(parents=True)
+    (tree / "modeling.py").write_text(published)
+
+    dest = unpack("test-camp", "fake", None, results_dir, tmp_path / "champions")
+
+    assert (dest / "modeling.py").read_text() == published
 
 
 def test_allow_missing_data_unpacks_a_dead_reference_and_discloses_it(tmp_path):

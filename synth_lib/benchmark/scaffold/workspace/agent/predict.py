@@ -47,6 +47,8 @@ from modeling import simulate  # noqa: E402  (import after adding AGENT_DIR to s
 
 CONTEXT_MINUTES = 7 * 24 * 60
 PREDICTIONS_DIR = WORKSPACE / "miner_outputs" / "campaign" / "predictions"
+# backtest() fetches prices up to 26 h past the last prompt's start (synth_lib/backtester/orchestration.py).
+BACKTEST_PADDING = timedelta(hours=26)
 
 
 def ensure_workspace_cwd() -> None:
@@ -88,6 +90,26 @@ def check_snapshot_coverage(asset: str, start: datetime, end: datetime) -> None:
             f"{' …' if len(missing) > 5 else ''}\n"
             f"The snapshot is frozen (read-only) and stops at the campaign's data_cutoff. "
             f"Reduce --eval-end / --days to stay within the available coverage ({root})."
+        )
+
+
+def check_backtest_padding(asset: str, end: datetime, time_length: int) -> None:
+    """Fails if backtest() would read past the snapshot.
+
+    backtest() reads beyond --eval-end — scores to the end of that day, rewards a day further,
+    prices 26 h past the last prompt's start — and fetches whatever the snapshot lacks from the live
+    API and the venues: data from after the cutoff. --eval-end therefore stops a horizon and 26 h
+    before the snapshot's last day."""
+    days = sorted(p.name for p in store_root(asset).glob("date=*.parquet"))
+    if not days:
+        return  # check_snapshot_coverage reports the missing partitions
+    last_day = datetime.fromisoformat(days[-1].removeprefix("date=").removesuffix(".parquet"))
+    latest = last_day.replace(tzinfo=timezone.utc) - timedelta(seconds=time_length) - BACKTEST_PADDING
+    if end > latest:
+        raise SystemExit(
+            f"--eval-end {end.date()} is too late for --time-length {time_length}: backtest() reads a horizon "
+            f"and 26 h past it, beyond the snapshot's last day ({last_day.date()}), and would fetch that "
+            f"from the live API. Use --eval-end {latest.date()} or earlier."
         )
 
 
@@ -143,7 +165,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--asset", default="BTC")
     ap.add_argument("--days", type=int, default=3)
-    ap.add_argument("--eval-end", required=True, help="YYYY-MM-DD, must be <= data_cutoff")
+    ap.add_argument("--eval-end", required=True, help="YYYY-MM-DD, at most data_cutoff minus the horizon and 26 h")
     ap.add_argument("--time-increment", type=int, default=300, help="seconds between points (60 for CRYPTO_1H)")
     ap.add_argument("--time-length", type=int, default=86_400, help="horizon in seconds (3600 for CRYPTO_1H)")
     ap.add_argument(
@@ -157,6 +179,7 @@ def main() -> None:
     args = ap.parse_args()
     ensure_workspace_cwd()
     end = datetime.fromisoformat(args.eval_end).replace(tzinfo=timezone.utc)
+    check_backtest_padding(args.asset, end, args.time_length)
     start = end - timedelta(days=args.days)
     # the context reaches back 7 days before the first prompt: coverage must extend that far
     check_snapshot_coverage(args.asset, start - timedelta(minutes=CONTEXT_MINUTES), end)

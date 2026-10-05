@@ -51,6 +51,37 @@ def test_offline_bundle_env_points_at_the_container_path(tmp_path):
     assert offline_bundle_env(snapshot) == {OFFLINE_ROOT_ENV: "/workspace/market_data/offline_data"}
 
 
+def test_require_offline_bundle_wants_scores_and_rewards(tmp_path):
+    """An empty folder is not a bundle: the agents would still backtest against the live API."""
+    from synth_lib.benchmark.run_campaign import require_offline_bundle
+
+    snapshot = tmp_path / "snapshot"
+    with pytest.raises(SystemExit, match="no offline scores bundle"):
+        require_offline_bundle(snapshot)
+    bundle = snapshot / "offline_data"
+    bundle.mkdir(parents=True)
+    with pytest.raises(SystemExit, match="no offline scores bundle"):
+        require_offline_bundle(snapshot)
+    (bundle / "miner_scores_BTC_crypto-24h.parquet").write_bytes(b"")
+    with pytest.raises(SystemExit, match="no offline scores bundle"):
+        require_offline_bundle(snapshot)
+    (bundle / "rewards_history_crypto-24h.parquet").write_bytes(b"")
+    assert require_offline_bundle(snapshot) == bundle
+
+
+def test_run_refuses_to_start_without_a_bundle(tmp_path, monkeypatch):
+    """The check comes before the proxy is touched: no key, no admin call, no leg."""
+    import sys
+
+    import synth_lib.benchmark.run_campaign as rc
+
+    monkeypatch.setattr(rc, "load_campaign", lambda path: _cfg(tmp_path))
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+    monkeypatch.setattr(sys, "argv", ["run_campaign", "run", "--campaign", "c.yaml"])
+    with pytest.raises(SystemExit, match="no offline scores bundle"):
+        rc.main()
+
+
 def test_offline_bundle_env_ignores_a_file_of_that_name(tmp_path):
     from synth_lib.benchmark.run_campaign import offline_bundle_env
 

@@ -47,15 +47,31 @@ def offline_bundle_env(snapshot: Path) -> dict[str, str]:
     The bundle's scores/rewards/pool parquets are not date partitions, so build_snapshot does not
     link them — the operator builds them straight into <snapshot>/offline_data. With
     this set, the agent reads field scores from disk instead of paginating api.synthdata.co one day
-    at a time (three concurrent agents would rate-limit each other); without it, synth-lib falls
-    back to the live API, which works on the bridge network. It is NOT optional for the verdict,
-    which runs with --network none.
+    at a time (three concurrent agents would rate-limit each other). `run` refuses to start without
+    it (`require_offline_bundle`). It is NOT optional for the verdict either, which runs with
+    --network none.
 
-    Absent bundle => empty dict, so a campaign without one behaves exactly as before.
+    Absent bundle => empty dict: only a direct run_all() caller with no bundle, such as the fake-CLI
+    tests, gets there.
     """
     if not (snapshot / OFFLINE_BUNDLE_DIR).is_dir():
         return {}
     return {OFFLINE_ROOT_ENV: f"{SANDBOX_MARKET_DATA}/{OFFLINE_BUNDLE_DIR}"}
+
+
+def require_offline_bundle(snapshot: Path) -> Path:
+    """The bundle agents backtest against, or exit. Without it every agent backtest calls the live
+    API, and the backtester's padding past the requested window reaches past the data cutoff."""
+    bundle = snapshot / OFFLINE_BUNDLE_DIR
+    has_scores = bundle.is_dir() and any(bundle.glob("miner_scores_*.parquet"))
+    has_rewards = bundle.is_dir() and any(bundle.glob("rewards_history_*.parquet"))
+    if not (has_scores and has_rewards):
+        raise SystemExit(
+            f"no offline scores bundle in {bundle}: build it before `run`, one call per competition —\n"
+            f"  python -m synth_lib.backtester.scripts.build_offline_bundle --competition <slug> "
+            f"--days 32 --eval-end <data_cutoff> --out {bundle} --no-realized-paths"
+        )
+    return bundle
 
 
 def containerize_url(url: str) -> str:
@@ -278,6 +294,7 @@ def main() -> None:
     if args.command == "setup":
         setup_campaign(args.campaign, args.data_root)
     elif args.command == "run":
+        require_offline_bundle(state.dir / "snapshot")
         admin = LiteLLMAdmin(cfg.proxy_url, os.environ[args.master_key_env])
         run_all(state, admin=admin)
     elif args.command == "status":
