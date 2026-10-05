@@ -89,6 +89,9 @@ API_SCORES_PAGE_SIZE_DAYS = 1  # /validation/scores/historical: "to" = inclusive
 # /v1/miners/rewards/pool caps ranges at 366 days; 300-day chunks stay under it.
 API_POOL_PAGE_SIZE_DAYS = 300
 
+# /miners/registrations/historical caps ranges at 31 days, "to" being an inclusive whole day.
+API_REGISTRATIONS_PAGE_SIZE_DAYS = 30
+
 # -- Prediction file matching --
 # Scoring delay: the real prediction start_time is a few minutes before
 # scored_time - time_length. We allow up to 30 minutes of tolerance when

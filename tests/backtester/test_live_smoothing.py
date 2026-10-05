@@ -6,12 +6,13 @@ Both rules were measured against /rewards/scores on 352 crypto-24h updates (2026
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
-from synth.validator.competition_config import SMOOTHED_SCORE_COEFFICIENT
+from synth.validator.competition_config import CRYPTO_24H, SMOOTHED_SCORE_COEFFICIENT
 
-from synth_lib.backtester.scoring import calculate_smoothed_scores
+from synth_lib.backtester.scoring import calculate_smoothed_scores, compute_combined_smoothed_scores
 
 U = pd.Timestamp(datetime(2026, 9, 20, 12, 0, tzinfo=UTC))
 
@@ -96,3 +97,49 @@ class TestReregisteredUid:
             registrations={5: self.R.to_pydatetime()},
         )
         assert list(out["miner_uid"]) == [1]
+
+    def test_the_combined_field_names_each_occupant(self) -> None:
+        """Both rounds report uid 5; miner_id says which occupant held it."""
+        before = self.R - timedelta(hours=1)
+        results = [
+            SimpleNamespace(
+                prompt_df=pd.DataFrame(self._field()),
+                smoothed_scores=pd.DataFrame({"updated_at": [before, U]}),
+            )
+        ]
+        out = compute_combined_smoothed_scores(
+            results, competition=CRYPTO_24H, registrations={5: self.R.to_pydatetime()}
+        )
+        held = out.loc[out["miner_uid"] == 5].set_index("updated_at")["miner_id"]
+        assert held.to_dict() == {before: 1_000_005, U: 5}
+
+
+class TestUidThatChangedHandsTwice:
+    """uid 5 changes hands at R1 = u - 5.5 d and again at R2 = u - 3.5 d: three miners live."""
+
+    R1 = U - timedelta(days=5, hours=12)
+    R2 = U - timedelta(days=3, hours=12)
+
+    def _field(self) -> list[dict]:
+        scores = _rows(1, [(timedelta(days=d), 1.0) for d in (8, 6, 4, 2, 1)])
+        scores += _rows(5, [(timedelta(days=8), 7.0), (timedelta(days=6), 7.0)])  # started before R1
+        scores += _rows(5, [(timedelta(days=4), 5.0)])  # started at u - 5 d: between R1 and R2
+        scores += _rows(5, [(timedelta(days=2), 3.0), (timedelta(days=1), 3.0)])  # started after R2
+        return scores
+
+    def _smoothed_at(self, updated_at: pd.Timestamp) -> pd.Series:
+        out = calculate_smoothed_scores(
+            pd.DataFrame(self._field()),
+            pd.DataFrame({"updated_at": [updated_at]}),
+            cutoff_days=10,
+            registrations={5: [self.R2.to_pydatetime(), self.R1.to_pydatetime()]},
+        )
+        return out.set_index("miner_uid")["new_smoothed_score"]
+
+    def test_the_middle_occupant_holds_the_uid_between_the_two_registrations(self) -> None:
+        # Its one row (u - 4 d) is counted; the two field timestamps before it are backfilled at 50.
+        assert self._smoothed_at(U - timedelta(days=3, hours=18))[5] == pytest.approx((50.0 * 2 + 5.0) / 3)
+
+    def test_the_current_occupant_holds_it_after_the_second(self) -> None:
+        # Backfilled at the three field timestamps before its first row, not paid the middle one's 5.
+        assert self._smoothed_at(U)[5] == pytest.approx((50.0 * 3 + 3.0 * 2) / 5)

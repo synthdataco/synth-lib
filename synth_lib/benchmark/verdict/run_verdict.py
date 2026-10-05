@@ -15,7 +15,9 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      simulated emissions -> Score = 100 x mean over competitions of reward_vs_top (see
      evaluate.reward_metrics; the unweighted mean mirrors the subnet's 1/3-per-competition
      emission split, and the softmaxed reward_weight makes top positions worth more, which a
-     rank percentile would flatten).
+     rank percentile would flatten). Field uids that changed hands are split as live does, from
+     registrations read from the Synth API once per window and kept in local files: the
+     window's offline bundle and each verdict. A re-score reads those first.
   6. Write campaign_results/<campaign>/<leg>/verdict-<tag>/ — the verdict.json, the
      per-competition rank-evolution charts, the per-prompt CRPS frames and the recomputed field
      rewards. One directory per verdict, so a re-score under --tag cannot overwrite the artifacts
@@ -24,7 +26,8 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
 The synth_default baseline runs on the HOST (trusted repo code; note its known caveat below).
 
 Usage (on the box, after ingesting prices up to window_end + 1 day):
-  export LITELLM_MASTER_KEY=...   # not needed here, but the offline bundle build needs network
+  export LITELLM_MASTER_KEY=...   # not needed here, but the offline bundle build needs network,
+                                  # and so does the first run of a window (registrations)
   uv run python -m synth_lib.benchmark.verdict.run_verdict --campaign <name> \\
       --window-start <YYYY-MM-DD> --window-end <YYYY-MM-DD>
 """
@@ -43,7 +46,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from synth_lib.backtester.loading import get_miner_scores
+from synth_lib.backtester.loading import get_miner_scores, get_registrations
+from synth_lib.backtester.scoring import Registrations
+from synth_lib.benchmark import workspace
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
@@ -64,6 +69,8 @@ PROMPT_TIMES_DIR = "prompt_times"
 # A prompt's paths depend on the champion's code and on the seed it was generated with, so both
 # are in the cache path: nothing else distinguishes two runs of the same window.
 DEFAULT_PREDICTIONS_CACHE = Path("predictions_cache")
+# Beside the scores and rewards in the window's offline bundle (prepare_offline_bundle).
+REGISTRATIONS_FILE = "registrations.json"
 
 # Constitution rule 7: a champion that uses randomness seeds every generator from this, and it
 # is set only here, at evaluation. Absent during a campaign, so an agent's own runs vary.
@@ -304,6 +311,71 @@ def generate_baseline(
             print(f"  baseline {asset} tl={comp.time_length}", flush=True)
 
 
+def registration_span(window: tuple[str, str], simulate_registration: datetime | None) -> tuple[datetime, datetime]:
+    """The span whose registrations can split the scored data: from one horizon before the window
+    (and a competition window earlier with a simulated registration) to the window's end."""
+    start = pd.Timestamp(window[0], tz="UTC") - pd.Timedelta(seconds=max(c.time_length for c in COMPETITIONS))
+    if simulate_registration is not None:
+        start -= pd.Timedelta(days=max(c.window_days for c in COMPETITIONS))
+    return start.to_pydatetime(), pd.Timestamp(window[1], tz="UTC").to_pydatetime()
+
+
+def registrations_record(span: tuple[datetime, datetime], rows: pd.DataFrame) -> dict:
+    """The field's registrations over `span` (`get_registrations` rows), as kept beside a window's
+    bundle and in its verdicts."""
+    return {
+        "since": span[0].isoformat(),
+        "until": span[1].isoformat(),
+        "rows": [
+            {"miner_uid": int(row.miner_uid), "hotkey": row.hotkey, "created_at": row.created_at.isoformat()}
+            for row in rows.itertuples()
+        ],
+    }
+
+
+def registrations_from(record: dict) -> dict[int, list[datetime]]:
+    """uid -> the registration times of its occupants in a `registrations_record`, ascending."""
+    out: dict[int, list[datetime]] = {}
+    for row in record["rows"]:
+        out.setdefault(int(row["miner_uid"]), []).append(datetime.fromisoformat(row["created_at"]))
+    return {uid: sorted(times) for uid, times in out.items()}
+
+
+def _covers(record: dict, span: tuple[datetime, datetime]) -> bool:
+    return (record.get("since"), record.get("until")) == (span[0].isoformat(), span[1].isoformat())
+
+
+def recorded_registrations(campaign_dir: Path, span: tuple[datetime, datetime]) -> dict | None:
+    """The registrations record any of the campaign's verdicts holds for `span`, or None."""
+    for path in sorted(campaign_dir.glob("**/verdict*/verdict.json")):
+        record = json.loads(path.read_text()).get("registrations") or {}
+        if _covers(record, span):
+            return record
+    return None
+
+
+def window_registrations(bundle: Path, campaign_dir: Path, span: tuple[datetime, datetime]) -> dict:
+    """The field's registrations record for `span`, from local files before the API: the window's
+    offline bundle, then the campaign's verdicts. Written into the bundle when it lacked it."""
+    cached = bundle / REGISTRATIONS_FILE
+    if cached.exists() and _covers(record := json.loads(cached.read_text()), span):
+        return record
+    record = recorded_registrations(campaign_dir, span)
+    if record is None:
+        print("reading the field's uid registrations from the Synth API...", flush=True)
+        record = registrations_record(span, get_registrations(*span))
+    cached.write_text(json.dumps(record, indent=2) + "\n")
+    return record
+
+
+def engine_rev() -> str | None:
+    """The synth-lib commit this host scores with, or None when it was not installed from git."""
+    try:
+        return workspace._host_synth_lib_rev()
+    except RuntimeError:
+        return None
+
+
 def score(
     name: str,
     predictions: Path,
@@ -311,8 +383,11 @@ def score(
     window_days: int,
     out_dir: Path,
     simulate_registration: datetime | None = None,
+    registrations: Registrations | None = None,
 ) -> dict:
-    result = evaluate_candidate(name, predictions, window_end, window_days, out_dir, simulate_registration)
+    result = evaluate_candidate(
+        name, predictions, window_end, window_days, out_dir, simulate_registration, registrations
+    )
     mrt = result["mean_reward_vs_top"]
     result["score"] = round(100 * mrt, 1) if mrt is not None else None
     ranks = [c["rank"] for c in result["per_competition"].values() if c["rank"] is not None]
@@ -330,6 +405,8 @@ def verdict_payload(
     seed: int,
     simulate_registration: datetime | None,
     live_prompts: bool,
+    registrations: dict | None = None,
+    engine: str | None = None,
 ) -> dict:
     return {
         "score": result["score"],
@@ -361,6 +438,11 @@ def verdict_payload(
         # False means the candidate answered a cadence grid and cadence_minutes describes it; True
         # means it answered the validator's own scored start_times and the grid was not used.
         "live_prompts": live_prompts,
+        # Field uids registered inside the scored span (registrations_record); a re-score of the
+        # same span reads them back instead of the API.
+        "registrations": registrations,
+        # The synth-lib commit that scored this verdict; None for an install not made from git.
+        "engine_rev": engine,
     }
 
 
@@ -436,11 +518,17 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     # The registration day is the window's first: the champion is deployed as the window opens.
     sim_reg = pd.Timestamp(args.window_start, tz="UTC").to_pydatetime() if args.simulate_registration else None
     print("building the offline scores bundle for the scoring window (network, resumable)...", flush=True)
-    prepare_offline_bundle(window_end, window_days, simulate_registration=sim_reg)
+    bundle = prepare_offline_bundle(window_end, window_days, simulate_registration=sim_reg)
     prompt_starts = None
     if args.live_prompts:
         print("reading the validator's scored prompt start_times from the bundle...", flush=True)
         prompt_starts = live_prompt_starts(window, lead_in=not args.no_lead_in)
+
+    span = registration_span(window, sim_reg)
+    record = window_registrations(bundle, campaign_dir, span)
+    registrations = registrations_from(record)
+    print(f"{len(record['rows'])} field registrations in {span[0]:%Y-%m-%d} -> {span[1]:%Y-%m-%d}", flush=True)
+    engine = engine_rev()
 
     legs = args.legs or sorted(p.name for p in campaign_dir.iterdir() if p.is_dir() and (p / "CHAMPION").exists())
     work = Path(tempfile.mkdtemp(prefix=f"verdict-{args.campaign}-"))
@@ -486,8 +574,8 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             cache=cache,
         )
         print(f"[{leg}] scoring", flush=True)
-        result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg)
-        payload = verdict_payload(result, champion.sha, window, args.seed, sim_reg, args.live_prompts)
+        result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg, registrations)
+        payload = verdict_payload(result, champion.sha, window, args.seed, sim_reg, args.live_prompts, record, engine)
         verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n")
         print(f"[{leg}] score={result['score']} mean_rank={result['mean_competition_rank']} -> {out}", flush=True)
@@ -500,7 +588,9 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print(f"[baseline] {baseline_out} already exists — SKIPPING (pass --force to rescore)", flush=True)
     elif not args.skip_baseline:
         baseline_modeling = baseline_modeling_path(args.baseline_module)
-        predictions = predictions_cache(args.predictions_cache, "synth_default", args.seed, args.live_prompts)
+        predictions = predictions_cache(
+            args.predictions_cache, "synth_default", args.seed, args.live_prompts, not args.no_lead_in
+        )
         print("[baseline] generating (host)", flush=True)
         generate_baseline(
             baseline_modeling,
@@ -511,8 +601,8 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             lead_in=not args.no_lead_in,
             prompt_starts=prompt_starts,
         )
-        result = score("synth_default", predictions, window_end, window_days, baseline_dir, sim_reg)
-        payload = verdict_payload(result, None, window, args.seed, sim_reg, args.live_prompts)
+        result = score("synth_default", predictions, window_end, window_days, baseline_dir, sim_reg, registrations)
+        payload = verdict_payload(result, None, window, args.seed, sim_reg, args.live_prompts, record, engine)
         baseline_dir.mkdir(parents=True, exist_ok=True)
         baseline_out.write_text(json.dumps(payload, indent=2) + "\n")
         print(

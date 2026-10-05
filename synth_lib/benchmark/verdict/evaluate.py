@@ -47,7 +47,10 @@ from synth_lib.backtester.config import _OFFLINE_ENV_VAR, slug_for  # type: igno
 from synth_lib.backtester.loading import get_rewards_history  # type: ignore[import-untyped]
 from synth_lib.backtester.orchestration import backtest  # type: ignore[import-untyped]
 from synth_lib.backtester.plots.rank import plot_total_rank_evolution  # type: ignore[import-untyped]
-from synth_lib.backtester.scoring import compute_combined_smoothed_scores  # type: ignore[import-untyped]
+from synth_lib.backtester.scoring import (  # type: ignore[import-untyped]
+    Registrations,
+    compute_combined_smoothed_scores,
+)
 from synth_lib.backtester.scripts.build_offline_bundle import (  # type: ignore[import-untyped]
     build_bundle,
     coerce_numeric_columns,
@@ -65,7 +68,9 @@ def reward_metrics(smoothed_scores: pd.DataFrame, miner_id: int = MINER_ID) -> d
       the denominator so a champion that beats the whole field reads as > 1.0, not capped at 1.
     - reward_rank: 1 + number of other miners whose window total beats the candidate's.
     """
-    totals = smoothed_scores.groupby("miner_uid")["reward_weight"].sum()
+    # miner_id tells a uid's successive occupants apart; frames written before it carry only miner_uid.
+    key = "miner_id" if "miner_id" in smoothed_scores.columns else "miner_uid"
+    totals = smoothed_scores.groupby(key)["reward_weight"].sum()
     if miner_id not in totals.index:
         return None
     candidate = float(totals.loc[miner_id])
@@ -178,6 +183,7 @@ def evaluate_candidate(
     window_days: int,
     out_dir: Path,
     simulate_registration: datetime | None = None,
+    registrations: Registrations | None = None,
 ) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
@@ -197,6 +203,9 @@ def evaluate_candidate(
     before it are dropped, the validator's moving average classifies it as a late joiner, and the
     preceding `competition.window_days` are backfilled at the field's worst score. That is what a
     champion actually earns in its first days live, and it is NOT comparable to a Score without it.
+
+    `registrations` (uid -> registration times of its occupants inside the scored data, see
+    `get_registrations`) scores each field uid that changed hands as the miners live sees.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []
@@ -218,6 +227,7 @@ def evaluate_candidate(
                     eval_end=window_end.to_pydatetime(),
                     competition=comp,
                     simulate_registration=simulate_registration,
+                    registrations=registrations,
                 )
                 results.append(result)
                 per_asset[asset] = {
@@ -237,7 +247,7 @@ def evaluate_candidate(
         # competition.window_days of rounds — exactly the backfilled onboarding period the
         # flag exists to show — and the headline rank, rewards and charts all read this frame.
         combined = compute_combined_smoothed_scores(
-            results, competition=comp, simulate_registration=simulate_registration
+            results, competition=comp, simulate_registration=simulate_registration, registrations=registrations
         )
         if simulate_registration is not None and not combined.empty:
             # The lookback is needed to compute the moving average, but the candidate did not exist

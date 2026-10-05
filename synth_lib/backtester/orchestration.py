@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -57,6 +56,7 @@ from synth_lib.backtester.plots.rank import (
 )
 from synth_lib.backtester.result import BacktestResult, NoScoresAvailable
 from synth_lib.backtester.scoring import (
+    Registrations,
     _compute_prompt_score_stats_for_group,
     _score_single_prompt,
     _trim_warmup,
@@ -101,12 +101,12 @@ def backtest(
     eval_end: datetime | None = None,
     simulate_registration: datetime | None = None,
     simulate_deregistration: datetime | None = None,
-    registrations: Mapping[int, datetime] | None = None,
+    registrations: Registrations | None = None,
 ) -> BacktestResult:
     """Backtest a local miner against Synth subnet scoring data.
     Loads predictions from predictions_dir (or miner_outputs/{miner_name}/predictions/).
-    `registrations` (uid -> chain registration time of its current occupant, see
-    `fetch_registrations`) splits re-registered field uids into two miners, as live does.
+    `registrations` (uid -> registration time(s) of its occupants inside the data, see
+    `get_registrations`) scores each field uid that changed hands as the miners live sees.
     """
     if competition is None:
         competition = competition_for(asset, time_length)
@@ -475,7 +475,7 @@ def run_backtest(
     eval_end: datetime | None = None,
     simulate_registration: datetime | None = None,
     simulate_deregistration: datetime | None = None,
-    registrations: Mapping[int, datetime] | None = None,
+    registrations: Registrations | None = None,
 ) -> tuple[list[BacktestResult], pd.DataFrame]:
     """Run the full backtest for all assets in a prompt config.
 
