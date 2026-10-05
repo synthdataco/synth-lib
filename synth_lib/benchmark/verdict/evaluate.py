@@ -68,7 +68,9 @@ def reward_metrics(smoothed_scores: pd.DataFrame, miner_id: int = MINER_ID) -> d
       the denominator so a champion that beats the whole field reads as > 1.0, not capped at 1.
     - reward_rank: 1 + number of other miners whose window total beats the candidate's.
     """
-    totals = smoothed_scores.groupby("miner_uid")["reward_weight"].sum()
+    # miner_id tells a uid's successive occupants apart; frames written before it carry only miner_uid.
+    key = "miner_id" if "miner_id" in smoothed_scores.columns else "miner_uid"
+    totals = smoothed_scores.groupby(key)["reward_weight"].sum()
     if miner_id not in totals.index:
         return None
     candidate = float(totals.loc[miner_id])

@@ -6,12 +6,13 @@ Both rules were measured against /rewards/scores on 352 crypto-24h updates (2026
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
-from synth.validator.competition_config import SMOOTHED_SCORE_COEFFICIENT
+from synth.validator.competition_config import CRYPTO_24H, SMOOTHED_SCORE_COEFFICIENT
 
-from synth_lib.backtester.scoring import calculate_smoothed_scores
+from synth_lib.backtester.scoring import calculate_smoothed_scores, compute_combined_smoothed_scores
 
 U = pd.Timestamp(datetime(2026, 9, 20, 12, 0, tzinfo=UTC))
 
@@ -96,6 +97,21 @@ class TestReregisteredUid:
             registrations={5: self.R.to_pydatetime()},
         )
         assert list(out["miner_uid"]) == [1]
+
+    def test_the_combined_field_names_each_occupant(self) -> None:
+        """Both rounds report uid 5; miner_id says which occupant held it."""
+        before = self.R - timedelta(hours=1)
+        results = [
+            SimpleNamespace(
+                prompt_df=pd.DataFrame(self._field()),
+                smoothed_scores=pd.DataFrame({"updated_at": [before, U]}),
+            )
+        ]
+        out = compute_combined_smoothed_scores(
+            results, competition=CRYPTO_24H, registrations={5: self.R.to_pydatetime()}
+        )
+        held = out.loc[out["miner_uid"] == 5].set_index("updated_at")["miner_id"]
+        assert held.to_dict() == {before: 1_000_005, U: 5}
 
 
 class TestUidThatChangedHandsTwice:

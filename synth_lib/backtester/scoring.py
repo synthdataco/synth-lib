@@ -252,9 +252,11 @@ def compute_combined_smoothed_scores(
     softmax across all miners — matching the real validator rather than our
     previous un-weighted hand-rolled aggregation.
 
-    Returns DataFrame with columns: updated_at, miner_uid, new_smoothed_score,
+    Returns DataFrame with columns: updated_at, miner_uid, miner_id, new_smoothed_score,
     reward_weight. reward_weight sums to SMOOTHED_SCORE_COEFFICIENT (1/3)
-    across miners per timestamp. `registrations`: as in calculate_smoothed_scores.
+    across miners per timestamp. miner_id names the occupant: the uid, or the uid of an earlier
+    occupant plus n * _PREVIOUS_OCCUPANT when `registrations` splits it. `registrations`: as in
+    calculate_smoothed_scores.
     """
     if not results:
         return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
@@ -312,6 +314,7 @@ def compute_combined_smoothed_scores(
                 {
                     "updated_at": pd.Timestamp(row["updated_at"]),
                     "miner_uid": row["miner_uid"],
+                    "miner_id": row["miner_id"],
                     "new_smoothed_score": row["smoothed_score"],
                     "reward_weight": row["reward_weight"],
                 }

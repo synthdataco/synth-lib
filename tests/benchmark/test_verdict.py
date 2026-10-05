@@ -151,6 +151,26 @@ def test_reward_metrics_simulated_emissions():
     assert reward_metrics(scores[scores["miner_uid"] != 999], miner_id=999) is None
 
 
+def test_reward_totals_keep_a_uids_successive_occupants_apart():
+    """uid 5 changes hands between the rounds and each occupant earns 2/9 once: neither beats the
+    candidate's two 1/9, which a total by uid (4/9) would have halved."""
+    from synth_lib.benchmark.verdict.evaluate import reward_metrics
+
+    t1 = pd.Timestamp("2026-08-01T00:00:00Z")
+    t2 = pd.Timestamp("2026-08-02T00:00:00Z")
+    scores = pd.DataFrame(
+        {
+            "updated_at": [t1, t1, t2, t2],
+            "miner_uid": [5, 999, 5, 999],
+            "miner_id": [1_000_005, 999, 5, 999],
+            "reward_weight": [2 / 9, 1 / 9, 2 / 9, 1 / 9],
+        }
+    )
+    m = reward_metrics(scores, miner_id=999)
+    assert m["reward_vs_top"] == pytest.approx(1.0)
+    assert m["reward_rank"] == 1
+
+
 def test_reward_metrics_beating_the_field_exceeds_one():
     from synth_lib.benchmark.verdict.evaluate import reward_metrics
 
