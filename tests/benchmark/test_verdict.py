@@ -856,16 +856,21 @@ def test_the_registration_span_starts_one_horizon_before_the_window():
     assert since == pd.Timestamp("2026-09-04T00:00:00Z")
 
 
-def test_a_window_reads_the_chain_once_and_its_verdicts_record_what_was_read(monkeypatch, tmp_path):
-    """The first run writes the registrations and the engine rev into the verdict; a re-score of the
-    same window reads them back from it."""
+def test_a_rescore_reads_registrations_from_local_files_before_the_chain(monkeypatch, tmp_path):
+    """The first run of a window reads the chain and writes the registrations into the offline bundle
+    and the verdict, with the engine rev. A re-score reads the bundle; without it, the verdict."""
     import synth_lib.benchmark.verdict.run_verdict as rv
 
     results = tmp_path / "results"
     (results / "c").mkdir(parents=True)
+    bundle = tmp_path / "bundle"
     registered = {12: pd.Timestamp("2026-09-17T08:00:00Z").to_pydatetime()}
     fetched: list = []
     scored_with: list = []
+
+    def fake_bundle(*a, **k):
+        bundle.mkdir(exist_ok=True)
+        return bundle
 
     def fake_fetch(since, until):
         fetched.append((since, until))
@@ -881,27 +886,32 @@ def test_a_window_reads_the_chain_once_and_its_verdicts_record_what_was_read(mon
             "per_competition": {},
         }
 
-    monkeypatch.setattr(rv, "prepare_offline_bundle", lambda *a, **k: tmp_path / "bundle")
+    monkeypatch.setattr(rv, "prepare_offline_bundle", fake_bundle)
     monkeypatch.setattr(rv, "fetch_registrations", fake_fetch)
     monkeypatch.setattr(rv, "docker_limits", lambda: (rv.SANDBOX_CPUS, rv.SANDBOX_MEMORY_GB))
     monkeypatch.setattr(rv, "generate_baseline", lambda *a, **k: None)
     monkeypatch.setattr(rv, "score", fake_score)
     argv = [
         "run_verdict",
-        *("--campaign", "c", "--results-dir", str(results), "--tag", "t"),
+        *("--campaign", "c", "--results-dir", str(results), "--tag", "t", "--force"),
         *("--window-start", "2026-09-15", "--window-end", "2026-09-25"),
         *("--predictions-cache", str(tmp_path / "cache"), "--data-root", str(tmp_path / "market_data")),
     ]
     monkeypatch.setattr(sys, "argv", argv)
-    rv.main()
-    monkeypatch.setattr(sys, "argv", [*argv, "--force"])
-    rv.main()
-
-    verdict = json.loads((results / "c" / "baselines" / "synth_default" / "verdict-t" / "verdict.json").read_text())
-    assert verdict["registrations"] == {
+    record = {
         "since": "2026-09-14T00:00:00+00:00",
         "until": "2026-09-25T00:00:00+00:00",
         "uids": {"12": "2026-09-17T08:00:00+00:00"},
     }
-    assert verdict["engine_rev"] == "0" * 40
-    assert len(fetched) == 1 and scored_with == [registered, registered]
+
+    rv.main()  # the chain
+    verdict = json.loads((results / "c" / "baselines" / "synth_default" / "verdict-t" / "verdict.json").read_text())
+    assert verdict["registrations"] == record and verdict["engine_rev"] == "0" * 40
+    assert json.loads((bundle / rv.REGISTRATIONS_FILE).read_text()) == record
+
+    rv.main()  # the bundle
+    (bundle / rv.REGISTRATIONS_FILE).unlink()
+    rv.main()  # the verdict, copied back into the bundle
+
+    assert len(fetched) == 1 and scored_with == [registered] * 3
+    assert json.loads((bundle / rv.REGISTRATIONS_FILE).read_text()) == record

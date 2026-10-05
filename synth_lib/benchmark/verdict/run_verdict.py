@@ -16,8 +16,8 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      evaluate.reward_metrics; the unweighted mean mirrors the subnet's 1/3-per-competition
      emission split, and the softmaxed reward_weight makes top positions worth more, which a
      rank percentile would flatten). Field uids that changed hands are split as live does, from
-     registrations read once from an archive node and recorded in the verdict, where a re-score
-     of the same window finds them.
+     registrations read from an archive node once per window and kept in local files: the
+     window's offline bundle and each verdict. A re-score reads those first.
   6. Write campaign_results/<campaign>/<leg>/verdict-<tag>/ — the verdict.json, the
      per-competition rank-evolution charts, the per-prompt CRPS frames and the recomputed field
      rewards. One directory per verdict, so a re-score under --tag cannot overwrite the artifacts
@@ -70,6 +70,8 @@ PROMPT_TIMES_DIR = "prompt_times"
 # A prompt's paths depend on the champion's code and on the seed it was generated with, so both
 # are in the cache path: nothing else distinguishes two runs of the same window.
 DEFAULT_PREDICTIONS_CACHE = Path("predictions_cache")
+# Beside the scores and rewards in the window's offline bundle (prepare_offline_bundle).
+REGISTRATIONS_FILE = "registrations.json"
 
 # Constitution rule 7: a champion that uses randomness seeds every generator from this, and it
 # is set only here, at evaluation. Absent during a campaign, so an agent's own runs vary.
@@ -328,16 +330,35 @@ def registrations_record(span: tuple[datetime, datetime], registrations: Mapping
     }
 
 
-def recorded_registrations(
-    campaign_dir: Path, verdict_name: str, span: tuple[datetime, datetime]
-) -> dict[int, datetime] | None:
-    """The registrations an earlier run over the same span recorded in one of the campaign's
-    verdicts, or None."""
-    for path in sorted(campaign_dir.glob(f"**/{verdict_name}/verdict.json")):
-        record = json.loads(path.read_text()).get("registrations") or {}
-        if (record.get("since"), record.get("until")) == (span[0].isoformat(), span[1].isoformat()):
-            return {int(uid): datetime.fromisoformat(t) for uid, t in record["uids"].items()}
+def registrations_from(record: dict, span: tuple[datetime, datetime]) -> dict[int, datetime] | None:
+    """The registrations in a `registrations_record`, or None unless it covers exactly `span`."""
+    if (record.get("since"), record.get("until")) != (span[0].isoformat(), span[1].isoformat()):
+        return None
+    return {int(uid): datetime.fromisoformat(t) for uid, t in record["uids"].items()}
+
+
+def recorded_registrations(campaign_dir: Path, span: tuple[datetime, datetime]) -> dict[int, datetime] | None:
+    """The registrations any of the campaign's verdicts recorded for `span`, or None."""
+    for path in sorted(campaign_dir.glob("**/verdict*/verdict.json")):
+        found = registrations_from(json.loads(path.read_text()).get("registrations") or {}, span)
+        if found is not None:
+            return found
     return None
+
+
+def window_registrations(bundle: Path, campaign_dir: Path, span: tuple[datetime, datetime]) -> dict[int, datetime]:
+    """The field's registrations over `span`, from local files before the chain: the window's
+    offline bundle, then the campaign's verdicts. Written into the bundle when it lacked them."""
+    cached = bundle / REGISTRATIONS_FILE
+    found = registrations_from(json.loads(cached.read_text()), span) if cached.exists() else None
+    if found is not None:
+        return found
+    found = recorded_registrations(campaign_dir, span)
+    if found is None:
+        print("reading the field's uid registrations from an archive node...", flush=True)
+        found = fetch_registrations(*span)
+    cached.write_text(json.dumps(registrations_record(span, found), indent=2) + "\n")
+    return found
 
 
 def engine_rev() -> str | None:
@@ -490,18 +511,14 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     # The registration day is the window's first: the champion is deployed as the window opens.
     sim_reg = pd.Timestamp(args.window_start, tz="UTC").to_pydatetime() if args.simulate_registration else None
     print("building the offline scores bundle for the scoring window (network, resumable)...", flush=True)
-    prepare_offline_bundle(window_end, window_days, simulate_registration=sim_reg)
+    bundle = prepare_offline_bundle(window_end, window_days, simulate_registration=sim_reg)
     prompt_starts = None
     if args.live_prompts:
         print("reading the validator's scored prompt start_times from the bundle...", flush=True)
         prompt_starts = live_prompt_starts(window, lead_in=not args.no_lead_in)
 
-    verdict_name = f"verdict-{args.tag}" if args.tag else "verdict"
     span = registration_span(window, sim_reg)
-    registrations = recorded_registrations(campaign_dir, verdict_name, span)
-    if registrations is None:
-        print("reading the field's uid registrations from an archive node...", flush=True)
-        registrations = fetch_registrations(*span)
+    registrations = window_registrations(bundle, campaign_dir, span)
     print(f"{len(registrations)} field uids registered in {span[0]:%Y-%m-%d} -> {span[1]:%Y-%m-%d}", flush=True)
     record = registrations_record(span, registrations)
     engine = engine_rev()
@@ -513,6 +530,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print(f"docker daemon smaller than the reference box: sandboxes capped at {limits[0]} cpus / {limits[1]} GB")
     print(f"legs: {legs}; work dir: {work}", flush=True)
 
+    verdict_name = f"verdict-{args.tag}" if args.tag else "verdict"
     for leg in legs:
         verdict_dir = campaign_dir / leg / verdict_name
         out = verdict_dir / "verdict.json"
