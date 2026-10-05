@@ -21,6 +21,7 @@ from tenacity import (
 from synth_lib.backtester.caveats import _is_rate_limit_or_server_error, _warn_on_middle_gap
 from synth_lib.backtester.config import (
     API_POOL_PAGE_SIZE_DAYS,
+    API_REGISTRATIONS_PAGE_SIZE_DAYS,
     API_SCORES_PAGE_SIZE_DAYS,
     MINER_DASHBOARD_API_BASE,
     UTC,
@@ -188,6 +189,37 @@ def get_rewards_history(
     df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True)
     df = df.drop_duplicates()
     return df
+
+
+def get_registrations(since: datetime, until: datetime) -> pd.DataFrame:
+    """GET https://api.synthdata.co/miners/registrations/historical.
+
+    The miners that took a uid inside [since, until]: one row per (miner_uid, hotkey), at the time the
+    validator first saw that hotkey on that uid. API ranges are paginated in
+    API_REGISTRATIONS_PAGE_SIZE_DAYS-day chunks. Returns DataFrame with columns: miner_uid, hotkey,
+    created_at.
+    """
+    since = since.replace(microsecond=0)
+    until = until.replace(microsecond=0)
+
+    chunks = []
+    cursor = since
+    while cursor < until:
+        chunk_end = min(cursor + timedelta(days=API_REGISTRATIONS_PAGE_SIZE_DAYS), until)
+        resp = _http_get(
+            f"{SYNTHDATA_API_BASE}/miners/registrations/historical",
+            params={"from": cursor.strftime("%Y-%m-%dT%H:%M:%SZ"), "to": chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ")},
+        )
+        if resp.status_code != 404:  # 404 = no registration in this range
+            resp.raise_for_status()
+            chunks.append(pd.DataFrame(resp.json() or [], columns=["miner_uid", "hotkey", "created_at"]))
+        cursor = chunk_end
+
+    df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=["miner_uid", "hotkey", "created_at"])
+    df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+    df = df.drop_duplicates().astype({"miner_uid": int})
+    df = df.loc[(df["created_at"] >= since) & (df["created_at"] <= until)]
+    return df.sort_values(["created_at", "miner_uid"]).reset_index(drop=True)
 
 
 def get_daily_miner_pool_usd(

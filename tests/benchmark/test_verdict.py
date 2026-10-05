@@ -856,15 +856,15 @@ def test_the_registration_span_starts_one_horizon_before_the_window():
     assert since == pd.Timestamp("2026-09-04T00:00:00Z")
 
 
-def test_a_rescore_reads_registrations_from_local_files_before_the_chain(monkeypatch, tmp_path):
-    """The first run of a window reads the chain and writes the registrations into the offline bundle
+def test_a_rescore_reads_registrations_from_local_files_before_the_api(monkeypatch, tmp_path):
+    """The first run of a window reads the API and writes the registrations into the offline bundle
     and the verdict, with the engine rev. A re-score reads the bundle; without it, the verdict."""
     import synth_lib.benchmark.verdict.run_verdict as rv
 
     results = tmp_path / "results"
     (results / "c").mkdir(parents=True)
     bundle = tmp_path / "bundle"
-    registered = {12: pd.Timestamp("2026-09-17T08:00:00Z").to_pydatetime()}
+    registered_at = pd.Timestamp("2026-09-17T08:00:00Z")
     fetched: list = []
     scored_with: list = []
 
@@ -874,7 +874,7 @@ def test_a_rescore_reads_registrations_from_local_files_before_the_chain(monkeyp
 
     def fake_fetch(since, until):
         fetched.append((since, until))
-        return registered
+        return pd.DataFrame({"miner_uid": [12], "hotkey": ["5Fa"], "created_at": [registered_at]})
 
     def fake_score(name, predictions, window_end, window_days, out_dir, simulate_registration=None, registrations=None):
         scored_with.append(registrations)
@@ -887,7 +887,7 @@ def test_a_rescore_reads_registrations_from_local_files_before_the_chain(monkeyp
         }
 
     monkeypatch.setattr(rv, "prepare_offline_bundle", fake_bundle)
-    monkeypatch.setattr(rv, "fetch_registrations", fake_fetch)
+    monkeypatch.setattr(rv, "get_registrations", fake_fetch)
     monkeypatch.setattr(rv, "docker_limits", lambda: (rv.SANDBOX_CPUS, rv.SANDBOX_MEMORY_GB))
     monkeypatch.setattr(rv, "generate_baseline", lambda *a, **k: None)
     monkeypatch.setattr(rv, "score", fake_score)
@@ -901,10 +901,10 @@ def test_a_rescore_reads_registrations_from_local_files_before_the_chain(monkeyp
     record = {
         "since": "2026-09-14T00:00:00+00:00",
         "until": "2026-09-25T00:00:00+00:00",
-        "uids": {"12": "2026-09-17T08:00:00+00:00"},
+        "rows": [{"miner_uid": 12, "hotkey": "5Fa", "created_at": "2026-09-17T08:00:00+00:00"}],
     }
 
-    rv.main()  # the chain
+    rv.main()  # the API
     verdict = json.loads((results / "c" / "baselines" / "synth_default" / "verdict-t" / "verdict.json").read_text())
     assert verdict["registrations"] == record and verdict["engine_rev"] == "0" * 40
     assert json.loads((bundle / rv.REGISTRATIONS_FILE).read_text()) == record
@@ -913,5 +913,5 @@ def test_a_rescore_reads_registrations_from_local_files_before_the_chain(monkeyp
     (bundle / rv.REGISTRATIONS_FILE).unlink()
     rv.main()  # the verdict, copied back into the bundle
 
-    assert len(fetched) == 1 and scored_with == [registered] * 3
+    assert len(fetched) == 1 and scored_with == [{12: [registered_at.to_pydatetime()]}] * 3
     assert json.loads((bundle / rv.REGISTRATIONS_FILE).read_text()) == record

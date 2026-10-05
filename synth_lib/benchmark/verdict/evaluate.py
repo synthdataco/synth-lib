@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -48,7 +47,10 @@ from synth_lib.backtester.config import _OFFLINE_ENV_VAR, slug_for  # type: igno
 from synth_lib.backtester.loading import get_rewards_history  # type: ignore[import-untyped]
 from synth_lib.backtester.orchestration import backtest  # type: ignore[import-untyped]
 from synth_lib.backtester.plots.rank import plot_total_rank_evolution  # type: ignore[import-untyped]
-from synth_lib.backtester.scoring import compute_combined_smoothed_scores  # type: ignore[import-untyped]
+from synth_lib.backtester.scoring import (  # type: ignore[import-untyped]
+    Registrations,
+    compute_combined_smoothed_scores,
+)
 from synth_lib.backtester.scripts.build_offline_bundle import (  # type: ignore[import-untyped]
     build_bundle,
     coerce_numeric_columns,
@@ -179,7 +181,7 @@ def evaluate_candidate(
     window_days: int,
     out_dir: Path,
     simulate_registration: datetime | None = None,
-    registrations: Mapping[int, datetime] | None = None,
+    registrations: Registrations | None = None,
 ) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
@@ -200,8 +202,8 @@ def evaluate_candidate(
     preceding `competition.window_days` are backfilled at the field's worst score. That is what a
     champion actually earns in its first days live, and it is NOT comparable to a Score without it.
 
-    `registrations` (uid -> registration time of its occupant at the window's end, see
-    `fetch_registrations`) scores each field uid that changed hands as the two miners live sees.
+    `registrations` (uid -> registration times of its occupants inside the scored data, see
+    `get_registrations`) scores each field uid that changed hands as the miners live sees.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []

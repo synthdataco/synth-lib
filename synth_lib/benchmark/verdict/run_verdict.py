@@ -16,7 +16,7 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      evaluate.reward_metrics; the unweighted mean mirrors the subnet's 1/3-per-competition
      emission split, and the softmaxed reward_weight makes top positions worth more, which a
      rank percentile would flatten). Field uids that changed hands are split as live does, from
-     registrations read from an archive node once per window and kept in local files: the
+     registrations read from the Synth API once per window and kept in local files: the
      window's offline bundle and each verdict. A re-score reads those first.
   6. Write campaign_results/<campaign>/<leg>/verdict-<tag>/ — the verdict.json, the
      per-competition rank-evolution charts, the per-prompt CRPS frames and the recomputed field
@@ -41,14 +41,13 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
-from synth_lib.backtester.loading import get_miner_scores
-from synth_lib.backtester.registrations import fetch_registrations
+from synth_lib.backtester.loading import get_miner_scores, get_registrations
+from synth_lib.backtester.scoring import Registrations
 from synth_lib.benchmark import workspace
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
@@ -321,44 +320,52 @@ def registration_span(window: tuple[str, str], simulate_registration: datetime |
     return start.to_pydatetime(), pd.Timestamp(window[1], tz="UTC").to_pydatetime()
 
 
-def registrations_record(span: tuple[datetime, datetime], registrations: Mapping[int, datetime]) -> dict:
-    """The registrations a verdict was scored with, as written into it."""
+def registrations_record(span: tuple[datetime, datetime], rows: pd.DataFrame) -> dict:
+    """The field's registrations over `span` (`get_registrations` rows), as kept beside a window's
+    bundle and in its verdicts."""
     return {
         "since": span[0].isoformat(),
         "until": span[1].isoformat(),
-        "uids": {str(uid): registrations[uid].isoformat() for uid in sorted(registrations)},
+        "rows": [
+            {"miner_uid": int(row.miner_uid), "hotkey": row.hotkey, "created_at": row.created_at.isoformat()}
+            for row in rows.itertuples()
+        ],
     }
 
 
-def registrations_from(record: dict, span: tuple[datetime, datetime]) -> dict[int, datetime] | None:
-    """The registrations in a `registrations_record`, or None unless it covers exactly `span`."""
-    if (record.get("since"), record.get("until")) != (span[0].isoformat(), span[1].isoformat()):
-        return None
-    return {int(uid): datetime.fromisoformat(t) for uid, t in record["uids"].items()}
+def registrations_from(record: dict) -> dict[int, list[datetime]]:
+    """uid -> the registration times of its occupants in a `registrations_record`, ascending."""
+    out: dict[int, list[datetime]] = {}
+    for row in record["rows"]:
+        out.setdefault(int(row["miner_uid"]), []).append(datetime.fromisoformat(row["created_at"]))
+    return {uid: sorted(times) for uid, times in out.items()}
 
 
-def recorded_registrations(campaign_dir: Path, span: tuple[datetime, datetime]) -> dict[int, datetime] | None:
-    """The registrations any of the campaign's verdicts recorded for `span`, or None."""
+def _covers(record: dict, span: tuple[datetime, datetime]) -> bool:
+    return (record.get("since"), record.get("until")) == (span[0].isoformat(), span[1].isoformat())
+
+
+def recorded_registrations(campaign_dir: Path, span: tuple[datetime, datetime]) -> dict | None:
+    """The registrations record any of the campaign's verdicts holds for `span`, or None."""
     for path in sorted(campaign_dir.glob("**/verdict*/verdict.json")):
-        found = registrations_from(json.loads(path.read_text()).get("registrations") or {}, span)
-        if found is not None:
-            return found
+        record = json.loads(path.read_text()).get("registrations") or {}
+        if _covers(record, span):
+            return record
     return None
 
 
-def window_registrations(bundle: Path, campaign_dir: Path, span: tuple[datetime, datetime]) -> dict[int, datetime]:
-    """The field's registrations over `span`, from local files before the chain: the window's
-    offline bundle, then the campaign's verdicts. Written into the bundle when it lacked them."""
+def window_registrations(bundle: Path, campaign_dir: Path, span: tuple[datetime, datetime]) -> dict:
+    """The field's registrations record for `span`, from local files before the API: the window's
+    offline bundle, then the campaign's verdicts. Written into the bundle when it lacked it."""
     cached = bundle / REGISTRATIONS_FILE
-    found = registrations_from(json.loads(cached.read_text()), span) if cached.exists() else None
-    if found is not None:
-        return found
-    found = recorded_registrations(campaign_dir, span)
-    if found is None:
-        print("reading the field's uid registrations from an archive node...", flush=True)
-        found = fetch_registrations(*span)
-    cached.write_text(json.dumps(registrations_record(span, found), indent=2) + "\n")
-    return found
+    if cached.exists() and _covers(record := json.loads(cached.read_text()), span):
+        return record
+    record = recorded_registrations(campaign_dir, span)
+    if record is None:
+        print("reading the field's uid registrations from the Synth API...", flush=True)
+        record = registrations_record(span, get_registrations(*span))
+    cached.write_text(json.dumps(record, indent=2) + "\n")
+    return record
 
 
 def engine_rev() -> str | None:
@@ -376,7 +383,7 @@ def score(
     window_days: int,
     out_dir: Path,
     simulate_registration: datetime | None = None,
-    registrations: Mapping[int, datetime] | None = None,
+    registrations: Registrations | None = None,
 ) -> dict:
     result = evaluate_candidate(
         name, predictions, window_end, window_days, out_dir, simulate_registration, registrations
@@ -432,7 +439,7 @@ def verdict_payload(
         # means it answered the validator's own scored start_times and the grid was not used.
         "live_prompts": live_prompts,
         # Field uids registered inside the scored span (registrations_record); a re-score of the
-        # same span reads them back instead of the chain.
+        # same span reads them back instead of the API.
         "registrations": registrations,
         # The synth-lib commit that scored this verdict; None for an install not made from git.
         "engine_rev": engine,
@@ -518,9 +525,9 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         prompt_starts = live_prompt_starts(window, lead_in=not args.no_lead_in)
 
     span = registration_span(window, sim_reg)
-    registrations = window_registrations(bundle, campaign_dir, span)
-    print(f"{len(registrations)} field uids registered in {span[0]:%Y-%m-%d} -> {span[1]:%Y-%m-%d}", flush=True)
-    record = registrations_record(span, registrations)
+    record = window_registrations(bundle, campaign_dir, span)
+    registrations = registrations_from(record)
+    print(f"{len(record['rows'])} field registrations in {span[0]:%Y-%m-%d} -> {span[1]:%Y-%m-%d}", flush=True)
     engine = engine_rev()
 
     legs = args.legs or sorted(p.name for p in campaign_dir.iterdir() if p.is_dir() and (p / "CHAMPION").exists())
