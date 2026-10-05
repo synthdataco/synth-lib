@@ -500,7 +500,9 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print(f"[baseline] {baseline_out} already exists — SKIPPING (pass --force to rescore)", flush=True)
     elif not args.skip_baseline:
         baseline_modeling = baseline_modeling_path(args.baseline_module)
-        predictions = predictions_cache(args.predictions_cache, "synth_default", args.seed, args.live_prompts)
+        predictions = predictions_cache(
+            args.predictions_cache, "synth_default", args.seed, args.live_prompts, not args.no_lead_in
+        )
         print("[baseline] generating (host)", flush=True)
         generate_baseline(
             baseline_modeling,
