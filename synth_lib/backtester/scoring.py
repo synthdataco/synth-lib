@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -96,29 +96,38 @@ def _live_window(prepared: pd.DataFrame, updated_at: Any, cutoff_days: int) -> p
     return prepared.loc[(scored > updated_at - pd.Timedelta(days=cutoff_days)) & (scored < updated_at - _UPDATE_LAG)]
 
 
-# miner_id given to the previous occupant of a re-registered uid: uid + this, far above any uid.
+# uid -> the registration time(s) of the occupants that took it inside the data.
+Registrations = Mapping[int, datetime | Sequence[datetime]]
+
+# miner_id of a uid's n-th occupant before the current one: uid + n * this, far above any uid.
 _PREVIOUS_OCCUPANT = 1_000_000
 
 
-def _split_reregistered(
-    df: pd.DataFrame, registrations: Mapping[int, datetime] | None, time_length: int
-) -> pd.DataFrame:
-    """Give the previous occupant of each re-registered uid its own miner_id.
+def _tenures(registrations: Registrations) -> dict[int, list[pd.Timestamp]]:
+    """uid -> its registration times inside the data, ascending."""
+    out = {}
+    for uid, times in registrations.items():
+        out[int(uid)] = sorted(pd.Timestamp(t) for t in ([times] if isinstance(times, datetime) else times))
+    return out
 
-    Live keys a miner by hotkey, the public scores by uid. A uid re-registered at R is two miners
-    live: the rows of prompts started before R belong to the previous occupant, the rest to the new
-    one, which `prepare_df_for_moving_average` then backfills as a late joiner. `df` carries
-    `miner_id` (= uid) and `scored_time`; a prompt starts `time_length` seconds before it is scored.
-    Only the latest registration of a uid is known here, so an earlier one inside the span stays
-    merged.
+
+def _split_reregistered(df: pd.DataFrame, registrations: Registrations | None, time_length: int) -> pd.DataFrame:
+    """Give each earlier occupant of a uid that changed hands its own miner_id.
+
+    Live keys a miner by hotkey, the public scores by uid. A uid registered at R1 < ... < Rk inside
+    the data is k + 1 miners live: a row belongs to the occupant whose tenure holds its prompt's
+    start, and each occupant after the first is a late joiner that `prepare_df_for_moving_average`
+    backfills. `df` carries `miner_id` (= uid) and `scored_time`; a prompt starts `time_length`
+    seconds before it is scored. The current occupant keeps the uid.
     """
     if not registrations:
         return df
     df = df.copy()
     start = pd.to_datetime(df["scored_time"], utc=True) - pd.Timedelta(seconds=time_length)
-    for uid, registered_at in registrations.items():
-        previous = (df["miner_id"] == uid) & (start < pd.Timestamp(registered_at))
-        df.loc[previous, "miner_id"] = uid + _PREVIOUS_OCCUPANT
+    for uid, times in _tenures(registrations).items():
+        rows = df["miner_id"] == uid
+        later = sum((start[rows] < t).astype(int) for t in times)
+        df.loc[rows, "miner_id"] = uid + later * _PREVIOUS_OCCUPANT
     return df
 
 
@@ -129,13 +138,19 @@ class _RegisteredAtUpdate(_BacktestMinerDataHandler):
     leaves a deregistered hotkey out of the softmax. Set `updated_at` before each call.
     """
 
-    def __init__(self, registrations: Mapping[int, datetime], scores: pd.DataFrame) -> None:
+    def __init__(self, registrations: Registrations, scores: pd.DataFrame) -> None:
         super().__init__()
-        self.registrations = {uid: pd.Timestamp(t) for uid, t in registrations.items()}
-        # The new occupant's first real row. Before it is in a window, live has no rows for the
-        # new occupant, so it is absent; the whole-frame backfill would otherwise pay it the worst
-        # score from R on. `scores` is the split frame, before prepare_df_for_moving_average.
-        mine = scores.loc[scores["miner_id"].isin(self.registrations)]
+        # miner_id -> (its registration, None for a uid's first occupant; its replacement, None for
+        # the current one), with miner_ids as _split_reregistered assigns them.
+        self.tenures: dict[int, tuple[pd.Timestamp | None, pd.Timestamp | None]] = {}
+        for uid, times in _tenures(registrations).items():
+            bounds = [None, *times, None]
+            for i in range(len(times) + 1):
+                self.tenures[uid + (len(times) - i) * _PREVIOUS_OCCUPANT] = (bounds[i], bounds[i + 1])
+        # A late occupant's first real row. Before it is in a window, live has no rows for it, so it
+        # is absent; the whole-frame backfill would otherwise pay it the worst score from its
+        # registration on. `scores` is the split frame, before prepare_df_for_moving_average.
+        mine = scores.loc[scores["miner_id"].isin(self.tenures)]
         self.first_scored = pd.to_datetime(mine["scored_time"], utc=True).groupby(mine["miner_id"]).min().to_dict()
         self.updated_at: pd.Timestamp | None = None
 
@@ -143,20 +158,18 @@ class _RegisteredAtUpdate(_BacktestMinerDataHandler):
         u = pd.Timestamp(self.updated_at)
         for row in miner_data:
             miner_id = int(row["miner_id"])
-            if miner_id >= _PREVIOUS_OCCUPANT:
-                uid = miner_id - _PREVIOUS_OCCUPANT
-                row["miner_uid"] = uid if u < self.registrations[uid] else None
-            else:
-                registered_at = self.registrations.get(miner_id)
-                first = self.first_scored.get(miner_id)
-                counted = first is not None and first < u - _UPDATE_LAG
-                row["miner_uid"] = miner_id if registered_at is None or (u >= registered_at and counted) else None
+            if miner_id not in self.tenures:
+                row["miner_uid"] = miner_id
+                continue
+            registered, replaced = self.tenures[miner_id]
+            first = self.first_scored.get(miner_id)
+            joined = registered is None or (u >= registered and first is not None and first < u - _UPDATE_LAG)
+            present = replaced is None or u < replaced
+            row["miner_uid"] = miner_id % _PREVIOUS_OCCUPANT if joined and present else None
         return miner_data
 
 
-def _miner_data_handler(
-    registrations: Mapping[int, datetime] | None, scores: pd.DataFrame
-) -> _BacktestMinerDataHandler:
+def _miner_data_handler(registrations: Registrations | None, scores: pd.DataFrame) -> _BacktestMinerDataHandler:
     return _RegisteredAtUpdate(registrations, scores) if registrations else _BACKTEST_MDH
 
 
@@ -178,12 +191,12 @@ def calculate_smoothed_scores(
     cutoff_days: int = 10,
     scores_column: str = "new_prompt_scores",
     competition: CompetitionConfig = CRYPTO_24H,
-    registrations: Mapping[int, datetime] | None = None,
+    registrations: Registrations | None = None,
 ) -> pd.DataFrame:
     """Compute smoothed scores and reward weights using synth's compute_smoothed_score.
 
-    `registrations` maps a uid to the chain time its current occupant registered. With it, a uid
-    re-registered inside the data is scored as two miners, as live does (see _split_reregistered);
+    `registrations` maps a uid to the registration time(s) of its occupants inside the data. With
+    it, a uid that changed hands is scored as the miners live sees (see _split_reregistered);
     without it, every uid is one miner.
 
     Delegates to synth.validator.moving_average.compute_smoothed_score for each
@@ -228,7 +241,7 @@ def compute_combined_smoothed_scores(
     competition: CompetitionConfig = CRYPTO_24H,
     cutoff_days: int | None = None,
     simulate_registration: datetime | None = None,
-    registrations: Mapping[int, datetime] | None = None,
+    registrations: Registrations | None = None,
 ) -> pd.DataFrame:
     """Real-validator-equivalent cross-asset smoothed scores.
 
