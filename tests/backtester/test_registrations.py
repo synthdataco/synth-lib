@@ -106,7 +106,7 @@ def test_get_scores_save_order_pages_by_day_and_keeps_the_range(monkeypatch):
         calls.append(params)
         if params["from"].startswith("2026-09-14"):
             return _Response(200, [first, {"scored_time": "2026-09-15T09:00:00Z", "assets": ["SOL", "BTC"]}])
-        return _Response(200, [{"scored_time": "2026-09-16T10:00:00Z", "assets": ["XRP", "ETH"]}])
+        return _Response(200, [first, {"scored_time": "2026-09-16T10:00:00Z", "assets": ["XRP", "ETH"]}])
 
     monkeypatch.setattr(loading, "_http_get", fake_get)
     out = loading.get_scores_save_order(start, end, 86400)
