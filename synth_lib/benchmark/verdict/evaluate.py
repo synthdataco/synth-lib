@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -178,6 +179,7 @@ def evaluate_candidate(
     window_days: int,
     out_dir: Path,
     simulate_registration: datetime | None = None,
+    registrations: Mapping[int, datetime] | None = None,
 ) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
@@ -197,6 +199,9 @@ def evaluate_candidate(
     before it are dropped, the validator's moving average classifies it as a late joiner, and the
     preceding `competition.window_days` are backfilled at the field's worst score. That is what a
     champion actually earns in its first days live, and it is NOT comparable to a Score without it.
+
+    `registrations` (uid -> registration time of its occupant at the window's end, see
+    `fetch_registrations`) scores each field uid that changed hands as the two miners live sees.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []
@@ -218,6 +223,7 @@ def evaluate_candidate(
                     eval_end=window_end.to_pydatetime(),
                     competition=comp,
                     simulate_registration=simulate_registration,
+                    registrations=registrations,
                 )
                 results.append(result)
                 per_asset[asset] = {
@@ -237,7 +243,7 @@ def evaluate_candidate(
         # competition.window_days of rounds — exactly the backfilled onboarding period the
         # flag exists to show — and the headline rank, rewards and charts all read this frame.
         combined = compute_combined_smoothed_scores(
-            results, competition=comp, simulate_registration=simulate_registration
+            results, competition=comp, simulate_registration=simulate_registration, registrations=registrations
         )
         if simulate_registration is not None and not combined.empty:
             # The lookback is needed to compute the moving average, but the candidate did not exist

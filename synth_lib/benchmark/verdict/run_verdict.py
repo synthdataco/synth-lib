@@ -15,7 +15,9 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      simulated emissions -> Score = 100 x mean over competitions of reward_vs_top (see
      evaluate.reward_metrics; the unweighted mean mirrors the subnet's 1/3-per-competition
      emission split, and the softmaxed reward_weight makes top positions worth more, which a
-     rank percentile would flatten).
+     rank percentile would flatten). Field uids that changed hands are split as live does, from
+     registrations read once from an archive node and recorded in the verdict, where a re-score
+     of the same window finds them.
   6. Write campaign_results/<campaign>/<leg>/verdict-<tag>/ — the verdict.json, the
      per-competition rank-evolution charts, the per-prompt CRPS frames and the recomputed field
      rewards. One directory per verdict, so a re-score under --tag cannot overwrite the artifacts
@@ -24,7 +26,8 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
 The synth_default baseline runs on the HOST (trusted repo code; note its known caveat below).
 
 Usage (on the box, after ingesting prices up to window_end + 1 day):
-  export LITELLM_MASTER_KEY=...   # not needed here, but the offline bundle build needs network
+  export LITELLM_MASTER_KEY=...   # not needed here, but the offline bundle build needs network,
+                                  # and so does the first run of a window (registrations)
   uv run python -m synth_lib.benchmark.verdict.run_verdict --campaign <name> \\
       --window-start <YYYY-MM-DD> --window-end <YYYY-MM-DD>
 """
@@ -38,12 +41,15 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 
 from synth_lib.backtester.loading import get_miner_scores
+from synth_lib.backtester.registrations import fetch_registrations
+from synth_lib.benchmark import workspace
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
@@ -304,6 +310,44 @@ def generate_baseline(
             print(f"  baseline {asset} tl={comp.time_length}", flush=True)
 
 
+def registration_span(window: tuple[str, str], simulate_registration: datetime | None) -> tuple[datetime, datetime]:
+    """The span whose registrations can split the scored data: from one horizon before the window
+    (and a competition window earlier with a simulated registration) to the window's end."""
+    start = pd.Timestamp(window[0], tz="UTC") - pd.Timedelta(seconds=max(c.time_length for c in COMPETITIONS))
+    if simulate_registration is not None:
+        start -= pd.Timedelta(days=max(c.window_days for c in COMPETITIONS))
+    return start.to_pydatetime(), pd.Timestamp(window[1], tz="UTC").to_pydatetime()
+
+
+def registrations_record(span: tuple[datetime, datetime], registrations: Mapping[int, datetime]) -> dict:
+    """The registrations a verdict was scored with, as written into it."""
+    return {
+        "since": span[0].isoformat(),
+        "until": span[1].isoformat(),
+        "uids": {str(uid): registrations[uid].isoformat() for uid in sorted(registrations)},
+    }
+
+
+def recorded_registrations(
+    campaign_dir: Path, verdict_name: str, span: tuple[datetime, datetime]
+) -> dict[int, datetime] | None:
+    """The registrations an earlier run over the same span recorded in one of the campaign's
+    verdicts, or None."""
+    for path in sorted(campaign_dir.glob(f"**/{verdict_name}/verdict.json")):
+        record = json.loads(path.read_text()).get("registrations") or {}
+        if (record.get("since"), record.get("until")) == (span[0].isoformat(), span[1].isoformat()):
+            return {int(uid): datetime.fromisoformat(t) for uid, t in record["uids"].items()}
+    return None
+
+
+def engine_rev() -> str | None:
+    """The synth-lib commit this host scores with, or None when it was not installed from git."""
+    try:
+        return workspace._host_synth_lib_rev()
+    except RuntimeError:
+        return None
+
+
 def score(
     name: str,
     predictions: Path,
@@ -311,8 +355,11 @@ def score(
     window_days: int,
     out_dir: Path,
     simulate_registration: datetime | None = None,
+    registrations: Mapping[int, datetime] | None = None,
 ) -> dict:
-    result = evaluate_candidate(name, predictions, window_end, window_days, out_dir, simulate_registration)
+    result = evaluate_candidate(
+        name, predictions, window_end, window_days, out_dir, simulate_registration, registrations
+    )
     mrt = result["mean_reward_vs_top"]
     result["score"] = round(100 * mrt, 1) if mrt is not None else None
     ranks = [c["rank"] for c in result["per_competition"].values() if c["rank"] is not None]
@@ -330,6 +377,8 @@ def verdict_payload(
     seed: int,
     simulate_registration: datetime | None,
     live_prompts: bool,
+    registrations: dict | None = None,
+    engine: str | None = None,
 ) -> dict:
     return {
         "score": result["score"],
@@ -361,6 +410,11 @@ def verdict_payload(
         # False means the candidate answered a cadence grid and cadence_minutes describes it; True
         # means it answered the validator's own scored start_times and the grid was not used.
         "live_prompts": live_prompts,
+        # Field uids registered inside the scored span (registrations_record); a re-score of the
+        # same span reads them back instead of the chain.
+        "registrations": registrations,
+        # The synth-lib commit that scored this verdict; None for an install not made from git.
+        "engine_rev": engine,
     }
 
 
@@ -442,6 +496,16 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print("reading the validator's scored prompt start_times from the bundle...", flush=True)
         prompt_starts = live_prompt_starts(window, lead_in=not args.no_lead_in)
 
+    verdict_name = f"verdict-{args.tag}" if args.tag else "verdict"
+    span = registration_span(window, sim_reg)
+    registrations = recorded_registrations(campaign_dir, verdict_name, span)
+    if registrations is None:
+        print("reading the field's uid registrations from an archive node...", flush=True)
+        registrations = fetch_registrations(*span)
+    print(f"{len(registrations)} field uids registered in {span[0]:%Y-%m-%d} -> {span[1]:%Y-%m-%d}", flush=True)
+    record = registrations_record(span, registrations)
+    engine = engine_rev()
+
     legs = args.legs or sorted(p.name for p in campaign_dir.iterdir() if p.is_dir() and (p / "CHAMPION").exists())
     work = Path(tempfile.mkdtemp(prefix=f"verdict-{args.campaign}-"))
     limits = docker_limits()
@@ -449,7 +513,6 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         print(f"docker daemon smaller than the reference box: sandboxes capped at {limits[0]} cpus / {limits[1]} GB")
     print(f"legs: {legs}; work dir: {work}", flush=True)
 
-    verdict_name = f"verdict-{args.tag}" if args.tag else "verdict"
     for leg in legs:
         verdict_dir = campaign_dir / leg / verdict_name
         out = verdict_dir / "verdict.json"
@@ -486,8 +549,8 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             cache=cache,
         )
         print(f"[{leg}] scoring", flush=True)
-        result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg)
-        payload = verdict_payload(result, champion.sha, window, args.seed, sim_reg, args.live_prompts)
+        result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg, registrations)
+        payload = verdict_payload(result, champion.sha, window, args.seed, sim_reg, args.live_prompts, record, engine)
         verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n")
         print(f"[{leg}] score={result['score']} mean_rank={result['mean_competition_rank']} -> {out}", flush=True)
@@ -513,8 +576,8 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             lead_in=not args.no_lead_in,
             prompt_starts=prompt_starts,
         )
-        result = score("synth_default", predictions, window_end, window_days, baseline_dir, sim_reg)
-        payload = verdict_payload(result, None, window, args.seed, sim_reg, args.live_prompts)
+        result = score("synth_default", predictions, window_end, window_days, baseline_dir, sim_reg, registrations)
+        payload = verdict_payload(result, None, window, args.seed, sim_reg, args.live_prompts, record, engine)
         baseline_dir.mkdir(parents=True, exist_ok=True)
         baseline_out.write_text(json.dumps(payload, indent=2) + "\n")
         print(

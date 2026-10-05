@@ -1,4 +1,5 @@
 import json
+import sys
 
 import numpy as np
 import pandas as pd
@@ -218,7 +219,7 @@ def _fake_combined(miner_ranks: dict[int, float], seen: list | None = None):
     """
     t1 = pd.Timestamp("2026-08-01T00:00:00Z")
 
-    def fake(results, competition=None, cutoff_days=None, simulate_registration=None):
+    def fake(results, competition=None, cutoff_days=None, simulate_registration=None, registrations=None):
         assert cutoff_days is None  # must let it default to competition.window_days
         if seen is not None:
             seen.append(simulate_registration)
@@ -256,6 +257,7 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
         eval_end,
         competition,
         simulate_registration,
+        registrations,
     ):
         backtest_calls.append((asset, time_length))
         if asset == "XAU":
@@ -265,7 +267,9 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
     combined_calls: list[tuple[object, int]] = []
     fake_combined = _fake_combined({1: 0.5, 999: 0.3, 2: 0.2})  # miner 999 -> rank 2 of 3
 
-    def fake_compute_combined(results, competition=None, cutoff_days=None, simulate_registration=None):
+    def fake_compute_combined(
+        results, competition=None, cutoff_days=None, simulate_registration=None, registrations=None
+    ):
         combined_calls.append((competition, len(results)))
         return fake_combined(results, competition=competition, cutoff_days=cutoff_days)
 
@@ -336,6 +340,7 @@ def test_all_assets_failed_competition_yields_none(monkeypatch, tmp_path):
         eval_end,
         competition,
         simulate_registration,
+        registrations,
     ):
         if time_length == 3600:
             raise RuntimeError("crypto-1h store broken")
@@ -343,7 +348,9 @@ def test_all_assets_failed_competition_yields_none(monkeypatch, tmp_path):
 
     fake_combined = _fake_combined({999: 0.6, 1: 0.4})  # miner 999 -> rank 1 of 2
 
-    def fake_compute_combined(results, competition=None, cutoff_days=None, simulate_registration=None):
+    def fake_compute_combined(
+        results, competition=None, cutoff_days=None, simulate_registration=None, registrations=None
+    ):
         return fake_combined(results, competition=competition, cutoff_days=cutoff_days)
 
     monkeypatch.setattr(ev, "backtest", fake_backtest)
@@ -417,12 +424,15 @@ def test_each_competition_writes_a_rank_chart(monkeypatch, tmp_path):
         eval_end,
         competition,
         simulate_registration,
+        registrations,
     ):
         return _FakeResult()
 
     rounds = pd.to_datetime(["2026-08-01T00:00:00Z", "2026-08-01T12:00:00Z", "2026-08-02T00:00:00Z"])
 
-    def fake_compute_combined(results, competition=None, cutoff_days=None, simulate_registration=None):
+    def fake_compute_combined(
+        results, competition=None, cutoff_days=None, simulate_registration=None, registrations=None
+    ):
         if not results:
             return pd.DataFrame(columns=["updated_at", "miner_uid", "reward_weight"])
         return pd.DataFrame(
@@ -772,7 +782,7 @@ def test_simulated_registration_earns_nothing_before_it_registered(monkeypatch, 
     reg = pd.Timestamp("2026-08-30T00:00:00Z")
     before, after = reg - pd.Timedelta(days=1), reg + pd.Timedelta(days=1)
 
-    def fake_combined(results, competition=None, cutoff_days=None, simulate_registration=None):
+    def fake_combined(results, competition=None, cutoff_days=None, simulate_registration=None, registrations=None):
         return pd.DataFrame(
             {
                 "updated_at": [before, before, after, after],
@@ -801,3 +811,97 @@ def test_simulated_registration_earns_nothing_before_it_registered(monkeypatch, 
     assert rewards["reward_share"] == pytest.approx(0.25 / 0.75)
     frame = pd.read_parquet(out / result["per_competition"]["crypto-1h"]["frames"]["field_rewards"])
     assert pd.to_datetime(frame["updated_at"], utc=True).min() >= reg
+
+
+def test_registrations_reach_every_backtest_and_the_combined_field(monkeypatch, tmp_path):
+    """Each asset's replay and the combined field that ranks the candidate get the same split."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+
+    registrations = {12: pd.Timestamp("2026-09-17T08:00:00Z").to_pydatetime()}
+    per_asset: list = []
+    combined: list = []
+
+    def fake_backtest(*, registrations, **kw):
+        per_asset.append(registrations)
+        return _FakeResult()
+
+    def fake_combined(results, competition=None, cutoff_days=None, simulate_registration=None, registrations=None):
+        combined.append(registrations)
+        return _fake_combined({1: 0.5, 999: 0.3})(results, competition=competition)
+
+    monkeypatch.setattr(ev, "backtest", fake_backtest)
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", fake_combined)
+    ev.evaluate_candidate(
+        "cand",
+        tmp_path,
+        window_end=pd.Timestamp("2026-09-25T00:00:00Z"),
+        window_days=10,
+        out_dir=tmp_path / "charts",
+        registrations=registrations,
+    )
+    assert per_asset and all(r == registrations for r in per_asset)
+    assert len(combined) == 3 and all(r == registrations for r in combined)
+
+
+def test_the_registration_span_starts_one_horizon_before_the_window():
+    """A simulated registration pulls the scored data a competition window earlier, and the span with it."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    window = ("2026-09-15", "2026-09-25")
+    assert rv.registration_span(window, None) == (
+        pd.Timestamp("2026-09-14T00:00:00Z"),
+        pd.Timestamp("2026-09-25T00:00:00Z"),
+    )
+    since, _ = rv.registration_span(window, pd.Timestamp("2026-09-15T00:00:00Z").to_pydatetime())
+    assert since == pd.Timestamp("2026-09-04T00:00:00Z")
+
+
+def test_a_window_reads_the_chain_once_and_its_verdicts_record_what_was_read(monkeypatch, tmp_path):
+    """The first run writes the registrations and the engine rev into the verdict; a re-score of the
+    same window reads them back from it."""
+    import synth_lib.benchmark.verdict.run_verdict as rv
+
+    results = tmp_path / "results"
+    (results / "c").mkdir(parents=True)
+    registered = {12: pd.Timestamp("2026-09-17T08:00:00Z").to_pydatetime()}
+    fetched: list = []
+    scored_with: list = []
+
+    def fake_fetch(since, until):
+        fetched.append((since, until))
+        return registered
+
+    def fake_score(name, predictions, window_end, window_days, out_dir, simulate_registration=None, registrations=None):
+        scored_with.append(registrations)
+        return {
+            "score": 1.0,
+            "mean_competition_rank": 2,
+            "mean_reward_vs_top": 0.01,
+            "mean_competition_percentile": 0.5,
+            "per_competition": {},
+        }
+
+    monkeypatch.setattr(rv, "prepare_offline_bundle", lambda *a, **k: tmp_path / "bundle")
+    monkeypatch.setattr(rv, "fetch_registrations", fake_fetch)
+    monkeypatch.setattr(rv, "docker_limits", lambda: (rv.SANDBOX_CPUS, rv.SANDBOX_MEMORY_GB))
+    monkeypatch.setattr(rv, "generate_baseline", lambda *a, **k: None)
+    monkeypatch.setattr(rv, "score", fake_score)
+    argv = [
+        "run_verdict",
+        *("--campaign", "c", "--results-dir", str(results), "--tag", "t"),
+        *("--window-start", "2026-09-15", "--window-end", "2026-09-25"),
+        *("--predictions-cache", str(tmp_path / "cache"), "--data-root", str(tmp_path / "market_data")),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    rv.main()
+    monkeypatch.setattr(sys, "argv", [*argv, "--force"])
+    rv.main()
+
+    verdict = json.loads((results / "c" / "baselines" / "synth_default" / "verdict-t" / "verdict.json").read_text())
+    assert verdict["registrations"] == {
+        "since": "2026-09-14T00:00:00+00:00",
+        "until": "2026-09-25T00:00:00+00:00",
+        "uids": {"12": "2026-09-17T08:00:00+00:00"},
+    }
+    assert verdict["engine_rev"] == "0" * 40
+    assert len(fetched) == 1 and scored_with == [registered, registered]
