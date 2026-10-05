@@ -20,6 +20,7 @@ from synth.validator.crps_calculation import (
     calculate_crps_for_miner,
     calculate_total_score_for_miner,
 )
+from synth.validator.miner_data_handler import SCORING_GATE_SECONDS
 from synth.validator.moving_average import (
     compute_smoothed_score,
     prepare_df_for_moving_average,
@@ -81,20 +82,23 @@ def _compute_prompt_score_stats_for_group(crps: pd.Series, capped_era: bool = Tr
     )
 
 
-# A prompt scored in the minute before an update is not yet counted by it. Measured on 352 live
-# crypto-24h updates (2026-09-12 -> 09-23): every update with a prompt in that minute pointed there.
-_UPDATE_LAG = pd.Timedelta(minutes=1)
+# The validator scores a prompt once its window plus the scoring gate has passed, so an update does
+# not count the prompts that ended within the gate before it.
+_UPDATE_LAG = pd.Timedelta(seconds=SCORING_GATE_SECONDS)
 
 
 def _live_window(prepared: pd.DataFrame, updated_at: Any, cutoff_days: int) -> pd.DataFrame:
-    """The rows the validator's update at `updated_at` averages: scored in (u - cutoff_days, u - 1 min).
+    """The rows the validator's update at `updated_at` averages: scored in (u - cutoff_days, u - gate).
 
-    The lower bound is the validator's SQL (`scored_time > :min_scored_time`); the upper one is
-    behavioural, see _UPDATE_LAG. Both ends are open.
+    The lower bound is the validator's SQL (`scored_time > :min_scored_time`); the upper one is its
+    scoring gate, see _UPDATE_LAG. Both ends are open.
     """
     scored = prepared["scored_time"]
     return prepared.loc[(scored > updated_at - pd.Timedelta(days=cutoff_days)) & (scored < updated_at - _UPDATE_LAG)]
 
+
+# scored_time -> the assets scored at that minute, in the order the validator saved their scores.
+SaveOrder = Mapping[pd.Timestamp, Sequence[str]]
 
 # uid -> the registration time(s) of the occupants that took it inside the data.
 Registrations = Mapping[int, datetime | Sequence[datetime]]
@@ -167,6 +171,22 @@ class _RegisteredAtUpdate(_BacktestMinerDataHandler):
             present = replaced is None or u < replaced
             row["miner_uid"] = miner_id % _PREVIOUS_OCCUPANT if joined and present else None
         return miner_data
+
+
+def _first_saved_first(df: pd.DataFrame, save_order: SaveOrder | None) -> pd.DataFrame:
+    """Order each minute's rows as the validator saved them.
+
+    `prepare_df_for_moving_average` backfills a late joiner from each minute's first row: its
+    percentile95 - lowest_score, and its asset. The validator's first row is the prompt it saved first;
+    an asset `save_order` does not list for a minute goes last.
+    """
+    if not save_order:
+        return df
+    position = {(pd.Timestamp(t), asset): i for t, assets in save_order.items() for i, asset in enumerate(assets)}
+    unlisted = max((len(assets) for assets in save_order.values()), default=0)
+    rank = [position.get((t, asset), unlisted) for t, asset in zip(df["scored_time"], df["asset"])]
+    ordered = df.assign(_save_rank=rank).sort_values(["scored_time", "_save_rank"], kind="stable")
+    return ordered.drop(columns="_save_rank").reset_index(drop=True)
 
 
 def _miner_data_handler(registrations: Registrations | None, scores: pd.DataFrame) -> _BacktestMinerDataHandler:
@@ -242,6 +262,7 @@ def compute_combined_smoothed_scores(
     cutoff_days: int | None = None,
     simulate_registration: datetime | None = None,
     registrations: Registrations | None = None,
+    save_order: SaveOrder | None = None,
 ) -> pd.DataFrame:
     """Real-validator-equivalent cross-asset smoothed scores.
 
@@ -256,7 +277,8 @@ def compute_combined_smoothed_scores(
     reward_weight. reward_weight sums to SMOOTHED_SCORE_COEFFICIENT (1/3)
     across miners per timestamp. miner_id names the occupant: the uid, or the uid of an earlier
     occupant plus n * _PREVIOUS_OCCUPANT when `registrations` splits it. `registrations`: as in
-    calculate_smoothed_scores.
+    calculate_smoothed_scores. `save_order` (`get_scores_save_order`) backfills late joiners from
+    each minute's first-saved prompt, as live does; without it, from the first asset of `results`.
     """
     if not results:
         return pd.DataFrame(columns=_COMBINED_EMPTY_COLS)
@@ -292,6 +314,7 @@ def compute_combined_smoothed_scores(
     combined_crps = combined_crps.rename(columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"})
     combined_crps["scored_time"] = pd.to_datetime(combined_crps["scored_time"])
     combined_crps = _split_reregistered(combined_crps, registrations, competition.time_length)
+    combined_crps = _first_saved_first(combined_crps, save_order)
 
     prepared = prepare_df_for_moving_average(combined_crps)
 

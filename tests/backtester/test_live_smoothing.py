@@ -1,7 +1,4 @@
-"""The smoothing replay follows the live validator's window and miner identity.
-
-Both rules were measured against /rewards/scores on 352 crypto-24h updates (2026-09-12 -> 09-23).
-"""
+"""The smoothing replay follows the live validator's window, miner identity and save order."""
 
 from __future__ import annotations
 
@@ -11,8 +8,13 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 from synth.validator.competition_config import CRYPTO_24H, SMOOTHED_SCORE_COEFFICIENT
+from synth.validator.moving_average import prepare_df_for_moving_average
 
-from synth_lib.backtester.scoring import calculate_smoothed_scores, compute_combined_smoothed_scores
+from synth_lib.backtester.scoring import (
+    _first_saved_first,
+    calculate_smoothed_scores,
+    compute_combined_smoothed_scores,
+)
 
 U = pd.Timestamp(datetime(2026, 9, 20, 12, 0, tzinfo=UTC))
 
@@ -143,3 +145,59 @@ class TestUidThatChangedHandsTwice:
     def test_the_current_occupant_holds_it_after_the_second(self) -> None:
         # Backfilled at the three field timestamps before its first row, not paid the middle one's 5.
         assert self._smoothed_at(U)[5] == pytest.approx((50.0 * 3 + 3.0 * 2) / 5)
+
+
+class TestSaveOrder:
+    """BTC and ETH are both scored at T; the validator saved ETH's scores first. uid 9 joins later."""
+
+    T = U - timedelta(days=2)
+
+    def _frame(self) -> pd.DataFrame:
+        rows = []
+        for asset, p95 in (("BTC", 40.0), ("ETH", 60.0)):  # the frame lists BTC first
+            for scored, uid in ((self.T, 1), (U - timedelta(days=1), 1), (U - timedelta(days=1), 9)):
+                rows.append(
+                    {
+                        "scored_time": scored,
+                        "miner_id": uid,
+                        "asset": asset,
+                        "prompt_score_v3": 1.0,
+                        "percentile95": p95,
+                        "lowest_score": 0.0,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def _backfill_at_t(self, frame: pd.DataFrame) -> list[tuple[str, float]]:
+        prepared = prepare_df_for_moving_average(frame)
+        rows = prepared.loc[(prepared["miner_id"] == 9) & (prepared["scored_time"] == self.T)]
+        return list(zip(rows["asset"], rows["prompt_score_v3"]))
+
+    def test_a_late_joiner_is_backfilled_from_the_prompt_saved_first(self) -> None:
+        ordered = _first_saved_first(self._frame(), {self.T: ["ETH", "BTC"]})
+        assert self._backfill_at_t(ordered) == [("ETH", 60.0)]
+
+    def test_without_the_order_the_frame_order_decides(self) -> None:
+        assert self._backfill_at_t(self._frame()) == [("BTC", 40.0)]
+
+    def test_the_combined_field_is_ordered_before_the_backfill(self, monkeypatch) -> None:
+        import synth_lib.backtester.scoring as scoring
+
+        seen: list[pd.DataFrame] = []
+
+        def spy(df):
+            seen.append(df)
+            return prepare_df_for_moving_average(df)
+
+        monkeypatch.setattr(scoring, "prepare_df_for_moving_average", spy)
+        frame = self._frame().rename(columns={"miner_id": "miner_uid", "prompt_score_v3": "new_prompt_scores"})
+        results = [
+            SimpleNamespace(
+                prompt_df=frame.loc[frame["asset"] == asset],
+                smoothed_scores=pd.DataFrame({"updated_at": [U]}),
+            )
+            for asset in ("BTC", "ETH")
+        ]
+        scoring.compute_combined_smoothed_scores(results, competition=CRYPTO_24H, save_order={self.T: ["ETH", "BTC"]})
+        first_at_t = seen[0].loc[seen[0]["scored_time"] == self.T].iloc[0]
+        assert first_at_t["asset"] == "ETH"

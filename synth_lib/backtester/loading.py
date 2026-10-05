@@ -191,6 +191,37 @@ def get_rewards_history(
     return df
 
 
+def get_scores_save_order(start_time: datetime, end_time: datetime, time_length: int) -> dict[pd.Timestamp, list[str]]:
+    """GET https://api.synthdata.co/validation/scores/save-order.
+
+    scored_time -> the assets whose `time_length` prompts were scored at that minute, in the order the
+    validator saved their scores; minutes scored for one asset are absent. API ranges are paginated in
+    API_SCORES_PAGE_SIZE_DAYS-day chunks, like the scores they order.
+    """
+    start_time = start_time.replace(microsecond=0)
+    end_time = end_time.replace(microsecond=0)
+
+    out: dict[pd.Timestamp, list[str]] = {}
+    cursor = start_time
+    while cursor < end_time:
+        chunk_end = min(cursor + timedelta(days=API_SCORES_PAGE_SIZE_DAYS), end_time)
+        resp = _http_get(
+            f"{SYNTHDATA_API_BASE}/validation/scores/save-order",
+            params={
+                "from": cursor.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "to": chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "time_length": time_length,
+            },
+        )
+        if resp.status_code != 404:  # 404 = no minute scored for several assets in this range
+            resp.raise_for_status()
+            for row in resp.json() or []:
+                out[pd.Timestamp(row["scored_time"])] = list(row["assets"])
+        cursor = chunk_end
+
+    return {t: assets for t, assets in sorted(out.items()) if start_time <= t <= end_time}
+
+
 def get_registrations(since: datetime, until: datetime) -> pd.DataFrame:
     """GET https://api.synthdata.co/miners/registrations/historical.
 

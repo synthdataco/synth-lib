@@ -90,3 +90,32 @@ def test_get_registrations_reads_a_404_as_no_registration(monkeypatch):
     monkeypatch.setattr(loading, "_http_get", lambda url, params=None, timeout=30: _Response(404))
     out = loading.get_registrations(datetime(2026, 9, 14, tzinfo=UTC), datetime(2026, 9, 25, tzinfo=UTC))
     assert out.empty and list(out.columns) == ["miner_uid", "hotkey", "created_at"]
+
+
+def test_get_scores_save_order_pages_by_day_and_keeps_the_range(monkeypatch):
+    """Overlapping pages repeat a minute; one minute past the range is dropped."""
+    import pandas as pd
+
+    import synth_lib.backtester.loading as loading
+
+    start, end = datetime(2026, 9, 14, tzinfo=UTC), datetime(2026, 9, 16, tzinfo=UTC)
+    calls: list[dict] = []
+    first = {"scored_time": "2026-09-14T08:00:00Z", "assets": ["ETH", "BTC"]}
+
+    def fake_get(url, params=None, timeout=30):
+        calls.append(params)
+        if params["from"].startswith("2026-09-14"):
+            return _Response(200, [first, {"scored_time": "2026-09-15T09:00:00Z", "assets": ["SOL", "BTC"]}])
+        return _Response(200, [first, {"scored_time": "2026-09-16T10:00:00Z", "assets": ["XRP", "ETH"]}])
+
+    monkeypatch.setattr(loading, "_http_get", fake_get)
+    out = loading.get_scores_save_order(start, end, 86400)
+
+    assert [(c["from"], c["time_length"]) for c in calls] == [
+        ("2026-09-14T00:00:00Z", 86400),
+        ("2026-09-15T00:00:00Z", 86400),
+    ]
+    assert out == {
+        pd.Timestamp("2026-09-14T08:00:00Z"): ["ETH", "BTC"],
+        pd.Timestamp("2026-09-15T09:00:00Z"): ["SOL", "BTC"],
+    }
