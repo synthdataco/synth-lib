@@ -8,8 +8,10 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 from synth.validator.competition_config import CRYPTO_24H, SMOOTHED_SCORE_COEFFICIENT
-from synth.validator.moving_average import prepare_df_for_moving_average
+from synth.validator.miner_data_handler import SCORING_GATE_SECONDS
+from synth.validator.moving_average import compute_smoothed_score, prepare_df_for_moving_average
 
+from synth_lib.backtester.miner_data_handler import _BacktestMinerDataHandler
 from synth_lib.backtester.scoring import (
     _first_saved_first,
     calculate_smoothed_scores,
@@ -145,6 +147,47 @@ class TestUidThatChangedHandsTwice:
     def test_the_current_occupant_holds_it_after_the_second(self) -> None:
         # Backfilled at the three field timestamps before its first row, not paid the middle one's 5.
         assert self._smoothed_at(U)[5] == pytest.approx((50.0 * 3 + 3.0 * 2) / 5)
+
+
+class TestLateJoiner:
+    """uid 7 is first scored at J; uids 1 and 2 throughout. The validator prepares each update's own
+    window (forward.calculate_moving_average_and_update_rewards); the replay prepares the frame once."""
+
+    J = U - timedelta(days=2)
+    UPDATES = [J - timedelta(hours=1), J + timedelta(seconds=30), J + timedelta(hours=1), U]
+
+    def _field(self) -> list[dict]:
+        offsets = [timedelta(hours=h) for h in range(12 * 24, 0, -12)]
+        scores = _rows(1, [(off, 1.0) for off in offsets]) + _rows(2, [(off, 2.0) for off in offsets])
+        return scores + _rows(7, [(off, 3.0) for off in offsets if U - off >= self.J])
+
+    def _live(self, updated_at: pd.Timestamp) -> dict[int, float]:
+        raw = pd.DataFrame(self._field()).rename(
+            columns={"miner_uid": "miner_id", "new_prompt_scores": "prompt_score_v3"}
+        )
+        window = raw.loc[
+            (raw["scored_time"] > updated_at - timedelta(days=10))
+            & (raw["scored_time"] < updated_at - timedelta(seconds=SCORING_GATE_SECONDS))
+        ]
+        rows = compute_smoothed_score(
+            _BacktestMinerDataHandler(), prepare_df_for_moving_average(window), updated_at, CRYPTO_24H
+        )
+        return {r["miner_uid"]: r["smoothed_score"] for r in rows}
+
+    def test_the_replay_averages_the_miners_each_update_does(self) -> None:
+        replay = calculate_smoothed_scores(
+            pd.DataFrame(self._field()), pd.DataFrame({"updated_at": self.UPDATES}), cutoff_days=10
+        )
+        for updated_at in self.UPDATES:
+            got = replay.loc[replay["updated_at"] == updated_at].set_index("miner_uid")["new_smoothed_score"]
+            assert got.to_dict() == pytest.approx(self._live(updated_at)), updated_at
+
+    def test_absent_until_its_first_scored_prompt_is_in_the_window(self) -> None:
+        replay = calculate_smoothed_scores(
+            pd.DataFrame(self._field()), pd.DataFrame({"updated_at": self.UPDATES}), cutoff_days=10
+        )
+        holders = replay.groupby("updated_at")["miner_uid"].apply(set)
+        assert [7 in holders[u] for u in self.UPDATES] == [False, False, True, True]
 
 
 class TestSaveOrder:

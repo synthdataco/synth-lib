@@ -37,7 +37,7 @@ from synth_lib.backtester.config import (
     slug_for,
 )
 from synth_lib.backtester.loading import load_prediction
-from synth_lib.backtester.miner_data_handler import _BACKTEST_MDH, _BacktestMinerDataHandler
+from synth_lib.backtester.miner_data_handler import _BacktestMinerDataHandler
 from synth_lib.backtester.prompt_scores_legacy import compute_prompt_scores_pre_cap
 from synth_lib.backtester.result import BacktestResult
 
@@ -136,40 +136,38 @@ def _split_reregistered(df: pd.DataFrame, registrations: Registrations | None, t
 
 
 class _RegisteredAtUpdate(_BacktestMinerDataHandler):
-    """miner_id -> uid only for miners registered at the update being computed.
+    """miner_id -> uid only for the miners the update being computed averages: holding their uid,
+    and with a scored prompt of their own inside its window.
 
     `compute_smoothed_score` drops a miner whose uid resolves to None, which is how the validator
     leaves a deregistered hotkey out of the softmax. Set `updated_at` before each call.
     """
 
-    def __init__(self, registrations: Registrations, scores: pd.DataFrame) -> None:
+    def __init__(self, registrations: Registrations | None, scores: pd.DataFrame) -> None:
         super().__init__()
         # miner_id -> (its registration, None for a uid's first occupant; its replacement, None for
         # the current one), with miner_ids as _split_reregistered assigns them.
         self.tenures: dict[int, tuple[pd.Timestamp | None, pd.Timestamp | None]] = {}
-        for uid, times in _tenures(registrations).items():
+        for uid, times in _tenures(registrations or {}).items():
             bounds = [None, *times, None]
             for i in range(len(times) + 1):
                 self.tenures[uid + (len(times) - i) * _PREVIOUS_OCCUPANT] = (bounds[i], bounds[i + 1])
-        # A late occupant's first real row. Before it is in a window, live has no rows for it, so it
-        # is absent; the whole-frame backfill would otherwise pay it the worst score from its
-        # registration on. `scores` is the split frame, before prepare_df_for_moving_average.
-        mine = scores.loc[scores["miner_id"].isin(self.tenures)]
-        self.first_scored = pd.to_datetime(mine["scored_time"], utc=True).groupby(mine["miner_id"]).min().to_dict()
+        # Each miner's first real row. The validator prepares each update's own window, so a miner
+        # with no real row inside it yet has no row at all; the whole-frame backfill would otherwise
+        # pay it the worst score from the frame's start. `scores` is the split frame, before
+        # prepare_df_for_moving_average.
+        scored = pd.to_datetime(scores["scored_time"], utc=True)
+        self.first_scored = scored.groupby(scores["miner_id"]).min().to_dict()
         self.updated_at: pd.Timestamp | None = None
 
     def populate_miner_uid_in_miner_data(self, miner_data: list[dict]) -> list[dict]:
         u = pd.Timestamp(self.updated_at)
         for row in miner_data:
             miner_id = int(row["miner_id"])
-            if miner_id not in self.tenures:
-                row["miner_uid"] = miner_id
-                continue
-            registered, replaced = self.tenures[miner_id]
             first = self.first_scored.get(miner_id)
-            joined = registered is None or (u >= registered and first is not None and first < u - _UPDATE_LAG)
-            present = replaced is None or u < replaced
-            row["miner_uid"] = miner_id % _PREVIOUS_OCCUPANT if joined and present else None
+            _, replaced = self.tenures.get(miner_id, (None, None))
+            averaged = first is not None and first < u - _UPDATE_LAG and (replaced is None or u < replaced)
+            row["miner_uid"] = miner_id % _PREVIOUS_OCCUPANT if averaged else None
         return miner_data
 
 
@@ -189,19 +187,14 @@ def _first_saved_first(df: pd.DataFrame, save_order: SaveOrder | None) -> pd.Dat
     return ordered.drop(columns="_save_rank").reset_index(drop=True)
 
 
-def _miner_data_handler(registrations: Registrations | None, scores: pd.DataFrame) -> _BacktestMinerDataHandler:
-    return _RegisteredAtUpdate(registrations, scores) if registrations else _BACKTEST_MDH
-
-
 def _smoothed_at(
-    mdh: _BacktestMinerDataHandler,
+    mdh: _RegisteredAtUpdate,
     prepared: pd.DataFrame,
     updated_at: Any,
     cutoff_days: int,
     competition: CompetitionConfig,
 ) -> list[dict] | None:
-    if isinstance(mdh, _RegisteredAtUpdate):
-        mdh.updated_at = pd.Timestamp(updated_at)
+    mdh.updated_at = pd.Timestamp(updated_at)
     return compute_smoothed_score(mdh, _live_window(prepared, updated_at, cutoff_days), updated_at, competition)
 
 
@@ -236,7 +229,7 @@ def calculate_smoothed_scores(
     # Prepare the df (backfill new miners, etc.)
     prepared = prepare_df_for_moving_average(input_df)
 
-    mdh = _miner_data_handler(registrations, input_df)
+    mdh = _RegisteredAtUpdate(registrations, input_df)
     result_rows = []
     for updated_at in rewards_history["updated_at"].sort_values().unique():
         rewards = _smoothed_at(mdh, prepared, updated_at, cutoff_days, competition)
@@ -326,7 +319,7 @@ def compute_combined_smoothed_scores(
         for t in pd.to_datetime(r.smoothed_scores["updated_at"]).unique():
             timestamps.add(pd.Timestamp(t))
 
-    mdh = _miner_data_handler(registrations, combined_crps)
+    mdh = _RegisteredAtUpdate(registrations, combined_crps)
     result_rows = []
     for updated_at in sorted(timestamps):
         rewards = _smoothed_at(mdh, prepared, updated_at, cutoff_days, competition)
