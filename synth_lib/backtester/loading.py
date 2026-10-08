@@ -126,6 +126,8 @@ def get_miner_scores(
         return df
     df["scored_time"] = pd.to_datetime(df["scored_time"], utc=True)
     df = df.drop_duplicates(subset=["miner_uid", "scored_time", "asset", "time_length"])
+    # The API's `to` names a whole day; keep the requested range, as the offline read does.
+    df = _filter_time_range(df, "scored_time", start_time, end_time)
     df["time_increment"] = time_increment
     # API does not return start_time; derive it as scored_time - time_length. That IS the
     # prompt's own start: the validator scores a prompt exactly time_length after it starts, so
@@ -189,7 +191,8 @@ def get_rewards_history(
         return df
     df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True)
     df = df.drop_duplicates()
-    return df
+    # The API's `to` names a whole day; keep the requested range, as the offline read does.
+    return _filter_time_range(df, "updated_at", start_time, end_time)
 
 
 def get_scores_save_order(start_time: datetime, end_time: datetime, time_length: int) -> dict[pd.Timestamp, list[str]]:

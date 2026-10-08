@@ -22,6 +22,7 @@ from synth_lib.backtester.config import (
 from synth_lib.backtester.loading import (
     download_price_data,
     get_miner_scores,
+    get_rewards_history,
     load_prediction,
 )
 from synth_lib.backtester.miner_data_handler import _BacktestMinerDataHandler
@@ -1444,6 +1445,35 @@ class TestNoScoresAvailable:
 
         assert df.empty
 
+    @patch("synth_lib.backtester.loading._http_get")
+    def test_online_pages_are_cut_to_the_requested_range(self, mock_get: MagicMock) -> None:
+        """The API's `to` names a whole day: a page ending at midnight returns the day after it."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            {"miner_uid": 1, "asset": "BTC", "crps": 1.0, "time_length": 86_400, "scored_time": t}
+            for t in ("2026-09-13T12:00:00Z", "2026-09-14T00:00:00Z", "2026-09-14T12:00:00Z")
+        ]
+        mock_get.return_value = resp
+
+        df = get_miner_scores(datetime(2026, 9, 13, tzinfo=UTC), datetime(2026, 9, 14, tzinfo=UTC), "BTC", 86_400, 300)
+
+        assert list(df["scored_time"]) == [pd.Timestamp("2026-09-13T12:00:00Z")]
+
+    @patch("synth_lib.backtester.loading._http_get")
+    def test_online_rewards_are_cut_to_the_requested_range(self, mock_get: MagicMock) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            {"miner_uid": 1, "reward_weight": 0.1, "updated_at": t}
+            for t in ("2026-09-13T12:00:00Z", "2026-09-14T12:00:00Z")
+        ]
+        mock_get.return_value = resp
+
+        df = get_rewards_history(datetime(2026, 9, 13, tzinfo=UTC), datetime(2026, 9, 14, tzinfo=UTC))
+
+        assert list(df["updated_at"]) == [pd.Timestamp("2026-09-13T12:00:00Z")]
+
     @patch("synth_lib.backtester.orchestration.get_miner_scores")
     def test_backtest_raises_no_scores_available(self, mock_scores: MagicMock, tmp_path: Path) -> None:
         """Must not degrade to a bare RuntimeError — run_backtest keys SKIPPED off it."""
@@ -1492,6 +1522,15 @@ class TestSliceRealPrices:
         assert len(real_prices) == 13
         assert np.isnan(real_prices).all()  # must not raise on object/None input
 
+    def test_an_ohlcv_frame_is_sliced_on_close(self) -> None:
+        """`open` comes first in the store's columns; scoring it moves CRPS by a few percent."""
+        frame = self._frame(61)
+        ohlcv = pd.DataFrame({"open": frame["close"] - 1.0, "high": frame["close"] + 1.0, "close": frame["close"]})
+
+        prices = _slice_real_prices(ohlcv, pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300)
+
+        assert prices[:2] == [100.0, 105.0]
+
     def test_nan_minutes_survive_the_slice(self) -> None:
         """NaN is repairable by the fallback, so the slice must pass it through."""
         prices = _slice_real_prices(self._frame(61, gap_at=5), pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300)
@@ -1536,6 +1575,26 @@ class TestFillGapsFromRealizedPaths:
         assert _fill_gaps_from_realized_paths(prompts, "[test]") == 1
         assert prompts[0]["real_prices"] == path.to_list()
         mock_prefetch.assert_called_once()
+
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_says_what_it_fetches(
+        self,
+        mock_store_cls: MagicMock,
+        mock_prefetch: MagicMock,
+        capsys: pytest.CaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One request per uncached prompt at the API's pace: without a word, a sweep looks hung."""
+        monkeypatch.delenv("SYNTH_BACKTESTER_OFFLINE_DATA_ROOT", raising=False)
+        expected_steps = 86_400 // 300 + 1
+        mock_store_cls.return_value.get.return_value = pd.Series(
+            [1.0] * expected_steps, index=pd.date_range(self.START, periods=expected_steps, freq="5min")
+        )
+
+        _fill_gaps_from_realized_paths([self._prompt([float("nan")] * expected_steps)], "[test]")
+
+        assert "[test] fetching the validator's realized paths for up to 1 XAU prompts" in capsys.readouterr().out
 
     @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
     @patch("synth_lib.backtester.preparation.RealizedPathStore")
