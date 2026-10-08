@@ -160,6 +160,13 @@ def test_render_constitution_substitutes_all_vars(tmp_path):
     assert "test-rig" in text
 
 
+def test_the_constitution_states_a_gpu_minimum_only_when_there_is_one(tmp_path):
+    cfg = _cfg(tmp_path / "campaigns")
+    assert "minutes of GPU work" not in render_constitution(cfg, cfg.models[0])
+    text = render_constitution(replace(cfg, min_gpu_minutes=60), cfg.models[0])
+    assert "a nomination stands only once 60 minutes of GPU work are metered" in text
+
+
 def test_scaffolded_predict_anchors_paths_to_workspace_not_cwd(tmp_path, monkeypatch):
     """The price snapshot is mounted at the workspace ROOT, not inside agent/. If predict.py
     resolves `market_data/` relative to cwd (MinutePriceStore's default), the agent reads

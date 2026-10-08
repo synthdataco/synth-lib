@@ -16,6 +16,7 @@ from typing import Callable
 from synth_lib.benchmark.budget import BudgetStatus, BudgetTracker, Phase
 from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
 from synth_lib.benchmark.cli_adapters import CLIAdapter
+from synth_lib.benchmark.gpu_usage import GpuUsage
 from synth_lib.benchmark.nomination import probe_simulate_subprocess
 
 INITIAL_PROMPT = "Read the CAMPAIGN.md file in your agent folder and start your research campaign."
@@ -32,6 +33,13 @@ LANDING_PROMPT = (
     "IMMEDIATE LANDING ORDER: run NO new experiments. Finalize agent/journal.md, "
     "write agent/report.md, write the agent/CHAMPION file, commit all your work, That's it."
 )
+GPU_PROMPT = (
+    "Your nomination does not stand yet: this campaign accepts a champion only after {required:g} minutes "
+    "of GPU work, and the harness has metered {busy:.0f}. Train your model on the GPU, then nominate "
+    "again. BUDGET.md shows the count."
+)
+# How many times a nomination short of min_gpu_minutes is handed back before it stands anyway.
+MAX_GPU_RELAUNCHES = 3
 DELIVERABLES = ("report.md", "journal.md", "CHAMPION", "suggestions.md")
 # A safety classifier can decline a turn and the API can serve it from a different model instead.
 # Routing is then sticky for about an hour, so one declined turn can hand the rest of a leg to a
@@ -52,6 +60,8 @@ class RunResult:
     # Models that served a turn in place of the one asked for. Non-empty means this leg does not
     # measure the model on the panel.
     substituted_models: tuple[str, ...] = ()
+    # GPU-busy minutes the driver metered; None without a meter.
+    gpu_busy_minutes: float | None = None
 
 
 class ModelRun:
@@ -92,6 +102,8 @@ class ModelRun:
         ]
         self._transcripts = max(existing, default=-1) + 1
         self._probe_note = ""
+        self.gpu = GpuUsage() if cfg.gpu else None
+        self._gpu_relaunches = 0
 
     def _log(self, msg: str) -> None:
         """Operator-facing progress line (lands in the nohup log). The driver used to print
@@ -201,6 +213,21 @@ class ModelRun:
             prompt += " Found CHAMPION at the workspace root — wrong location: move it to agent/CHAMPION now."
         return prompt
 
+    def _notes(self) -> str:
+        """Harness notes for BUDGET.md: the GPU meter, then the interface check once it ran."""
+        gpu = self.gpu.line(self.cfg.min_gpu_minutes) if self.gpu is not None else ""
+        return "\n".join(note for note in (gpu, self._probe_note) if note)
+
+    def _short_of_gpu(self) -> bool:
+        """A nomination made before the campaign's GPU minutes, while it can still be handed back."""
+        return (
+            self.cfg.min_gpu_minutes > 0
+            and self.gpu is not None
+            and self.gpu.available
+            and self.gpu.busy_minutes < self.cfg.min_gpu_minutes
+            and self._gpu_relaunches < MAX_GPU_RELAUNCHES
+        )
+
     def _probe_interface(self, status: BudgetStatus) -> None:
         """Checks the nominated champion's simulate() contract once and logs the result.
         The result is memoized on the instance (self._probe_note): once known, it must stay visible
@@ -213,15 +240,24 @@ class ModelRun:
         # passed ("ok (24h + 1h)"), and that distinction is the whole point of the check — a
         # champion that ignores time_increment passes 24h and breaks on crypto-1h.
         self._probe_note = f"check interface: {msg}"
-        self.tracker.write_budget_file(self.agent_dir, status, notes=self._probe_note)
+        self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
 
     def _handle_exit(
         self, proc: subprocess.Popen, exit_code: int, status: BudgetStatus, crash_resumes: int, voluntary_resumes: int
     ) -> tuple[bool, subprocess.Popen, int, int]:
-        """Decides what happens after the process exits: clean landing, infra outage
-        (wait it out), voluntary stop with no champion (unlimited relaunch, never a crash), or
+        """Decides what happens after the process exits: clean landing (unless the nomination is
+        short of min_gpu_minutes in the normal phase: relaunched, up to MAX_GPU_RELAUNCHES), infra
+        outage (wait it out), voluntary stop with no champion (unlimited relaunch, never a crash), or
         crash (relaunch capped by max_crash_resumes). Returns (done, proc, crash_resumes, voluntary_resumes)."""
         if exit_code == 0 and self._champion() is not None:
+            if status.phase is Phase.NORMAL and self._short_of_gpu():
+                self._gpu_relaunches += 1
+                self._log(
+                    f"champion nominated after {self.gpu.busy_minutes:.0f} of {self.cfg.min_gpu_minutes:g} GPU "
+                    f"minutes: relaunching ({self._gpu_relaunches}/{MAX_GPU_RELAUNCHES})"
+                )
+                prompt = GPU_PROMPT.format(required=self.cfg.min_gpu_minutes, busy=self.gpu.busy_minutes)
+                return False, self._launch(prompt, resume=True), crash_resumes, voluntary_resumes + 1
             self._log("clean landing: process exited with agent/CHAMPION present")
             return True, proc, crash_resumes, voluntary_resumes  # clean landing
         if status.infra_down:
@@ -250,7 +286,7 @@ class ModelRun:
         # BUDGET.md must exist from the very first turn: the constitution promises the agent it
         # can read it from the start, not only after the first poll_seconds sleep.
         status = self.tracker.status()
-        self.tracker.write_budget_file(self.agent_dir, status, notes=self._probe_note)
+        self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
         self._log(
             f"leg start: model={self.model.model} budget=${self.cfg.budget_usd_per_model:.2f} "
             f"deadline={self.cfg.deadline_hours_per_model}h"
@@ -265,7 +301,9 @@ class ModelRun:
         while True:
             time.sleep(self.cfg.poll_seconds)
             status = self.tracker.status()
-            self.tracker.write_budget_file(self.agent_dir, status, notes=self._probe_note)
+            if self.gpu is not None:
+                self.gpu.sample(self.cfg.poll_seconds)
+            self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
             decile = int(max(status.pct_usd, status.pct_time) * 10)
             if decile > last_decile:  # one line per 10% of envelope, not one per poll
                 last_decile = decile
@@ -319,6 +357,11 @@ class ModelRun:
         substituted = tuple(sorted(self.substituted_models()))
         if substituted:
             self._log(f"WARNING: turns were served by {', '.join(substituted)} instead of {self.model.model}")
+        gpu_minutes = self.gpu.busy_minutes if self.gpu is not None and self.gpu.available else None
+        if self.gpu is not None:
+            self._log(
+                f"GPU: {gpu_minutes:.0f} min busy" if gpu_minutes is not None else f"GPU meter off: {self.gpu.error}"
+            )
         return RunResult(
             model_id=self.model.id,
             landed=champion is not None,
@@ -328,6 +371,7 @@ class ModelRun:
             landing_relaunches=landing_relaunches,
             final_spend_usd=status.spend_usd,
             substituted_models=substituted,
+            gpu_busy_minutes=gpu_minutes,
         )
 
     def _collect(self) -> None:

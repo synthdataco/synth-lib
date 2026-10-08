@@ -55,6 +55,15 @@ def test_non_positive_sandbox_limits_rejected(tmp_path, field):
         load_campaign(_write(tmp_path, VALID_YAML + f"\n{field}: 0\n"))
 
 
+def test_a_gpu_minimum_loads_and_needs_the_gpu(tmp_path):
+    assert load_campaign(_write(tmp_path, VALID_YAML + "\nmin_gpu_minutes: 60\n")).min_gpu_minutes == 60
+    assert load_campaign(_write(tmp_path, VALID_YAML)).min_gpu_minutes == 0
+    with pytest.raises(ValueError, match="min_gpu_minutes"):
+        load_campaign(_write(tmp_path, VALID_YAML + "\nmin_gpu_minutes: 60\ngpu: false\n"))
+    with pytest.raises(ValueError, match="min_gpu_minutes"):
+        load_campaign(_write(tmp_path, VALID_YAML + "\nmin_gpu_minutes: -1\n"))
+
+
 def test_effort_ultracode_and_goal_load_per_model(tmp_path):
     text = VALID_YAML.replace(
         "{id: claude, cli: claude-code, model: claude-model}",

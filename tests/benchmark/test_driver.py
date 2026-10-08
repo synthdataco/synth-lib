@@ -7,11 +7,12 @@ import time
 from datetime import date
 from pathlib import Path
 
-from synth_lib.benchmark.budget import BudgetTracker
+from synth_lib.benchmark.budget import BudgetStatus, BudgetTracker, Phase
 from synth_lib.benchmark.campaign import BaselineSpec, CampaignConfig, ModelSpec
 from synth_lib.benchmark.cli_adapters import FakeAdapter
 from synth_lib.benchmark.clock import RunClock
-from synth_lib.benchmark.driver import ModelRun
+from synth_lib.benchmark.driver import GPU_PROMPT, MAX_GPU_RELAUNCHES, ModelRun
+from synth_lib.benchmark.gpu_usage import GpuUsage
 
 
 class RampAdmin:
@@ -274,6 +275,55 @@ def test_handle_exit_voluntary_stop_during_landing_uses_landing_prompt(tmp_path)
     assert captured["prompt"].startswith(LANDING_PROMPT)
     assert "agent/CHAMPION MISSING" in captured["prompt"]  # the driver's view rides along
     assert captured["resume"] is True
+
+
+def _nominated(tmp_path, gpu_minutes: float | None, phase: Phase = Phase.NORMAL, min_gpu_minutes: float = 60):
+    """A run whose agent just exited 0 with agent/CHAMPION, after `gpu_minutes` of metered GPU work
+    (None: no meter). Returns the run and what _handle_exit decided."""
+    run = _run(
+        tmp_path, "lands", HoldAdmin(spend=1.0), cfg=_cfg(tmp_path / "campaigns", min_gpu_minutes=min_gpu_minutes)
+    )
+    run.gpu = GpuUsage(busy_seconds=60 * (gpu_minutes or 0), error=None if gpu_minutes is not None else "no meter")
+    (run.agent_dir / "CHAMPION").write_text("sha: abc\nagent_dir: agent\nprofiles: [low]\n")
+    launched: list[str] = []
+    run._launch = lambda prompt, resume=False: launched.append(prompt) or object()
+    status = BudgetStatus(
+        spend_usd=1.0, budget_usd=10.0, pct_usd=0.1, elapsed_s=0.0, remaining_s=100.0, pct_time=0.1, phase=phase
+    )
+    done, _proc, _crashes, voluntary = run._handle_exit(object(), 0, status, 0, 0)
+    return run, done, launched, voluntary
+
+
+def test_a_nomination_short_of_the_gpu_minimum_is_handed_back(tmp_path):
+    run, done, launched, voluntary = _nominated(tmp_path, gpu_minutes=12)
+    assert done is False and voluntary == 1
+    assert launched == [GPU_PROMPT.format(required=60, busy=12)]
+
+
+def test_a_nomination_past_the_gpu_minimum_stands(tmp_path):
+    _, done, launched, _ = _nominated(tmp_path, gpu_minutes=75)
+    assert done is True and launched == []
+
+
+def test_the_gpu_minimum_never_holds_a_landing_or_a_leg_without_a_meter(tmp_path):
+    assert _nominated(tmp_path / "landing", gpu_minutes=0, phase=Phase.LANDING)[1] is True
+    assert _nominated(tmp_path / "no-meter", gpu_minutes=None)[1] is True
+    assert _nominated(tmp_path / "no-minimum", gpu_minutes=0, min_gpu_minutes=0)[1] is True
+
+
+def test_a_nomination_stands_after_the_last_hand_back(tmp_path):
+    run, *_ = _nominated(tmp_path, gpu_minutes=0)
+    run._gpu_relaunches = MAX_GPU_RELAUNCHES
+    status = BudgetStatus(
+        spend_usd=1.0, budget_usd=10.0, pct_usd=0.1, elapsed_s=0.0, remaining_s=100.0, pct_time=0.1, phase=Phase.NORMAL
+    )
+    assert run._handle_exit(object(), 0, status, 0, 0)[0] is True
+
+
+def test_the_gpu_line_reaches_budget_md(tmp_path):
+    run = _run(tmp_path, "lands", HoldAdmin(spend=1.0), cfg=_cfg(tmp_path / "campaigns", min_gpu_minutes=60))
+    run.gpu = GpuUsage(busy_seconds=600)
+    assert run._notes() == "- GPU: 10 min busy so far, peak memory 0.0 GiB. A nomination stands from 60 min"
 
 
 def test_landing_prompt_reports_deliverable_state_and_misplaced_champion(tmp_path):
