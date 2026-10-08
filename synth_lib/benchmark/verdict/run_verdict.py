@@ -8,7 +8,7 @@ For each leg under campaign_results/<campaign>/ that has a CHAMPION + workspace.
      built, and that needs the network. It fetches only pinned packages, never prices.
   4. Phase 2 (network=none): one sandbox run per (competition, asset) generating predictions.
      The data root is mounted read-only at /workspace/market_data; the model itself only ever
-     receives the pre-prompt context Series (see generate_predictions.py). Predictions are
+     receives the pre-prompt context (see generate_predictions.py). Predictions are
      written to a cache mounted at /workspace/predictions that outlives the workspace, one file
      per day, so a re-score of a window already generated skips straight to scoring.
   5. On the host: evaluate_candidate() against the offline bundle -> per-competition rank +
@@ -51,6 +51,7 @@ import pandas as pd
 from synth_lib.backtester.loading import get_miner_scores, get_registrations, get_scores_save_order
 from synth_lib.backtester.scoring import Registrations, SaveOrder
 from synth_lib.benchmark import workspace
+from synth_lib.benchmark.generate_predictions import CONTEXT_MODES
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
@@ -165,7 +166,9 @@ def baseline_identity(modeling: Path) -> str:
     return hashlib.sha256(modeling.read_bytes()).hexdigest()[:12]
 
 
-def predictions_cache(root: Path, champion: str, seed: int, live_prompts: bool, lead_in: bool) -> Path:
+def predictions_cache(
+    root: Path, champion: str, seed: int, live_prompts: bool, lead_in: bool, context_mode: str = "ohlcv"
+) -> Path:
     """Where one champion's generated paths live, across runs.
 
     Everything that decides WHICH prompts get generated is in the path. Two runs that disagree on
@@ -176,6 +179,8 @@ def predictions_cache(root: Path, champion: str, seed: int, live_prompts: bool, 
     mode = "live-prompts" if live_prompts else "cadence-grid"
     if not lead_in:
         mode += "-no-lead-in"
+    if context_mode != "ohlcv":
+        mode += f"-{context_mode}"
     return root / champion / f"seed={seed}" / mode
 
 
@@ -222,6 +227,7 @@ def generate_all(
     lead_in: bool = True,
     prompt_starts: dict[tuple[str, int], list[pd.Timestamp]] | None = None,
     cache: Path | None = None,
+    context_mode: str = "ohlcv",
 ) -> None:
     """One --network none sandbox run per (competition, asset).
 
@@ -246,6 +252,8 @@ def generate_all(
             )
             if prompt_starts is not None:
                 inner += f" --prompt-times {PROMPT_TIMES_DIR}/{asset}_{comp.time_length}.json"
+            if context_mode != "ohlcv":
+                inner += f" --context {context_mode}"
             try:
                 run(
                     sandbox(
@@ -439,6 +447,7 @@ def verdict_payload(
     live_prompts: bool,
     registrations: dict | None = None,
     engine: str | None = None,
+    context_mode: str = "ohlcv",
 ) -> dict:
     return {
         "score": result["score"],
@@ -475,6 +484,8 @@ def verdict_payload(
         "registrations": registrations,
         # The synth-lib commit that scored this verdict; None for an install not made from git.
         "engine_rev": engine,
+        # What simulate() received as context_prices (generate_predictions.CONTEXT_MODES).
+        "context_prices": context_mode,
     }
 
 
@@ -537,6 +548,14 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         "covering every prompt of a re-score is reused instead of regenerated. Roughly 5 GB per "
         "champion per 10-day window, so prune it rather than letting it grow",
     )
+    ap.add_argument(
+        "--context",
+        choices=CONTEXT_MODES,
+        default="ohlcv",
+        help="what the champion's simulate() receives as context_prices: the minute OHLCV frame, or "
+        "'close', the Series of minute closes (NaN kept) of the contract before OHLCV, for a champion "
+        "written against it",
+    )
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--keep-work", action="store_true", help="keep clones + predictions for inspection")
     args = ap.parse_args()
@@ -592,7 +611,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         )
         print(f"[{leg}] phase 2: generation (--network none)", flush=True)
         cache = predictions_cache(
-            args.predictions_cache, champion.sha, args.seed, args.live_prompts, not args.no_lead_in
+            args.predictions_cache, champion.sha, args.seed, args.live_prompts, not args.no_lead_in, args.context
         )
         generate_all(
             clone,
@@ -605,10 +624,13 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             lead_in=not args.no_lead_in,
             prompt_starts=prompt_starts,
             cache=cache,
+            context_mode=args.context,
         )
         print(f"[{leg}] scoring", flush=True)
         result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg, registrations, save_order)
-        payload = verdict_payload(result, champion.sha, window, args.seed, sim_reg, args.live_prompts, record, engine)
+        payload = verdict_payload(
+            result, champion.sha, window, args.seed, sim_reg, args.live_prompts, record, engine, args.context
+        )
         verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n")
         print(f"[{leg}] score={result['score']} mean_rank={result['mean_competition_rank']} -> {out}", flush=True)

@@ -8,6 +8,7 @@ import pytest
 import synth_lib.benchmark.verdict.evaluate as ev
 from synth_lib.benchmark.verdict.generate import generate_predictions, prompt_grid
 from synth_lib.benchmark.verdict.evaluate import asset_rank_stats, final_rank, write_verdict
+import synth_lib.benchmark.verdict.run_verdict as rv
 from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES, score
 
 
@@ -807,10 +808,12 @@ def test_the_two_prompt_modes_never_share_a_cache(tmp_path):
         kw.pop("seed", 0),
         kw.pop("live_prompts", True),
         kw.pop("lead_in", True),
+        kw.pop("context_mode", "ohlcv"),
     )
     live = cache()
     assert cache(live_prompts=False) != live  # the prompts sit minutes apart
     assert cache(lead_in=False) != live  # --no-lead-in must not reuse lead-in prompts
+    assert cache(context_mode="close") != live  # the champion saw a different context
     assert cache(seed=7) != live
     assert cache(sha="def5678") != live
     # …but the same run reuses its own tree: that is the point of the cache
@@ -831,6 +834,26 @@ def test_the_cache_is_mounted_where_generation_writes(tmp_path, monkeypatch):
 
     assert commands and all(f"{cache.resolve()}:/workspace/predictions:rw" in cmd for cmd in commands)
     assert all("--out-dir predictions" in cmd for cmd in commands)
+
+
+def test_a_close_context_verdict_tells_every_generation_run(tmp_path, monkeypatch):
+    commands: list[str] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: commands.append(" ".join(cmd)))
+    rv.generate_all(tmp_path, tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), gpus=False, limits=(2, 4), seed=7)
+    assert commands and not any("--context" in cmd for cmd in commands)
+
+    commands.clear()
+    rv.generate_all(
+        tmp_path,
+        tmp_path,
+        tmp_path,
+        ("2026-08-30", "2026-09-09"),
+        gpus=False,
+        limits=(2, 4),
+        seed=7,
+        context_mode="close",
+    )
+    assert commands and all("--context close" in cmd for cmd in commands)
 
 
 def test_simulated_registration_earns_nothing_before_it_registered(monkeypatch, tmp_path):
