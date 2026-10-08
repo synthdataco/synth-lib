@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from synth_lib.backtester.caveats import _maybe_warn_hf_crps_formula_change
+from synth_lib.backtester.caveats import _maybe_warn_hf_crps_formula_change, _maybe_warn_latest_formula
 from synth_lib.backtester.config import (
     HF_CRPS_FORMULA_CHANGE_DATE,
     competition_for,
@@ -1698,7 +1698,7 @@ class TestVolCrpsCutover:
     PATHS = np.array([[100.0 + i * 0.1 + k for i in range(61)] for k in range(8)], dtype=float)
     REAL = np.array([100.0 + i * 0.1 for i in range(61)], dtype=float)
 
-    def _score(self, tmp_path, scored_time):
+    def _score(self, tmp_path, scored_time, latest_formula=False):
         f = tmp_path / "p.json"
         f.write_text(json.dumps({"paths": self.PATHS.tolist()}))
         return _score_single_prompt(
@@ -1712,6 +1712,7 @@ class TestVolCrpsCutover:
             scoring_intervals=CRYPTO_1H.scoring_intervals,
             vol_scoring_blocks=CRYPTO_1H.vol_scoring_blocks,
             miner_id=999,
+            latest_formula=latest_formula,
         )["crps"]
 
     def test_before_the_cutover_scores_price_only(self, tmp_path):
@@ -1741,6 +1742,21 @@ class TestVolCrpsCutover:
     def test_the_24h_competitions_have_no_volatility_term(self):
         """No vol_scoring_blocks, so the cutover date never applies to them."""
         assert not CRYPTO_24H.vol_scoring_blocks
+
+    def test_the_latest_formula_scores_a_prompt_from_before_the_cutover_with_the_volatility_term(self, tmp_path):
+        """What a champion scored after the cutover is judged on, measured on an older window."""
+        before = pd.Timestamp(VOL_CRPS_1H_DATE) - pd.Timedelta(days=7)
+        assert self._score(tmp_path, before, latest_formula=True) == pytest.approx(
+            self._score(tmp_path, pd.Timestamp(VOL_CRPS_1H_DATE))
+        )
+
+    def test_the_latest_formula_warns_that_field_ranks_before_the_cutover_compare_two_formulas(self):
+        with pytest.warns(UserWarning, match="field-relative numbers before it do not"):
+            _maybe_warn_latest_formula(CRYPTO_1H, pd.Timestamp(VOL_CRPS_1H_DATE) - pd.Timedelta(days=1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            _maybe_warn_latest_formula(CRYPTO_1H, pd.Timestamp(VOL_CRPS_1H_DATE))
+            _maybe_warn_latest_formula(CRYPTO_24H, pd.Timestamp(VOL_CRPS_1H_DATE) - pd.Timedelta(days=1))
 
 
 class TestOutlierCapCutover:

@@ -5,8 +5,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import synth_lib.benchmark.verdict.evaluate as ev
 from synth_lib.benchmark.verdict.generate import generate_predictions, prompt_grid
 from synth_lib.benchmark.verdict.evaluate import final_rank, write_verdict
+from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES, score
 
 
 def _flat_simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100, context_prices=None):
@@ -620,9 +622,6 @@ def test_the_bundle_widens_only_when_registration_is_simulated(monkeypatch, tmp_
 def test_a_grid_verdict_answers_each_prompt_from_the_grid_point_before_it(monkeypatch, tmp_path):
     """Matching only looks back, so the tolerance has to span the grid's cadence: a prompt scored
     late in an hour would otherwise find no prediction and score as a miss."""
-    import synth_lib.benchmark.verdict.evaluate as ev
-    from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES, score
-
     tolerances: dict[int, set[int]] = {}
 
     def fake_backtest(*, time_length, match_tolerance_minutes, **kw):

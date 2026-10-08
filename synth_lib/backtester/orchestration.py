@@ -16,6 +16,7 @@ from synth.validator.competition_config import ALL_COMPETITIONS, CompetitionConf
 from synth_lib.backtester.caveats import (
     _maybe_warn_competition_split,
     _maybe_warn_hf_crps_formula_change,
+    _maybe_warn_latest_formula,
 )
 from synth_lib.backtester.config import (
     OUTLIER_CAP_DATE,
@@ -103,6 +104,7 @@ def backtest(
     simulate_deregistration: datetime | None = None,
     registrations: Registrations | None = None,
     match_tolerance_minutes: int = PREDICTION_MATCH_TOLERANCE_MINUTES,
+    latest_formula: bool = False,
 ) -> BacktestResult:
     """Backtest a local miner against Synth subnet scoring data.
     Loads predictions from predictions_dir (or miner_outputs/{miner_name}/predictions/).
@@ -110,6 +112,8 @@ def backtest(
     `get_registrations`) scores each field uid that changed hands as the miners live sees.
     A scored prompt is answered by the latest prediction starting at or before it, at most
     `match_tolerance_minutes` earlier; predictions on a grid pass its cadence.
+    `latest_formula` scores every prompt with the latest crypto-1h formula instead of the one live
+    when it was scored: CRPS then compares across the change, field ranks before it do not.
     """
     if competition is None:
         competition = competition_for(asset, time_length)
@@ -187,6 +191,8 @@ def backtest(
         f"in {perf_counter()-t_start:.1f}s",
         flush=True,
     )
+    if latest_formula:
+        _maybe_warn_latest_formula(competition, asset_scores["scored_time"].min())
 
     # Step 3: fetch rewards history
     prompt_name = None if not time_length_backtest else prompt_label
@@ -300,6 +306,7 @@ def backtest(
             scoring_intervals,
             competition.vol_scoring_blocks,
             miner_id,
+            latest_formula,
         )
         for prompt in prompts
     ]

@@ -366,9 +366,11 @@ def _score_single_prompt(
     scoring_intervals: dict[str, int],
     vol_scoring_blocks: dict[str, tuple[int, float]],
     miner_id: int,
+    latest_formula: bool = False,
 ) -> dict:
     """Score a single prompt's prediction against real prices. Runs in a worker process.
 
+    The formula is the one live at `scored_time`, or the latest one with `latest_formula`.
     Returns a dict with scoring results, or a dict with crps=-1 for missing predictions.
     """
     if file_path is None:
@@ -401,7 +403,7 @@ def _score_single_prompt(
             "miner_id": miner_id,
         }
     real_price_array = np.asarray(real_prices, dtype=float)
-    if vol_scoring_blocks and pd.Timestamp(scored_time) >= VOL_CRPS_1H_DATE:
+    if vol_scoring_blocks and (latest_formula or pd.Timestamp(scored_time) >= VOL_CRPS_1H_DATE):
         total_crps, _ = calculate_total_score_for_miner(
             simulation_runs, real_price_array, time_incr, scoring_intervals, vol_scoring_blocks
         )
