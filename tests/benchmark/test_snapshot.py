@@ -103,6 +103,34 @@ def test_data_md_states_the_realized_path_span(tmp_path):
     assert "**Cached realized paths** (2 assets): **2026-07-02 → 2026-07-20**" in md
 
 
+def test_data_md_measures_the_flat_steps_of_the_scored_paths(tmp_path):
+    """A thin market's scored path often does not move between two points; agents had to find it."""
+    import pandas as pd
+
+    from synth_lib.benchmark.snapshot import render_data_md
+
+    for asset, path in (("XAU", [10.0, 10.0, 10.0, 11.0, 11.0]), ("BTC", [1.0, 2.0, 3.0, 4.0, 4.0])):
+        d = tmp_path / "realized" / asset / "86400_300"
+        d.mkdir(parents=True)
+        pd.DataFrame({"start_time": [pd.Timestamp("2026-07-02", tz="UTC")], "prices": [path]}).to_parquet(
+            d / "date=2026-07-02.parquet"
+        )
+    md = render_data_md(tmp_path)
+    assert "computed against: XAU (5 min) 75.0%, BTC (5 min) 25.0%." in md
+
+
+def test_data_md_states_the_timestamp_unit(tmp_path):
+    import pandas as pd
+
+    from synth_lib.benchmark.snapshot import render_data_md
+
+    btc = tmp_path / "prices" / "BTC" / "1m"
+    btc.mkdir(parents=True)
+    idx = pd.date_range("2026-07-01", periods=1440, freq="1min", tz="UTC").as_unit("us")
+    pd.DataFrame({"timestamp": idx, "close": 100.0}).to_parquet(btc / "date=2026-07-01.parquet")
+    assert "`timestamp` loads as `datetime64[us, UTC]`" in render_data_md(tmp_path)
+
+
 def test_data_md_omits_the_span_when_nothing_is_cached(tmp_path):
     """No paths cached is not a span of zero; the line must not appear at all."""
     from synth_lib.benchmark.snapshot import render_data_md
