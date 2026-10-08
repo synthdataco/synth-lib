@@ -7,7 +7,7 @@ import pytest
 
 import synth_lib.benchmark.verdict.evaluate as ev
 from synth_lib.benchmark.verdict.generate import generate_predictions, prompt_grid
-from synth_lib.benchmark.verdict.evaluate import final_rank, write_verdict
+from synth_lib.benchmark.verdict.evaluate import asset_rank_stats, final_rank, write_verdict
 from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES, score
 
 
@@ -185,8 +185,6 @@ def test_reward_metrics_beating_the_field_exceeds_one():
 
 
 def test_asset_rank_stats_best_and_mean():
-    from synth_lib.benchmark.verdict.evaluate import asset_rank_stats
-
     t1 = pd.Timestamp("2026-08-01T00:00:00Z")
     t2 = pd.Timestamp("2026-08-02T00:00:00Z")
     scores = pd.DataFrame(
@@ -214,6 +212,25 @@ def test_final_rank_at_last_round():
     )
     # last round (t2): weights 0.4 > 0.3 > 0.2 > 0.1 => miner 999 is 3rd of 4
     assert final_rank(scores, miner_id=999) == (3, 4)
+
+
+def test_a_candidate_with_no_row_in_a_round_ranks_last_in_it():
+    """A miner whose softmax weight is 0 has no row: the final rank raised an IndexError, and the mean
+    over rounds skipped those rounds, flattering the candidate."""
+    t1 = pd.Timestamp("2026-08-01T00:00:00Z")
+    t2 = pd.Timestamp("2026-08-02T00:00:00Z")
+    scores = pd.DataFrame(
+        {
+            "updated_at": [t1] * 3 + [t2] * 2,
+            "miner_uid": [1, 2, 999, 1, 2],
+            "reward_weight": [0.5, 0.3, 0.2, 0.6, 0.4],  # 999: 3rd of 3 at t1, absent at t2
+        }
+    )
+    assert final_rank(scores, miner_id=999) == (3, 3)
+    assert asset_rank_stats(scores, miner_id=999) == {"best_rank": 3, "mean_rank": 3.0, "field_size": 3}
+
+    scores.loc[2, "reward_weight"] = 0.9  # 1st at t1
+    assert asset_rank_stats(scores, miner_id=999) == {"best_rank": 1, "mean_rank": 2.0, "field_size": 3}
 
 
 class _FakeResult:
