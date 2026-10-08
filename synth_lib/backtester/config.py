@@ -94,8 +94,8 @@ API_REGISTRATIONS_PAGE_SIZE_DAYS = 30
 
 # -- Prediction file matching --
 # How far before a scored prompt's start a prediction may start and still answer it; a prediction
-# never answers an earlier prompt. backtest()'s default: predictions on a grid pass their cadence.
-PREDICTION_MATCH_TOLERANCE_MINUTES = 30
+# never answers an earlier prompt. backtest()'s default, so an hourly grid answers every prompt.
+PREDICTION_MATCH_TOLERANCE_MINUTES = 60
 
 
 # -- Offline mode --
