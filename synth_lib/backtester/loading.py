@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -348,6 +349,13 @@ def load_prediction(ref: PredictionRef | Path) -> dict:
     return raw
 
 
+def _writable(path: Path) -> bool:
+    """Whether a store rooted at `path` can be written: its nearest existing ancestor accepts writes."""
+    while not path.exists():
+        path = path.parent
+    return os.access(path, os.W_OK)
+
+
 def _price_store(asset: str) -> MinutePriceStore:
     """Return a MinutePriceStore configured for the asset's upstream provider.
 
@@ -368,7 +376,7 @@ def download_price_data(
     Uses MinutePriceStore for routing (Pyth vs Hyperliquid) and on-demand
     ingestion. Reads parquets directly for NaN-tolerance — futures assets like
     WTIOIL have legitimate market-closure gaps, and downstream scoring already
-    filters NaN per-prompt.
+    filters NaN per-prompt. A day missing from a read-only store raises before any fetch.
     """
     store = _price_store(asset)
     frames: list[pd.DataFrame] = []
@@ -383,6 +391,10 @@ def download_price_data(
         cursor += timedelta(days=1)
 
     if missing:
+        if not _writable(store.root):
+            raise FileNotFoundError(
+                f"no {asset} price partition for {', '.join(map(str, missing))} in the read-only store {store.root}"
+            )
         store.ingest_range(missing[0], missing[-1], verbose=False)
         for day in missing:
             frames.append(pd.read_parquet(store.day_path(day)))

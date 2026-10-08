@@ -410,7 +410,15 @@ def score(
     save_order: Mapping[int, SaveOrder] | None = None,
 ) -> dict:
     result = evaluate_candidate(
-        name, predictions, window_end, window_days, out_dir, simulate_registration, registrations, save_order
+        name,
+        predictions,
+        window_end,
+        window_days,
+        out_dir,
+        simulate_registration,
+        registrations,
+        save_order,
+        match_tolerance_minutes=CADENCE_MINUTES,
     )
     mrt = result["mean_reward_vs_top"]
     result["score"] = round(100 * mrt, 1) if mrt is not None else None

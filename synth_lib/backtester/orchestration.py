@@ -102,11 +102,14 @@ def backtest(
     simulate_registration: datetime | None = None,
     simulate_deregistration: datetime | None = None,
     registrations: Registrations | None = None,
+    match_tolerance_minutes: int = PREDICTION_MATCH_TOLERANCE_MINUTES,
 ) -> BacktestResult:
     """Backtest a local miner against Synth subnet scoring data.
     Loads predictions from predictions_dir (or miner_outputs/{miner_name}/predictions/).
     `registrations` (uid -> registration time(s) of its occupants inside the data, see
     `get_registrations`) scores each field uid that changed hands as the miners live sees.
+    A scored prompt is answered by the latest prediction starting at or before it, at most
+    `match_tolerance_minutes` earlier; predictions on a grid pass its cadence.
     """
     if competition is None:
         competition = competition_for(asset, time_length)
@@ -128,8 +131,8 @@ def backtest(
     pred_start = min(pred_times)
     pred_end = max(pred_times)
 
-    # Constrain backtest window to prediction coverage. The buffer before pred_start matches the
-    # file-matching tolerance, so every returned prompt can resolve to a prediction file.
+    # Constrain backtest window to prediction coverage, scored_time against the first prediction's
+    # start less the default match tolerance.
     # Anchor priority: simulate_deregistration > eval_end > now. When the user passes
     # simulate_registration, the window's lower bound shifts to it (minus 10d for the
     # smoothed-score moving-average lookback) instead of `anchor − n_backtest_days`,
@@ -237,11 +240,11 @@ def backtest(
             ].min()
             rewards_history = rewards_history.loc[rewards_history["updated_at"] <= max_upd_at].copy()
 
-    # Step 5: download asset price data
+    # Step 5: download asset price data, up to the last prompt's end
     asset_prices: dict[str, pd.DataFrame] = {}
     for asset_ in asset_scores["asset"].unique():
         st_ = asset_scores["start_time"].min() - pd.Timedelta(hours=2)
-        en_ = asset_scores["start_time"].max() + pd.Timedelta(hours=26)
+        en_ = asset_scores["start_time"].max() + pd.Timedelta(seconds=time_length)
         asset_prices[asset_] = download_price_data(st_, en_, asset_, freq="1min")
 
     # Step 6: score LLM miner predictions
@@ -261,7 +264,9 @@ def backtest(
         for _, asset_val, scored_time, time_len, time_incr in (
             scores_subset[["asset", "scored_time", "time_length", "time_increment"]].drop_duplicates().itertuples()
         ):
-            file_path = _find_prediction_file(prediction_index, start_time, asset_val, time_len)
+            file_path = _find_prediction_file(
+                prediction_index, start_time, asset_val, time_len, match_tolerance_minutes
+            )
 
             # Pre-slice real prices in the main process (avoids pickling DataFrames)
             real_prices: list[float] = []

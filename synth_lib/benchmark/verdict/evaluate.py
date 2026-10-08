@@ -44,7 +44,11 @@ from pathlib import Path
 import pandas as pd
 
 from synth.validator.competition_config import COM_EQU_24H, CRYPTO_1H, CRYPTO_24H  # type: ignore[import-untyped]
-from synth_lib.backtester.config import _OFFLINE_ENV_VAR, slug_for  # type: ignore[import-untyped]
+from synth_lib.backtester.config import (  # type: ignore[import-untyped]
+    _OFFLINE_ENV_VAR,
+    PREDICTION_MATCH_TOLERANCE_MINUTES,
+    slug_for,
+)
 from synth_lib.backtester.loading import get_rewards_history  # type: ignore[import-untyped]
 from synth_lib.backtester.orchestration import backtest  # type: ignore[import-untyped]
 from synth_lib.backtester.plots.rank import plot_total_rank_evolution  # type: ignore[import-untyped]
@@ -187,6 +191,7 @@ def evaluate_candidate(
     simulate_registration: datetime | None = None,
     registrations: Registrations | None = None,
     save_order: Mapping[int, SaveOrder] | None = None,
+    match_tolerance_minutes: Mapping[int, int] | None = None,
 ) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
@@ -210,13 +215,15 @@ def evaluate_candidate(
     `registrations` (uid -> registration times of its occupants inside the scored data, see
     `get_registrations`) scores each field uid that changed hands as the miners live sees.
     `save_order` (time_length -> `get_scores_save_order`) backfills late joiners from each minute's
-    first-saved prompt, as live does.
+    first-saved prompt, as live does. `match_tolerance_minutes` (time_length -> minutes) is how much
+    earlier than a scored prompt a prediction may start and answer it: the cadence of a grid.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []
     competition_reward_ratios: list[float] = []
     for comp in COMPETITIONS:
         slug = slug_for(comp)
+        tolerance = (match_tolerance_minutes or {}).get(comp.time_length, PREDICTION_MATCH_TOLERANCE_MINUTES)
         results = []
         assets_failed: list[str] = []
         per_asset: dict[str, dict] = {}
@@ -233,6 +240,7 @@ def evaluate_candidate(
                     competition=comp,
                     simulate_registration=simulate_registration,
                     registrations=registrations,
+                    match_tolerance_minutes=tolerance,
                 )
                 results.append(result)
                 per_asset[asset] = {

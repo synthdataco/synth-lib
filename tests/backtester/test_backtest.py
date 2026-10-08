@@ -198,17 +198,30 @@ class TestFindPredictionFile:
         index = build_prediction_index(predictions_dir)
         assert _find_prediction_file(index, T0, "ETH", TIME_LENGTH) is None
 
-    def test_closest_of_multiple_within_tolerance(self, tmp_path: Path) -> None:
-        """When multiple prompts are within tolerance, the closest should be selected."""
-        for t in (T0, T0 + timedelta(minutes=15)):
+    @staticmethod
+    def _index(root: Path, *starts: datetime):
+        for t in starts:
             name = t.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{ASSET}_{TIME_LENGTH}.json"
-            (tmp_path / name).write_text("{}")
+            (root / name).write_text("{}")
+        return build_prediction_index(root)
 
-        index = build_prediction_index(tmp_path)
-        query_time = T0 + timedelta(minutes=5)
-        found = _find_prediction_file(index, query_time, ASSET, TIME_LENGTH, tolerance_minutes=30)
+    def test_the_latest_at_or_before_the_prompt(self, tmp_path: Path) -> None:
+        index = self._index(tmp_path, T0, T0 + timedelta(minutes=15))
+        found = _find_prediction_file(index, T0 + timedelta(minutes=5), ASSET, TIME_LENGTH, tolerance_minutes=30)
         assert found is not None
         assert "00:00:00Z" in found.path.name
+
+    def test_never_a_later_prediction_even_a_closer_one(self, tmp_path: Path) -> None:
+        """A prediction made 5 minutes into the prompt's path has seen 5 minutes of what it is scored on."""
+        index = self._index(tmp_path, T0, T0 + timedelta(minutes=15))
+        found = _find_prediction_file(index, T0 + timedelta(minutes=10), ASSET, TIME_LENGTH, tolerance_minutes=30)
+        assert found is not None and "00:00:00Z" in found.path.name
+        assert _find_prediction_file(index, T0 - timedelta(minutes=5), ASSET, TIME_LENGTH, tolerance_minutes=30) is None
+
+    def test_an_exact_match_needs_no_tolerance(self, tmp_path: Path) -> None:
+        index = self._index(tmp_path, T0)
+        assert _find_prediction_file(index, T0, ASSET, TIME_LENGTH, tolerance_minutes=0) is not None
+        assert _find_prediction_file(index, T0 + timedelta(minutes=1), ASSET, TIME_LENGTH, tolerance_minutes=0) is None
 
 
 # Loading prediction JSON files in both formats: flat (notebook) and ArtifactManager.
@@ -365,6 +378,35 @@ class TestBacktestIntegration:
         assert result.smoothed_scores["miner_uid"].isna().sum() == 0
         miner_rw = result.smoothed_scores.loc[result.smoothed_scores["miner_uid"] == custom_id, "reward_weight"]
         assert len(miner_rw) > 0 and all(miner_rw > 0)
+
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
+    def test_prices_are_read_to_the_last_prompts_end(
+        self,
+        mock_scores: object,
+        mock_rewards: object,
+        mock_prices: object,
+        mock_crps: object,
+        predictions_dir: Path,
+    ) -> None:
+        """Not a day past it: a crypto-1h window ending at a snapshot's last day would read the next."""
+        mock_scores.return_value = _make_scores_df()  # type: ignore[union-attr]
+        mock_rewards.return_value = _make_rewards_df()  # type: ignore[union-attr]
+        mock_prices.return_value = _make_price_df(T0, SCORED_T1)  # type: ignore[union-attr]
+        mock_crps.return_value = (FAKE_CRPS, [{"interval": "stub"}])  # type: ignore[union-attr]
+
+        backtest(
+            miner_name="test_miner",
+            asset=ASSET,
+            time_length=TIME_LENGTH,
+            n_backtest_days=5,
+            predictions_dir=predictions_dir,
+        )
+
+        _, end, _ = mock_prices.call_args.args  # type: ignore[union-attr]
+        assert end == SCORED_T1
 
     # -- Partial predictions fill with crps=-1 --
 
@@ -808,6 +850,44 @@ class TestDownloadPriceDataPerAsset:
 
         assert float(result["close"].iloc[0]) == pytest.approx(2_000.0)
         assert float(result["close"].iloc[-1]) == pytest.approx(2_000.0)
+
+    def test_a_day_missing_from_a_read_only_store_raises_before_any_fetch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A campaign's snapshot is mounted read-only and stops at its cutoff: the day it lacks is
+        after the cutoff, and must not be fetched from the venue."""
+        monkeypatch.chdir(tmp_path)
+        day = datetime(2026, 3, 20, tzinfo=UTC)
+        root = tmp_path / "market_data" / "pyth" / "ETH" / "1m"
+        self._write_partition(root, day, price=2_000.0)
+        fetch = MagicMock()
+        monkeypatch.setattr("synth_lib.backtester.loading.MinutePriceStore.ingest_range", fetch)
+        root.chmod(0o555)
+        try:
+            with pytest.raises(FileNotFoundError, match="2026-03-21 in the read-only store"):
+                download_price_data(day, day + timedelta(days=1, hours=1), "ETH", freq="1min")
+        finally:
+            root.chmod(0o755)
+        fetch.assert_not_called()
+
+    def test_a_day_missing_from_a_writable_store_is_ingested(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        day = datetime(2026, 3, 20, tzinfo=UTC)
+        root = tmp_path / "market_data" / "pyth" / "ETH" / "1m"
+        self._write_partition(root, day, price=2_000.0)
+        fetched = []
+
+        def ingest(store, start_day, end_day, verbose=True):
+            fetched.append(start_day)
+            self._write_partition(store.root, datetime(start_day.year, start_day.month, start_day.day), 2_100.0)
+
+        monkeypatch.setattr("synth_lib.backtester.loading.MinutePriceStore.ingest_range", ingest)
+        result = download_price_data(day, day + timedelta(days=1, hours=1), "ETH", freq="1min")
+
+        assert [str(d) for d in fetched] == ["2026-03-21"]
+        assert float(result["close"].iloc[-1]) == pytest.approx(2_100.0)
 
 
 # ---------------------------------------------------------------------------

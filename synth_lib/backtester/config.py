@@ -93,9 +93,8 @@ API_POOL_PAGE_SIZE_DAYS = 300
 API_REGISTRATIONS_PAGE_SIZE_DAYS = 30
 
 # -- Prediction file matching --
-# Scoring delay: the real prediction start_time is a few minutes before
-# scored_time - time_length. We allow up to 30 minutes of tolerance when
-# matching prediction filenames to scored prompts.
+# How far before a scored prompt's start a prediction may start and still answer it; a prediction
+# never answers an earlier prompt. backtest()'s default: predictions on a grid pass their cadence.
 PREDICTION_MATCH_TOLERANCE_MINUTES = 30
 
 

@@ -163,22 +163,21 @@ def _find_prediction_file(
     time_length: int,
     tolerance_minutes: int = PREDICTION_MATCH_TOLERANCE_MINUTES,
 ) -> PredictionRef | None:
-    """The closest prediction to start_time for this (asset, time_length), or None.
+    """The latest prediction starting at or before start_time for this (asset, time_length), at most
+    tolerance_minutes earlier, or None.
 
-    start_time is approximate (derived from scored_time - time_length), so the match is
-    nearest within tolerance_minutes rather than exact. Bisects the sorted start_times:
-    a window holds thousands of prompts and this runs once per prompt.
+    Never a later one: its context would hold prices from the path the prompt is scored on. Bisects
+    the sorted start_times: a window holds thousands of prompts and this runs once per prompt.
     """
     prompts = index.get((asset, time_length))
     if not prompts:
         return None
     starts = sorted(prompts)
     target = pd.Timestamp(start_time)
-    position = bisect.bisect_left(starts, target)
-    best: pd.Timestamp | None = None
-    best_delta = timedelta(minutes=tolerance_minutes)
-    for candidate in starts[max(0, position - 1) : position + 1]:
-        delta = abs(target - candidate).to_pytimedelta()
-        if delta < best_delta:
-            best_delta, best = delta, candidate
-    return prompts[best] if best is not None else None
+    position = bisect.bisect_right(starts, target)
+    if position == 0:
+        return None
+    best = starts[position - 1]
+    if target - best > timedelta(minutes=tolerance_minutes):
+        return None
+    return prompts[best]

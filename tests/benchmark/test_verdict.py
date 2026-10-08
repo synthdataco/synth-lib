@@ -280,6 +280,7 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
         competition,
         simulate_registration,
         registrations,
+        match_tolerance_minutes,
     ):
         backtest_calls.append((asset, time_length))
         if asset == "XAU":
@@ -363,6 +364,7 @@ def test_all_assets_failed_competition_yields_none(monkeypatch, tmp_path):
         competition,
         simulate_registration,
         registrations,
+        match_tolerance_minutes,
     ):
         if time_length == 3600:
             raise RuntimeError("crypto-1h store broken")
@@ -447,6 +449,7 @@ def test_each_competition_writes_a_rank_chart(monkeypatch, tmp_path):
         competition,
         simulate_registration,
         registrations,
+        match_tolerance_minutes,
     ):
         return _FakeResult()
 
@@ -612,6 +615,25 @@ def test_the_bundle_widens_only_when_registration_is_simulated(monkeypatch, tmp_
         simulate_registration=pd.Timestamp("2026-08-30T00:00:00Z").to_pydatetime(),
     )
     assert set(days) == {20}  # window_days + the longest competition moving average
+
+
+def test_a_grid_verdict_answers_each_prompt_from_the_grid_point_before_it(monkeypatch, tmp_path):
+    """Matching only looks back, so the tolerance has to span the grid's cadence: a prompt scored
+    late in an hour would otherwise find no prediction and score as a miss."""
+    import synth_lib.benchmark.verdict.evaluate as ev
+    from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES, score
+
+    tolerances: dict[int, set[int]] = {}
+
+    def fake_backtest(*, time_length, match_tolerance_minutes, **kw):
+        tolerances.setdefault(time_length, set()).add(match_tolerance_minutes)
+        return _FakeResult()
+
+    monkeypatch.setattr(ev, "backtest", fake_backtest)
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", _fake_combined({1: 0.5, 999: 0.3}))
+    score("cand", tmp_path, pd.Timestamp("2026-09-09T00:00:00Z"), 10, tmp_path / "out")
+
+    assert tolerances == {tl: {minutes} for tl, minutes in CADENCE_MINUTES.items()}
 
 
 def test_the_onboarding_ramp_survives_the_combined_aggregation(monkeypatch, tmp_path):
