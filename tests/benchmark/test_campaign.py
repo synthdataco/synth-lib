@@ -89,6 +89,31 @@ def test_effort_outside_the_cli_levels_rejected(tmp_path, model):
         load_campaign(_write(tmp_path, bad))
 
 
+def test_workflow_size_and_agents_load_with_ultracode(tmp_path):
+    text = VALID_YAML.replace(
+        "{id: claude, cli: claude-code, model: claude-model}",
+        "{id: claude, cli: claude-code, model: claude-model, ultracode: true, workflow_size: small, "
+        "max_workflow_agents: 4}",
+    )
+    claude = load_campaign(_write(tmp_path, text)).models[0]
+    assert (claude.workflow_size, claude.max_workflow_agents) == ("small", 4)
+
+
+@pytest.mark.parametrize(
+    "model, match",
+    [
+        ("{id: claude, cli: claude-code, model: claude-model, workflow_size: small}", "need ultracode"),
+        ("{id: claude, cli: claude-code, model: claude-model, max_workflow_agents: 4}", "need ultracode"),
+        ("{id: claude, cli: claude-code, model: claude-model, ultracode: true, workflow_size: huge}", "workflow_size"),
+        ("{id: claude, cli: claude-code, model: claude-model, ultracode: true, max_workflow_agents: 0}", "between"),
+    ],
+)
+def test_workflow_keys_rejected_without_ultracode_or_out_of_range(tmp_path, model, match):
+    text = VALID_YAML.replace("{id: claude, cli: claude-code, model: claude-model}", model)
+    with pytest.raises(ValueError, match=match):
+        load_campaign(_write(tmp_path, text))
+
+
 @pytest.mark.parametrize("flag", ["ultracode", "goal"])
 def test_claude_code_settings_rejected_on_other_clis(tmp_path, flag):
     bad = VALID_YAML.replace("wire_api: responses}", f"wire_api: responses, {flag}: true}}")

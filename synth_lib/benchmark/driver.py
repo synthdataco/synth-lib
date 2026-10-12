@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from synth_lib.benchmark.budget import BudgetStatus, BudgetTracker, Phase
 from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
@@ -46,6 +47,9 @@ DELIVERABLES = ("report.md", "journal.md", "CHAMPION", "suggestions.md")
 # model the campaign never chose — and the transcript is the only place it shows. A leg whose
 # champion came from a substitute model does not measure the model on the panel.
 FALLBACK_MARKER = b"model_refusal_fallback"
+# Under artifacts_dir: each Claude Code session's workflow records and subagent transcripts, copied from
+# the run's HOME, where they are not part of the stream-json transcript.
+SESSIONS_DIR = "sessions"
 
 
 @dataclass
@@ -62,6 +66,19 @@ class RunResult:
     substituted_models: tuple[str, ...] = ()
     # GPU-busy minutes the driver metered; None without a meter.
     gpu_busy_minutes: float | None = None
+
+
+def _fallback_models(node: object) -> Iterator[str]:
+    """Every `fallback_model` value in a transcript event, at any depth."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "fallback_model" and value:
+                yield str(value)
+            else:
+                yield from _fallback_models(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _fallback_models(item)
 
 
 class ModelRun:
@@ -127,9 +144,14 @@ class ModelRun:
         return proc
 
     def substituted_models(self) -> set[str]:
-        """Models that served a turn in place of the one this leg asked for, from the transcripts."""
+        """Models that served a turn in place of the one this leg asked for, from the transcripts and the
+        subagent transcripts collected under SESSIONS_DIR."""
         served: set[str] = set()
-        for path in sorted(self.artifacts_dir.glob("transcript-*.log")):
+        transcripts = [
+            *sorted(self.artifacts_dir.glob("transcript-*.log")),
+            *sorted(self.artifacts_dir.glob(f"{SESSIONS_DIR}/*/subagents/*.jsonl")),
+        ]
+        for path in transcripts:
             try:
                 blob = path.read_bytes()
             except OSError:
@@ -143,8 +165,7 @@ class ModelRun:
                     event = json.loads(line)
                 except ValueError:
                     continue
-                if name := event.get("fallback_model"):
-                    served.add(str(name))
+                served.update(_fallback_models(event))
         return served
 
     def _launch(self, prompt: str, resume: bool = False) -> subprocess.Popen:
@@ -381,6 +402,25 @@ class ModelRun:
             if src.exists():
                 (self.artifacts_dir / name).write_bytes(src.read_bytes())
         self._bundle_workspace()
+        self._collect_sessions()
+
+    def _collect_sessions(self) -> None:
+        """Copies each Claude Code session's `workflows/` and `subagents/` out of the run's HOME.
+
+        Workflow agents write their transcripts there, not to the stream the transcript-*.log files
+        hold, and Claude Code deletes them after `cleanupPeriodDays`. Best-effort, like the bundle."""
+        home = self.extra_env.get("HOME")
+        if not home:
+            return
+        for session in sorted(Path(home).glob(".claude/projects/*/*")):
+            for part in ("workflows", "subagents"):
+                src = session / part
+                if not src.is_dir():
+                    continue
+                try:
+                    shutil.copytree(src, self.artifacts_dir / SESSIONS_DIR / session.name / part, dirs_exist_ok=True)
+                except (OSError, shutil.Error) as exc:
+                    print(f"[{self.model.id}] copying {src} FAILED: {exc}", flush=True)
 
     def _bundle_workspace(self) -> None:
         """Archives the workspace git repo alongside the markdown deliverables.

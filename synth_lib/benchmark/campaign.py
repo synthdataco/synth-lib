@@ -15,6 +15,8 @@ EFFORT_LEVELS = {
     "claude-code": ("low", "medium", "high", "xhigh", "max"),
     "codex": ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
 }
+# claude-code's workflowSizeGuideline values: the agent count it tells the model to aim for per workflow.
+WORKFLOW_SIZES = ("unrestricted", "small", "medium", "large")
 PRIMARY_METRIC = "synth_competition_rank"
 # CampaignConfig fields that must be strictly positive (checked in _validate).
 POSITIVE_FIELDS = (
@@ -35,6 +37,8 @@ class ModelSpec:
     effort: str | None = None  # an EFFORT_LEVELS name for the leg's CLI; None = the CLI's default for the model
     ultracode: bool = False  # claude-code only: a dynamic workflow for every substantive task
     goal: bool = False  # claude-code only: an evaluator holds the session to cli_adapters.GOAL_CONDITION
+    workflow_size: str | None = None  # with ultracode: a WORKFLOW_SIZES name; None = the CLI's default
+    max_workflow_agents: int | None = None  # with ultracode: workflow agents at once; None = the CLI's default
 
 
 PACKAGED_BASELINE = "synth_lib.benchmark.verdict.baseline_default"
@@ -156,3 +160,9 @@ def _validate_model(m: ModelSpec) -> None:
         raise ValueError(f"{m.id}: ultracode is a claude-code setting")
     if m.goal and m.cli != "claude-code":
         raise ValueError(f"{m.id}: goal is a claude-code setting")
+    if (m.workflow_size is not None or m.max_workflow_agents is not None) and not m.ultracode:
+        raise ValueError(f"{m.id}: workflow_size and max_workflow_agents need ultracode")
+    if m.workflow_size is not None and m.workflow_size not in WORKFLOW_SIZES:
+        raise ValueError(f"{m.id}: workflow_size {m.workflow_size!r} is not one of {WORKFLOW_SIZES}")
+    if m.max_workflow_agents is not None and not 1 <= m.max_workflow_agents <= 256:
+        raise ValueError(f"{m.id}: max_workflow_agents must be between 1 and 256")
