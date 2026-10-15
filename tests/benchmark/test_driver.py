@@ -327,6 +327,18 @@ def test_the_gpu_line_reaches_budget_md(tmp_path):
     assert run._notes() == "- GPU: 10 min busy so far, peak memory 0.0 GiB. A nomination stands from 60 min"
 
 
+def test_the_leg_result_carries_the_gpu_meter(tmp_path, monkeypatch):
+    monkeypatch.setattr(GpuUsage, "sample", lambda self, interval_seconds: None)
+    metered = _run(tmp_path / "metered", "lands", HoldAdmin(spend=8.6))
+    metered.gpu = GpuUsage(busy_seconds=600, peak_memory_mib=2048.0)
+    result = metered.run()
+    assert (result.gpu_busy_minutes, result.gpu_peak_memory_mib) == (10, 2048.0)
+    unmetered = _run(tmp_path / "unmetered", "lands", HoldAdmin(spend=8.6))
+    unmetered.gpu = GpuUsage(error="no meter")
+    result = unmetered.run()
+    assert (result.gpu_busy_minutes, result.gpu_peak_memory_mib) == (None, None)
+
+
 def _claude_session(home: Path, session: str = "0a1b") -> Path:
     """A Claude Code session directory in a run's HOME, as a workflow leaves it."""
     d = home / ".claude" / "projects" / "-workspace" / session

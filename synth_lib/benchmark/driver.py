@@ -64,8 +64,9 @@ class RunResult:
     # Models that served a turn in place of the one asked for. Non-empty means this leg does not
     # measure the model on the panel.
     substituted_models: tuple[str, ...] = ()
-    # GPU-busy minutes the driver metered; None without a meter.
+    # GPU-busy minutes and peak device memory the driver metered; None without a meter.
     gpu_busy_minutes: float | None = None
+    gpu_peak_memory_mib: float | None = None
 
 
 def _fallback_models(node: object) -> Iterator[str]:
@@ -378,11 +379,13 @@ class ModelRun:
         substituted = tuple(sorted(self.substituted_models()))
         if substituted:
             self._log(f"WARNING: turns were served by {', '.join(substituted)} instead of {self.model.model}")
-        gpu_minutes = self.gpu.busy_minutes if self.gpu is not None and self.gpu.available else None
-        if self.gpu is not None:
-            self._log(
-                f"GPU: {gpu_minutes:.0f} min busy" if gpu_minutes is not None else f"GPU meter off: {self.gpu.error}"
-            )
+        gpu_minutes: float | None = None
+        gpu_peak_mib: float | None = None
+        if self.gpu is not None and self.gpu.available:
+            gpu_minutes, gpu_peak_mib = self.gpu.busy_minutes, self.gpu.peak_memory_mib
+            self._log(f"GPU: {gpu_minutes:.0f} min busy, peak memory {gpu_peak_mib / 1024:.1f} GiB")
+        elif self.gpu is not None:
+            self._log(f"GPU meter off: {self.gpu.error}")
         return RunResult(
             model_id=self.model.id,
             landed=champion is not None,
@@ -393,6 +396,7 @@ class ModelRun:
             final_spend_usd=status.spend_usd,
             substituted_models=substituted,
             gpu_busy_minutes=gpu_minutes,
+            gpu_peak_memory_mib=gpu_peak_mib,
         )
 
     def _collect(self) -> None:
