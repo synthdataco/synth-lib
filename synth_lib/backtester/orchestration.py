@@ -345,13 +345,15 @@ def backtest(
     asset_scores = asset_scores.loc[asset_scores["scored_time"] <= end_backtest_time]
 
     # Optional: simulate the miner registering on a specific date by dropping our
-    # CRPS rows before that date. synth.validator.prepare_df_for_moving_average
-    # then sees our miner's first scored_time > global_min and applies the same
-    # worst-score backfill it gives real late-joining miners — making rank
-    # comparisons symmetric instead of giving us an unfair "from-the-start" boost.
+    # CRPS rows for the prompts issued before that date: a miner answers only the
+    # prompts sent once it is registered, so its first score lands a horizon later.
+    # synth.validator.prepare_df_for_moving_average then sees our miner's first
+    # scored_time > global_min and applies the same worst-score backfill it gives
+    # real late-joining miners — making rank comparisons symmetric instead of giving
+    # us an unfair "from-the-start" boost.
     if simulate_registration is not None:
         sim_reg = pd.Timestamp(simulate_registration)
-        new_scores = new_scores.loc[new_scores["scored_time"] >= sim_reg]
+        new_scores = new_scores.loc[new_scores["start_time"] >= sim_reg]
         if new_scores.empty:
             raise RuntimeError(
                 f"simulate_registration={sim_reg} drops all of our miner's CRPS rows; " f"no valid backtest results."

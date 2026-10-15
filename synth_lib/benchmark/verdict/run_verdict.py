@@ -520,10 +520,11 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     ap.add_argument(
         "--simulate-registration",
         action="store_true",
-        help="score the champion as a miner that registered on --window-start: its rows before that "
-        "day are dropped, so the validator's moving average treats it as a late joiner and backfills "
-        "the preceding window at the field's worst score. This is what a champion earns in its first "
-        "days live, and it is NOT comparable to a Score without it — give it its own --tag.",
+        help="score the champion as a miner that registered on --window-start: the prompts issued "
+        "before that day are dropped, so its first score lands a horizon later and the validator's "
+        "moving average treats it as a late joiner, backfilling the preceding window at the field's "
+        "worst score. This is what a champion earns in its first days live, and it is NOT comparable "
+        "to a Score without it — give it its own --tag.",
     )
     ap.add_argument(
         "--live-prompts",
