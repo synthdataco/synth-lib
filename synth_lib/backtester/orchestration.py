@@ -136,7 +136,8 @@ def backtest(
     pred_end = max(pred_times)
 
     # Constrain backtest window to prediction coverage, scored_time against the first prediction's
-    # start less the default match tolerance.
+    # start less the default match tolerance, and the last one's horizon plus the match tolerance
+    # (at least an hour): a prediction answers prompts up to that tolerance after its start.
     # Anchor priority: simulate_deregistration > eval_end > now. When the user passes
     # simulate_registration, the window's lower bound shifts to it (minus 10d for the
     # smoothed-score moving-average lookback) instead of `anchor − n_backtest_days`,
@@ -161,7 +162,7 @@ def backtest(
             pred_start - timedelta(minutes=PREDICTION_MATCH_TOLERANCE_MINUTES),
             window_start,
         )
-    query_end = pred_end + timedelta(seconds=time_length) + timedelta(hours=1)
+    query_end = pred_end + timedelta(seconds=time_length) + timedelta(minutes=max(60, match_tolerance_minutes))
 
     # Step 2: fetch existing miner scores
     asset_backtest = asset

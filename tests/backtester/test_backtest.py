@@ -1832,6 +1832,37 @@ class TestRegistrationLookback:
         assert start <= reg - pd.Timedelta(days=CRYPTO_24H.window_days)
 
 
+def test_the_score_query_reaches_the_prompts_the_last_prediction_answers(monkeypatch, tmp_path):
+    """On a 120-minute grid ending 21:00, the 22:30 prompt is answered by the 21:00 prediction and
+    scored at 23:30: the query has to reach the tolerance past the last prediction's horizon."""
+    seen = {}
+
+    def fake_scores(*, start_time, end_time, asset, time_length, time_increment):
+        seen["end"] = end_time
+        raise NoScoresAvailable("stop here — the query bound is what this test is about")
+
+    monkeypatch.setattr("synth_lib.backtester.orchestration.get_miner_scores", fake_scores)
+    monkeypatch.setattr("synth_lib.backtester.orchestration.download_price_data", lambda *a, **k: pd.DataFrame())
+    last = pd.Timestamp("2026-09-17T21:00:00Z")
+    preds = tmp_path / "predictions"
+    preds.mkdir()
+    name = last.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_BTC_{CRYPTO_1H.time_length}.json"
+    (preds / name).write_text(json.dumps({"paths": [[1.0, 2.0]]}))
+    with pytest.raises(NoScoresAvailable):
+        backtest(
+            miner_name="m",
+            asset="BTC",
+            time_length=CRYPTO_1H.time_length,
+            time_increment=CRYPTO_1H.time_increment,
+            n_backtest_days=1,
+            predictions_dir=preds,
+            competition=CRYPTO_1H,
+            eval_end=(last + pd.Timedelta(days=2)).to_pydatetime(),
+            match_tolerance_minutes=120,
+        )
+    assert pd.Timestamp(seen["end"]) >= pd.Timestamp("2026-09-17T23:30:00Z")
+
+
 def test_a_day_file_scores_the_same_prompt_as_its_json_twin(tmp_path):
     """The day layout is a storage change, not a scoring one: the paths that come back out of a
     .npy row must be the paths that went in, and the metadata must survive with them."""
