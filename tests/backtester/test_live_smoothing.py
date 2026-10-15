@@ -149,6 +149,12 @@ class TestUidThatChangedHandsTwice:
         assert self._smoothed_at(U)[5] == pytest.approx((50.0 * 3 + 3.0 * 2) / 5)
 
 
+def test_an_unsplit_id_past_the_occupant_offset_keeps_its_uid():
+    """A candidate run as miner_id=1_000_001 is not uid 1's previous occupant."""
+    scores = _rows(1, [(timedelta(days=2), 1.0)]) + _rows(1_000_001, [(timedelta(days=2), 2.0)])
+    assert sorted(_smoothed(scores).index) == [1, 1_000_001]
+
+
 class TestLateJoiner:
     """uid 7 is first scored at J; uids 1 and 2 throughout. The validator prepares each update's own
     window (forward.calculate_moving_average_and_update_rewards); the replay prepares the frame once."""

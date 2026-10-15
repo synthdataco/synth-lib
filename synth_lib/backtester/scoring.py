@@ -167,7 +167,9 @@ class _RegisteredAtUpdate(_BacktestMinerDataHandler):
             first = self.first_scored.get(miner_id)
             _, replaced = self.tenures.get(miner_id, (None, None))
             averaged = first is not None and first < u - _UPDATE_LAG and (replaced is None or u < replaced)
-            row["miner_uid"] = miner_id % _PREVIOUS_OCCUPANT if averaged else None
+            # Only a split occupant's id encodes its uid; any other id is the uid itself.
+            uid = miner_id % _PREVIOUS_OCCUPANT if miner_id in self.tenures else miner_id
+            row["miner_uid"] = uid if averaged else None
         return miner_data
 
 
