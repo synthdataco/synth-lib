@@ -9,6 +9,7 @@ import re
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from synth_lib.preparation.config import STORE_SUBDIR
@@ -92,6 +93,7 @@ def render_data_md(snapshot_root: Path) -> str:
         row = _coverage_row(asset_dir)
         if row is not None:
             lines.append(row)
+    lines += _timestamp_lines(store)
     lines += _offline_bundle_lines(snapshot_root / "offline_data")
     lines += _realized_lines(snapshot_root / "realized")
     return "\n".join(lines) + "\n"
@@ -117,6 +119,22 @@ def _coverage_row(asset_dir: Path) -> str | None:
         f"| {asset_dir.name} | {per_day[0][0]} | {per_day[-1][0]} | {len(per_day)} "
         f"| {pct(per_day)} | {pct(per_day[:30])} | {pct(per_day[-30:])} |"
     )
+
+
+def _timestamp_lines(store: Path) -> list[str]:
+    """The unit the partitions' timestamps load in: an integer view of them counts in it."""
+    part = next(iter(sorted(store.glob("*/1m/date=*.parquet"))), None)
+    if part is None:
+        return []
+    try:
+        dtype = pd.read_parquet(part, columns=["timestamp"])["timestamp"].dtype
+    except Exception:  # unreadable/placeholder partition
+        return []
+    return [
+        "",
+        f'`timestamp` loads as `{dtype}`. An integer view of it (`.view("int64")`) counts in that unit:',
+        "derive minute indices from the dtype, never by assuming nanoseconds.",
+    ]
 
 
 def _offline_bundle_lines(offline: Path) -> list[str]:
@@ -148,13 +166,44 @@ def _realized_lines(realized: Path) -> list[str]:
     if not days:
         return []
     assets = sorted(p.name for p in realized.iterdir() if p.is_dir())
-    return [
+    lines = [
         "",
         f"**Cached realized paths** ({len(assets)} assets): **{days[0]} → {days[-1]}**. Where a",
         "prompt's slice of the price store contains NaN, scoring substitutes the validator's own",
         "array for that prompt. Outside this range it cannot, and the prompt is scored on the",
         "points that remain — which is a smaller CRPS from a thinner reference, not a better model.",
     ]
+    flat = _flat_step_shares(realized)
+    if flat:
+        lines += [
+            "",
+            "Steps with no price change in those paths, the arrays CRPS is computed against: "
+            + ", ".join(f"{name} {share:.1%}" for name, share in flat)
+            + ".",
+        ]
+    return lines
+
+
+def _flat_step_shares(realized: Path) -> list[tuple[str, float]]:
+    """Per asset and step size, the share of consecutive points of the cached paths at the same price,
+    largest first."""
+    shares = []
+    for prompt_dir in sorted(realized.glob("*/*_*")):
+        flat = steps = 0
+        for part in prompt_dir.glob("date=*.parquet"):
+            try:
+                paths = pd.read_parquet(part, columns=["prices"])["prices"]
+            except Exception:  # unreadable/placeholder partition
+                continue
+            for path in paths:
+                diffs = np.diff(np.asarray(path, dtype=float))
+                diffs = diffs[np.isfinite(diffs)]
+                flat += int((diffs == 0).sum())
+                steps += diffs.size
+        if steps:
+            increment = int(prompt_dir.name.split("_")[1])
+            shares.append((f"{prompt_dir.parent.name} ({increment // 60} min)", flat / steps))
+    return sorted(shares, key=lambda item: -item[1])
 
 
 def verify_snapshot(dest_root: Path) -> bool:

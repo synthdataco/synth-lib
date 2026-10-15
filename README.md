@@ -153,6 +153,12 @@ accepted (see [load_prediction](synth_lib/backtester/backtest.py)):
 `paths` is a `num_simulations × (num_steps + 1)` array of simulated price paths
 starting from the current price.
 
+A scored prompt is answered by the latest prediction that starts at or before it,
+up to an hour earlier (`backtest(match_tolerance_minutes=...)`). A prediction is
+never matched to a prompt that started before it: its context would hold part of
+the path that prompt is scored on. Predictions made at the scored prompts' own
+start times (`get_miner_scores(...)["start_time"]`) answer every prompt exactly.
+
 ### Running the backtester
 
 The subnet scores three **competitions**, defined in

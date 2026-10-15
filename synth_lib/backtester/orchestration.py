@@ -16,6 +16,7 @@ from synth.validator.competition_config import ALL_COMPETITIONS, CompetitionConf
 from synth_lib.backtester.caveats import (
     _maybe_warn_competition_split,
     _maybe_warn_hf_crps_formula_change,
+    _maybe_warn_latest_formula,
 )
 from synth_lib.backtester.config import (
     OUTLIER_CAP_DATE,
@@ -102,11 +103,17 @@ def backtest(
     simulate_registration: datetime | None = None,
     simulate_deregistration: datetime | None = None,
     registrations: Registrations | None = None,
+    match_tolerance_minutes: int = PREDICTION_MATCH_TOLERANCE_MINUTES,
+    latest_formula: bool = False,
 ) -> BacktestResult:
     """Backtest a local miner against Synth subnet scoring data.
     Loads predictions from predictions_dir (or miner_outputs/{miner_name}/predictions/).
     `registrations` (uid -> registration time(s) of its occupants inside the data, see
     `get_registrations`) scores each field uid that changed hands as the miners live sees.
+    A scored prompt is answered by the latest prediction starting at or before it, at most
+    `match_tolerance_minutes` earlier; predictions on a grid pass its cadence.
+    `latest_formula` scores every prompt with the latest crypto-1h formula instead of the one live
+    when it was scored: CRPS then compares across the change, field ranks before it do not.
     """
     if competition is None:
         competition = competition_for(asset, time_length)
@@ -128,8 +135,9 @@ def backtest(
     pred_start = min(pred_times)
     pred_end = max(pred_times)
 
-    # Constrain backtest window to prediction coverage. The buffer before pred_start matches the
-    # file-matching tolerance, so every returned prompt can resolve to a prediction file.
+    # Constrain backtest window to prediction coverage, scored_time against the first prediction's
+    # start less the default match tolerance, and the last one's horizon plus the match tolerance
+    # (at least an hour): a prediction answers prompts up to that tolerance after its start.
     # Anchor priority: simulate_deregistration > eval_end > now. When the user passes
     # simulate_registration, the window's lower bound shifts to it (minus 10d for the
     # smoothed-score moving-average lookback) instead of `anchor − n_backtest_days`,
@@ -154,7 +162,7 @@ def backtest(
             pred_start - timedelta(minutes=PREDICTION_MATCH_TOLERANCE_MINUTES),
             window_start,
         )
-    query_end = pred_end + timedelta(seconds=time_length) + timedelta(hours=1)
+    query_end = pred_end + timedelta(seconds=time_length) + timedelta(minutes=max(60, match_tolerance_minutes))
 
     # Step 2: fetch existing miner scores
     asset_backtest = asset
@@ -184,6 +192,8 @@ def backtest(
         f"in {perf_counter()-t_start:.1f}s",
         flush=True,
     )
+    if latest_formula:
+        _maybe_warn_latest_formula(competition, asset_scores["scored_time"].min())
 
     # Step 3: fetch rewards history
     prompt_name = None if not time_length_backtest else prompt_label
@@ -237,11 +247,11 @@ def backtest(
             ].min()
             rewards_history = rewards_history.loc[rewards_history["updated_at"] <= max_upd_at].copy()
 
-    # Step 5: download asset price data
+    # Step 5: download asset price data, up to the last prompt's end
     asset_prices: dict[str, pd.DataFrame] = {}
     for asset_ in asset_scores["asset"].unique():
         st_ = asset_scores["start_time"].min() - pd.Timedelta(hours=2)
-        en_ = asset_scores["start_time"].max() + pd.Timedelta(hours=26)
+        en_ = asset_scores["start_time"].max() + pd.Timedelta(seconds=time_length)
         asset_prices[asset_] = download_price_data(st_, en_, asset_, freq="1min")
 
     # Step 6: score LLM miner predictions
@@ -261,7 +271,9 @@ def backtest(
         for _, asset_val, scored_time, time_len, time_incr in (
             scores_subset[["asset", "scored_time", "time_length", "time_increment"]].drop_duplicates().itertuples()
         ):
-            file_path = _find_prediction_file(prediction_index, start_time, asset_val, time_len)
+            file_path = _find_prediction_file(
+                prediction_index, start_time, asset_val, time_len, match_tolerance_minutes
+            )
 
             # Pre-slice real prices in the main process (avoids pickling DataFrames)
             real_prices: list[float] = []
@@ -295,6 +307,7 @@ def backtest(
             scoring_intervals,
             competition.vol_scoring_blocks,
             miner_id,
+            latest_formula,
         )
         for prompt in prompts
     ]
@@ -332,13 +345,15 @@ def backtest(
     asset_scores = asset_scores.loc[asset_scores["scored_time"] <= end_backtest_time]
 
     # Optional: simulate the miner registering on a specific date by dropping our
-    # CRPS rows before that date. synth.validator.prepare_df_for_moving_average
-    # then sees our miner's first scored_time > global_min and applies the same
-    # worst-score backfill it gives real late-joining miners — making rank
-    # comparisons symmetric instead of giving us an unfair "from-the-start" boost.
+    # CRPS rows for the prompts issued before that date: a miner answers only the
+    # prompts sent once it is registered, so its first score lands a horizon later.
+    # synth.validator.prepare_df_for_moving_average then sees our miner's first
+    # scored_time > global_min and applies the same worst-score backfill it gives
+    # real late-joining miners — making rank comparisons symmetric instead of giving
+    # us an unfair "from-the-start" boost.
     if simulate_registration is not None:
         sim_reg = pd.Timestamp(simulate_registration)
-        new_scores = new_scores.loc[new_scores["scored_time"] >= sim_reg]
+        new_scores = new_scores.loc[new_scores["start_time"] >= sim_reg]
         if new_scores.empty:
             raise RuntimeError(
                 f"simulate_registration={sim_reg} drops all of our miner's CRPS rows; " f"no valid backtest results."

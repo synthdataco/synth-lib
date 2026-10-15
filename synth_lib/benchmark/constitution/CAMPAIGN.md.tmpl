@@ -28,6 +28,10 @@ crypto-1h.
 | COM_EQU_24H | XAU, NVDAX, GOOGLX, TSLAX, AAPLX, WTIOIL, SPCX, SP500 (+ SPYX, retired — see the breaks table) | 24h | 5min | 289 |
 | CRYPTO_1H | BTC, ETH, SOL, XRP, HYPE | 1h (3600 s) | 1min (60 s) | 61 |
 
+BTC, ETH, SOL, XRP and HYPE are in two competitions: look one up by `(asset, time_length)`
+(`synth_lib.backtester.config.competition_for`), never by asset. A 24h prompt scored with the
+crypto-1h intervals is wrong by a large, silent margin.
+
 **1000 simulations per prompt** in all three cases (`PromptConfig.num_simulations`); a response
 whose path count differs is rejected outright by the validator
 (`synth.validator.response_validation_v2`). `simulate()` receives `num_simulations` as an
@@ -70,8 +74,13 @@ horizon before the window and yours is never treated as late.
   `pyproject.toml` with pinned dependencies. First action: `uv sync`. Then run EVERY python
   command through `uv run` (`uv run python -c ...`, `uv run agent/predict.py`): the container's
   system `python3` has no numpy or pandas — only the workspace venv does.
-  `agent/predict.py` is also used for the 1h format (pass `--time-length 3600 --time-increment
-  60`).
+  `agent/predict.py --days N --eval-end D` answers the prompts the validator scored in the N days
+  before D, at the start times it actually used, read from the offline field bundle: the same
+  kind of prompts your champion is scored on. `--eval-end` may be any day up to your cutoff, and
+  each run scores only its own predictions, so runs can go in parallel. It is also used for the 1h
+  format (pass `--time-length 3600 --time-increment 60`). `--cadence-minutes N` answers an even
+  grid instead; a cadence that divides an hour puts every prompt on the round hour, where
+  volatility spikes, so do not read an absolute calibration level off such a grid.
 - **`market_data/`**: a frozen snapshot of minute OHLCV (parquet partitions
   `prices/{ASSET}/1m/date=YYYY-MM-DD.parquet`, columns `open, high, low, close, volume,
   trade_count`, resolve it with
@@ -117,12 +126,13 @@ horizon before the window and yours is never treated as late.
   2026-06-23 configuration split (breaks table below) constrains only FIELD-RELATIVE numbers —
   never compute one on a window that starts before it. CRPS itself is unaffected.
 
-  **Three structural breaks in the subnet's history. Do not backtest across them:**
+  **Four structural breaks in the subnet's history. Do not backtest across them:**
 
   | Date | What changed |
   |---|---|
   | 2026-06-23 | The subnet split into the 3 current competitions. Before it: 2 profiles, and COM_EQU_24H did not exist. A field-relative rank spanning this date mixes incompatible reward structures — `synth_lib` will warn, and the number it gives you is meaningless. |
   | 2026-03-11 | The crypto-1h CRPS formula changed. Ranks before it are not comparable to today's. |
+  | 2026-09-22 | crypto-1h scoring added a volatility term. A crypto-1h CRPS from before it is not comparable with one after; `agent/predict.py --latest-formula` scores earlier prompts with it too, which keeps CRPS comparable (field ranks before the date then are not). |
   | ~2026-07-17 | SPYX was retired and SP500 introduced as a NEW asset, carrying the HIGHEST coefficient (3.44) in COM_EQU_24H. **SPYX is DEAD**: its feed stopped, the validator no longer prompts or scores it, and no post-mid-July prices exist — it still appears in the pinned competition config, but spend NOTHING on it. SP500 has scored field history from ~2026-07-19 onward; fit on its whole price series, validate its RANK on the scored weeks. |
 
   **Loader expectations**: synth-lib's strict `load_range` RAISES on any NaN or missing day in
@@ -149,6 +159,7 @@ horizon before the window and yours is never treated as late.
   validator's code. Read it to understand exactly how you'll be scored.
 - **Public Synth API** (api.synthdata.co): historical field scores
   (`/validation/scores/historical`, query windows ≤ 2 days) and rewards (`/rewards/scores`).
+  `to` names a whole UTC day, inclusive: a query to 08-16 also returns 08-16's rows.
   synth-lib handles pagination for you. Studying the field (CRPS levels, what the top miners do)
   is ALLOWED and recommended; copying the paths served by an individual miner is
   FORBIDDEN.
@@ -178,7 +189,7 @@ horizon before the window and yours is never treated as late.
 - Credit budget: $budget_usd USD. Deadline: $deadline_hours h of wall-clock time.
 - The `BUDGET.md` file in your workspace is maintained by the harness: READ IT AT THE START OF
   EACH ITERATION. When it contains a LANDING ORDER, it is non-negotiable.
-- Hardware: $hardware. ONLY ONE GPU job at a time; cap the memory of your heavy jobs.
+- Hardware: $hardware. ONLY ONE GPU job at a time; cap the memory of your heavy jobs.$gpu_requirement
 - **Parallel work shares this envelope.** Every agent or job you start — subagents, workflows,
   background runs — spends from the same credit budget and runs on the same machine. The budget in
   `BUDGET.md` and the hardware above are totals, whatever a tool's own guidance says about token
@@ -257,7 +268,22 @@ You choose your own research questions, hypotheses, splits, and criteria. What w
 write the hypothesis BEFORE the experiment, pre-registered kill thresholds, validation on 2
 windows of opposite regimes (within the limits of the snapshot), one variable at a time,
 frequent commits. Watch out for the edges of eval windows: only backtest windows fully covered
-by the snapshot.
+by the snapshot. Lessons earlier agents paid for:
+
+- **Price a residual before fitting it.** For a Gaussian fan, expected CRPS at scale σ against
+  the right σ* is about 1 + ¼·(ln σ/σ*)² times the optimum: a ±20 % global scale error costs about
+  1 %, and a width correction across buckets can gain at most about ¼ of the variance of the
+  log width ratios. A minute of arithmetic tells you whether a day of sweeping can pay.
+- **Test a feature by what it adds to a fast EWMA of realized volatility**, not by its own
+  predictive power. Range estimators, volume, trade counts and the leverage effect act on future
+  volatility through realized volatility, which the EWMA has already priced. What it cannot hold
+  is information outside the context: the calendar, and anything older than the 7 days
+  `simulate()` receives.
+- **Check what `simulate()` can see before building on it**: one asset's 7-day context per
+  call, nothing else. A feature that needs another asset's current prices cannot be served.
+- **Count the asset-window cells where a change helps**, across disjoint windows, not only its
+  average: a small gain signed the same way in most cells survives; a larger one that flips sign
+  between windows is noise.
 
 ## Resuming after a crash
 

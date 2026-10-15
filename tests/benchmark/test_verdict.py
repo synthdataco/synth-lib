@@ -5,8 +5,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import synth_lib.benchmark.verdict.evaluate as ev
 from synth_lib.benchmark.verdict.generate import generate_predictions, prompt_grid
-from synth_lib.benchmark.verdict.evaluate import final_rank, write_verdict
+from synth_lib.benchmark.verdict.evaluate import asset_rank_stats, final_rank, write_verdict
+import synth_lib.benchmark.verdict.run_verdict as rv
+from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES, score
 
 
 def _flat_simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100, context_prices=None):
@@ -183,8 +186,6 @@ def test_reward_metrics_beating_the_field_exceeds_one():
 
 
 def test_asset_rank_stats_best_and_mean():
-    from synth_lib.benchmark.verdict.evaluate import asset_rank_stats
-
     t1 = pd.Timestamp("2026-08-01T00:00:00Z")
     t2 = pd.Timestamp("2026-08-02T00:00:00Z")
     scores = pd.DataFrame(
@@ -212,6 +213,25 @@ def test_final_rank_at_last_round():
     )
     # last round (t2): weights 0.4 > 0.3 > 0.2 > 0.1 => miner 999 is 3rd of 4
     assert final_rank(scores, miner_id=999) == (3, 4)
+
+
+def test_a_candidate_with_no_row_in_a_round_ranks_last_in_it():
+    """A miner whose softmax weight is 0 has no row: the final rank raised an IndexError, and the mean
+    over rounds skipped those rounds, flattering the candidate."""
+    t1 = pd.Timestamp("2026-08-01T00:00:00Z")
+    t2 = pd.Timestamp("2026-08-02T00:00:00Z")
+    scores = pd.DataFrame(
+        {
+            "updated_at": [t1] * 3 + [t2] * 2,
+            "miner_uid": [1, 2, 999, 1, 2],
+            "reward_weight": [0.5, 0.3, 0.2, 0.6, 0.4],  # 999: 3rd of 3 at t1, absent at t2
+        }
+    )
+    assert final_rank(scores, miner_id=999) == (3, 3)
+    assert asset_rank_stats(scores, miner_id=999) == {"best_rank": 3, "mean_rank": 3.0, "field_size": 3}
+
+    scores.loc[2, "reward_weight"] = 0.9  # 1st at t1
+    assert asset_rank_stats(scores, miner_id=999) == {"best_rank": 1, "mean_rank": 2.0, "field_size": 3}
 
 
 class _FakeResult:
@@ -280,6 +300,7 @@ def test_evaluate_candidate_covers_three_competitions(monkeypatch, tmp_path):
         competition,
         simulate_registration,
         registrations,
+        match_tolerance_minutes,
     ):
         backtest_calls.append((asset, time_length))
         if asset == "XAU":
@@ -363,6 +384,7 @@ def test_all_assets_failed_competition_yields_none(monkeypatch, tmp_path):
         competition,
         simulate_registration,
         registrations,
+        match_tolerance_minutes,
     ):
         if time_length == 3600:
             raise RuntimeError("crypto-1h store broken")
@@ -447,6 +469,7 @@ def test_each_competition_writes_a_rank_chart(monkeypatch, tmp_path):
         competition,
         simulate_registration,
         registrations,
+        match_tolerance_minutes,
     ):
         return _FakeResult()
 
@@ -614,6 +637,22 @@ def test_the_bundle_widens_only_when_registration_is_simulated(monkeypatch, tmp_
     assert set(days) == {20}  # window_days + the longest competition moving average
 
 
+def test_a_grid_verdict_answers_each_prompt_from_the_grid_point_before_it(monkeypatch, tmp_path):
+    """Matching only looks back, so the tolerance has to span the grid's cadence: a prompt scored
+    late in an hour would otherwise find no prediction and score as a miss."""
+    tolerances: dict[int, set[int]] = {}
+
+    def fake_backtest(*, time_length, match_tolerance_minutes, **kw):
+        tolerances.setdefault(time_length, set()).add(match_tolerance_minutes)
+        return _FakeResult()
+
+    monkeypatch.setattr(ev, "backtest", fake_backtest)
+    monkeypatch.setattr(ev, "compute_combined_smoothed_scores", _fake_combined({1: 0.5, 999: 0.3}))
+    score("cand", tmp_path, pd.Timestamp("2026-09-09T00:00:00Z"), 10, tmp_path / "out")
+
+    assert tolerances == {tl: {minutes} for tl, minutes in CADENCE_MINUTES.items()}
+
+
 def test_the_onboarding_ramp_survives_the_combined_aggregation(monkeypatch, tmp_path):
     """Forwarding to the per-asset backtest is not enough: the competition frame is where the
     headline rank and rewards come from, and _trim_warmup deletes the backfilled period there."""
@@ -769,10 +808,12 @@ def test_the_two_prompt_modes_never_share_a_cache(tmp_path):
         kw.pop("seed", 0),
         kw.pop("live_prompts", True),
         kw.pop("lead_in", True),
+        kw.pop("context_mode", "ohlcv"),
     )
     live = cache()
     assert cache(live_prompts=False) != live  # the prompts sit minutes apart
     assert cache(lead_in=False) != live  # --no-lead-in must not reuse lead-in prompts
+    assert cache(context_mode="close") != live  # the champion saw a different context
     assert cache(seed=7) != live
     assert cache(sha="def5678") != live
     # …but the same run reuses its own tree: that is the point of the cache
@@ -793,6 +834,26 @@ def test_the_cache_is_mounted_where_generation_writes(tmp_path, monkeypatch):
 
     assert commands and all(f"{cache.resolve()}:/workspace/predictions:rw" in cmd for cmd in commands)
     assert all("--out-dir predictions" in cmd for cmd in commands)
+
+
+def test_a_close_context_verdict_tells_every_generation_run(tmp_path, monkeypatch):
+    commands: list[str] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: commands.append(" ".join(cmd)))
+    rv.generate_all(tmp_path, tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), gpus=False, limits=(2, 4), seed=7)
+    assert commands and not any("--context" in cmd for cmd in commands)
+
+    commands.clear()
+    rv.generate_all(
+        tmp_path,
+        tmp_path,
+        tmp_path,
+        ("2026-08-30", "2026-09-09"),
+        gpus=False,
+        limits=(2, 4),
+        seed=7,
+        context_mode="close",
+    )
+    assert commands and all("--context close" in cmd for cmd in commands)
 
 
 def test_simulated_registration_earns_nothing_before_it_registered(monkeypatch, tmp_path):

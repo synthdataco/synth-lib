@@ -44,7 +44,11 @@ from pathlib import Path
 import pandas as pd
 
 from synth.validator.competition_config import COM_EQU_24H, CRYPTO_1H, CRYPTO_24H  # type: ignore[import-untyped]
-from synth_lib.backtester.config import _OFFLINE_ENV_VAR, slug_for  # type: ignore[import-untyped]
+from synth_lib.backtester.config import (  # type: ignore[import-untyped]
+    _OFFLINE_ENV_VAR,
+    PREDICTION_MATCH_TOLERANCE_MINUTES,
+    slug_for,
+)
 from synth_lib.backtester.loading import get_rewards_history  # type: ignore[import-untyped]
 from synth_lib.backtester.orchestration import backtest  # type: ignore[import-untyped]
 from synth_lib.backtester.plots.rank import plot_total_rank_evolution  # type: ignore[import-untyped]
@@ -90,6 +94,16 @@ def reward_metrics(smoothed_scores: pd.DataFrame, miner_id: int = MINER_ID) -> d
     }
 
 
+def _round_rank(rows: pd.DataFrame, miner_id: int) -> tuple[int, int]:
+    """Rank (1 = best reward_weight) and field size in one scoring round. A miner whose softmax
+    weight is 0 has no row; the candidate is then last, and counted in the field."""
+    mine = rows["miner_uid"] == miner_id
+    if not bool(mine.any()):
+        return len(rows) + 1, len(rows) + 1
+    ranks = rows["reward_weight"].rank(ascending=False, method="min")
+    return int(ranks[mine].iloc[0]), len(rows)
+
+
 def asset_rank_stats(smoothed_scores: pd.DataFrame, miner_id: int = MINER_ID) -> dict | None:
     """Candidate's best and mean rank across ONE asset's scoring rounds (1 = best reward_weight).
 
@@ -97,23 +111,19 @@ def asset_rank_stats(smoothed_scores: pd.DataFrame, miner_id: int = MINER_ID) ->
     champion earns its competition rank (e.g. rank 1 on two assets, invisible on the rest)."""
     if smoothed_scores.empty or not bool((smoothed_scores["miner_uid"] == miner_id).any()):
         return None
-    ranks = smoothed_scores.groupby("updated_at")["reward_weight"].rank(ascending=False, method="min")
-    mine = ranks[smoothed_scores["miner_uid"] == miner_id]
-    last = smoothed_scores[smoothed_scores["updated_at"] == smoothed_scores["updated_at"].max()]
+    per_round = [_round_rank(rows, miner_id) for _, rows in smoothed_scores.groupby("updated_at")]
+    ranks = [rank for rank, _ in per_round]
     return {
-        "best_rank": int(mine.min()),
-        "mean_rank": round(float(mine.mean()), 1),
-        "field_size": int(len(last)),
+        "best_rank": min(ranks),
+        "mean_rank": round(sum(ranks) / len(ranks), 1),
+        "field_size": per_round[-1][1],
     }
 
 
 def final_rank(smoothed_scores: pd.DataFrame, miner_id: int = MINER_ID) -> tuple[int, int]:
     """Rank (1 = best reward_weight) at the last updated_at + field size.
     Same logic as the synth-lib runner (run_backtest.py)."""
-    last = smoothed_scores[smoothed_scores["updated_at"] == smoothed_scores["updated_at"].max()]
-    ranks = last["reward_weight"].rank(ascending=False, method="min")
-    rank = int(ranks[last["miner_uid"] == miner_id].iloc[0])
-    return rank, int(len(last))
+    return _round_rank(smoothed_scores[smoothed_scores["updated_at"] == smoothed_scores["updated_at"].max()], miner_id)
 
 
 def _rank_chart(results: list, combined: pd.DataFrame, slug: str, out_dir: Path) -> str | None:
@@ -187,6 +197,7 @@ def evaluate_candidate(
     simulate_registration: datetime | None = None,
     registrations: Registrations | None = None,
     save_order: Mapping[int, SaveOrder] | None = None,
+    match_tolerance_minutes: Mapping[int, int] | None = None,
 ) -> dict:
     """Evaluates a candidate on the three competitions (CRYPTO_24H, COM_EQU_24H, CRYPTO_1H).
 
@@ -210,13 +221,15 @@ def evaluate_candidate(
     `registrations` (uid -> registration times of its occupants inside the scored data, see
     `get_registrations`) scores each field uid that changed hands as the miners live sees.
     `save_order` (time_length -> `get_scores_save_order`) backfills late joiners from each minute's
-    first-saved prompt, as live does.
+    first-saved prompt, as live does. `match_tolerance_minutes` (time_length -> minutes) is how much
+    earlier than a scored prompt a prediction may start and answer it: the cadence of a grid.
     """
     per_competition: dict[str, dict] = {}
     competition_percentiles: list[float] = []
     competition_reward_ratios: list[float] = []
     for comp in COMPETITIONS:
         slug = slug_for(comp)
+        tolerance = (match_tolerance_minutes or {}).get(comp.time_length, PREDICTION_MATCH_TOLERANCE_MINUTES)
         results = []
         assets_failed: list[str] = []
         per_asset: dict[str, dict] = {}
@@ -233,6 +246,7 @@ def evaluate_candidate(
                     competition=comp,
                     simulate_registration=simulate_registration,
                     registrations=registrations,
+                    match_tolerance_minutes=tolerance,
                 )
                 results.append(result)
                 per_asset[asset] = {

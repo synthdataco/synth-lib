@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -125,6 +126,8 @@ def get_miner_scores(
         return df
     df["scored_time"] = pd.to_datetime(df["scored_time"], utc=True)
     df = df.drop_duplicates(subset=["miner_uid", "scored_time", "asset", "time_length"])
+    # The API's `to` names a whole day; keep the requested range, as the offline read does.
+    df = _filter_time_range(df, "scored_time", start_time, end_time)
     df["time_increment"] = time_increment
     # API does not return start_time; derive it as scored_time - time_length. That IS the
     # prompt's own start: the validator scores a prompt exactly time_length after it starts, so
@@ -188,7 +191,8 @@ def get_rewards_history(
         return df
     df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True)
     df = df.drop_duplicates()
-    return df
+    # The API's `to` names a whole day; keep the requested range, as the offline read does.
+    return _filter_time_range(df, "updated_at", start_time, end_time)
 
 
 def get_scores_save_order(start_time: datetime, end_time: datetime, time_length: int) -> dict[pd.Timestamp, list[str]]:
@@ -348,6 +352,13 @@ def load_prediction(ref: PredictionRef | Path) -> dict:
     return raw
 
 
+def _writable(path: Path) -> bool:
+    """Whether a store rooted at `path` can be written: its nearest existing ancestor accepts writes."""
+    while not path.exists():
+        path = path.parent
+    return os.access(path, os.W_OK)
+
+
 def _price_store(asset: str) -> MinutePriceStore:
     """Return a MinutePriceStore configured for the asset's upstream provider.
 
@@ -368,7 +379,7 @@ def download_price_data(
     Uses MinutePriceStore for routing (Pyth vs Hyperliquid) and on-demand
     ingestion. Reads parquets directly for NaN-tolerance — futures assets like
     WTIOIL have legitimate market-closure gaps, and downstream scoring already
-    filters NaN per-prompt.
+    filters NaN per-prompt. A day missing from a read-only store raises before any fetch.
     """
     store = _price_store(asset)
     frames: list[pd.DataFrame] = []
@@ -383,6 +394,10 @@ def download_price_data(
         cursor += timedelta(days=1)
 
     if missing:
+        if not _writable(store.root):
+            raise FileNotFoundError(
+                f"no {asset} price partition for {', '.join(map(str, missing))} in the read-only store {store.root}"
+            )
         store.ingest_range(missing[0], missing[-1], verbose=False)
         for day in missing:
             frames.append(pd.read_parquet(store.day_path(day)))

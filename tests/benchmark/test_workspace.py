@@ -160,13 +160,20 @@ def test_render_constitution_substitutes_all_vars(tmp_path):
     assert "test-rig" in text
 
 
+def test_the_constitution_states_a_gpu_minimum_only_when_there_is_one(tmp_path):
+    cfg = _cfg(tmp_path / "campaigns")
+    assert "minutes of GPU work" not in render_constitution(cfg, cfg.models[0])
+    text = render_constitution(replace(cfg, min_gpu_minutes=60), cfg.models[0])
+    assert "a nomination stands only once 60 minutes of GPU work are metered" in text
+
+
 def test_scaffolded_predict_anchors_paths_to_workspace_not_cwd(tmp_path, monkeypatch):
     """The price snapshot is mounted at the workspace ROOT, not inside agent/. If predict.py
     resolves `market_data/` relative to cwd (MinutePriceStore's default), the agent reads
     nothing as soon as it launches from agent/ — and burns its budget debugging OUR template.
     Regression 07-24: paths must be anchored to the file's location."""
     import importlib.util
-    from datetime import date, datetime, timezone
+    from datetime import date
 
     import pandas as pd
 
@@ -193,8 +200,8 @@ def test_scaffolded_predict_anchors_paths_to_workspace_not_cwd(tmp_path, monkeyp
     predict = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(predict)
 
-    assert predict.PREDICTIONS_DIR.is_absolute()
-    assert ws in predict.PREDICTIONS_DIR.parents, predict.PREDICTIONS_DIR
+    assert predict.PREDICTIONS_ROOT.is_absolute()
+    assert ws in predict.PREDICTIONS_ROOT.parents, predict.PREDICTIONS_ROOT
 
     captured: dict = {}
 
@@ -204,9 +211,8 @@ def test_scaffolded_predict_anchors_paths_to_workspace_not_cwd(tmp_path, monkeyp
         return pd.DataFrame({c: 100.0 for c in ("open", "high", "low", "close", "volume", "trade_count")}, index=idx)
 
     monkeypatch.setattr(predict, "load_minute_prices", stub_load)
-    start = datetime(2026, 7, 10, tzinfo=timezone.utc)
-    end = datetime(2026, 7, 10, 3, tzinfo=timezone.utc)
-    n = predict.generate("BTC", start, end, cadence_minutes=60)
+    times = list(pd.date_range("2026-07-10T00:00:00Z", periods=3, freq="60min"))
+    n = predict.generate("BTC", times, tmp_path / "out")
 
     assert n == 3
     data_root = captured["data_root"]

@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from synth_lib.backtester.caveats import _maybe_warn_hf_crps_formula_change
+from synth_lib.backtester.caveats import _maybe_warn_hf_crps_formula_change, _maybe_warn_latest_formula
 from synth_lib.backtester.config import (
     HF_CRPS_FORMULA_CHANGE_DATE,
     competition_for,
@@ -22,6 +22,7 @@ from synth_lib.backtester.config import (
 from synth_lib.backtester.loading import (
     download_price_data,
     get_miner_scores,
+    get_rewards_history,
     load_prediction,
 )
 from synth_lib.backtester.miner_data_handler import _BacktestMinerDataHandler
@@ -198,17 +199,30 @@ class TestFindPredictionFile:
         index = build_prediction_index(predictions_dir)
         assert _find_prediction_file(index, T0, "ETH", TIME_LENGTH) is None
 
-    def test_closest_of_multiple_within_tolerance(self, tmp_path: Path) -> None:
-        """When multiple prompts are within tolerance, the closest should be selected."""
-        for t in (T0, T0 + timedelta(minutes=15)):
+    @staticmethod
+    def _index(root: Path, *starts: datetime):
+        for t in starts:
             name = t.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{ASSET}_{TIME_LENGTH}.json"
-            (tmp_path / name).write_text("{}")
+            (root / name).write_text("{}")
+        return build_prediction_index(root)
 
-        index = build_prediction_index(tmp_path)
-        query_time = T0 + timedelta(minutes=5)
-        found = _find_prediction_file(index, query_time, ASSET, TIME_LENGTH, tolerance_minutes=30)
+    def test_the_latest_at_or_before_the_prompt(self, tmp_path: Path) -> None:
+        index = self._index(tmp_path, T0, T0 + timedelta(minutes=15))
+        found = _find_prediction_file(index, T0 + timedelta(minutes=5), ASSET, TIME_LENGTH, tolerance_minutes=30)
         assert found is not None
         assert "00:00:00Z" in found.path.name
+
+    def test_never_a_later_prediction_even_a_closer_one(self, tmp_path: Path) -> None:
+        """A prediction made 5 minutes into the prompt's path has seen 5 minutes of what it is scored on."""
+        index = self._index(tmp_path, T0, T0 + timedelta(minutes=15))
+        found = _find_prediction_file(index, T0 + timedelta(minutes=10), ASSET, TIME_LENGTH, tolerance_minutes=30)
+        assert found is not None and "00:00:00Z" in found.path.name
+        assert _find_prediction_file(index, T0 - timedelta(minutes=5), ASSET, TIME_LENGTH, tolerance_minutes=30) is None
+
+    def test_an_exact_match_needs_no_tolerance(self, tmp_path: Path) -> None:
+        index = self._index(tmp_path, T0)
+        assert _find_prediction_file(index, T0, ASSET, TIME_LENGTH, tolerance_minutes=0) is not None
+        assert _find_prediction_file(index, T0 + timedelta(minutes=1), ASSET, TIME_LENGTH, tolerance_minutes=0) is None
 
 
 # Loading prediction JSON files in both formats: flat (notebook) and ArtifactManager.
@@ -366,6 +380,35 @@ class TestBacktestIntegration:
         miner_rw = result.smoothed_scores.loc[result.smoothed_scores["miner_uid"] == custom_id, "reward_weight"]
         assert len(miner_rw) > 0 and all(miner_rw > 0)
 
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
+    def test_prices_are_read_to_the_last_prompts_end(
+        self,
+        mock_scores: object,
+        mock_rewards: object,
+        mock_prices: object,
+        mock_crps: object,
+        predictions_dir: Path,
+    ) -> None:
+        """Not a day past it: a crypto-1h window ending at a snapshot's last day would read the next."""
+        mock_scores.return_value = _make_scores_df()  # type: ignore[union-attr]
+        mock_rewards.return_value = _make_rewards_df()  # type: ignore[union-attr]
+        mock_prices.return_value = _make_price_df(T0, SCORED_T1)  # type: ignore[union-attr]
+        mock_crps.return_value = (FAKE_CRPS, [{"interval": "stub"}])  # type: ignore[union-attr]
+
+        backtest(
+            miner_name="test_miner",
+            asset=ASSET,
+            time_length=TIME_LENGTH,
+            n_backtest_days=5,
+            predictions_dir=predictions_dir,
+        )
+
+        _, end, _ = mock_prices.call_args.args  # type: ignore[union-attr]
+        assert end == SCORED_T1
+
     # -- Partial predictions fill with crps=-1 --
 
     @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
@@ -392,6 +435,36 @@ class TestBacktestIntegration:
 
         assert split.summary["mean_crps"] == plain.summary["mean_crps"]
         assert split.smoothed_scores["miner_uid"].isna().sum() == 0
+
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    @patch("synth_lib.backtester.orchestration.get_rewards_history")
+    @patch("synth_lib.backtester.orchestration.get_miner_scores")
+    def test_a_simulated_registration_drops_the_prompts_issued_before_it(
+        self,
+        mock_scores: object,
+        mock_rewards: object,
+        mock_prices: object,
+        mock_crps: object,
+        predictions_dir: Path,
+    ) -> None:
+        """Registered at 03:00, between T0 and T1: T0 is scored after it, but was sent before it."""
+        mock_scores.return_value = _make_scores_df()  # type: ignore[union-attr]
+        mock_rewards.return_value = _make_rewards_df()  # type: ignore[union-attr]
+        mock_prices.return_value = _make_price_df(T0, SCORED_T1)  # type: ignore[union-attr]
+        mock_crps.return_value = (FAKE_CRPS, [{"interval": "stub"}])  # type: ignore[union-attr]
+
+        result = backtest(
+            miner_name="test_miner",
+            asset=ASSET,
+            time_length=TIME_LENGTH,
+            n_backtest_days=5,
+            predictions_dir=predictions_dir,
+            simulate_registration=T0 + timedelta(hours=3),
+        )
+
+        mine = result.prompt_df.loc[result.prompt_df["miner_uid"] == MINER_ID]
+        assert list(pd.to_datetime(mine["start_time"], utc=True)) == [pd.Timestamp(T1)]
 
     @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
     @patch("synth_lib.backtester.orchestration.download_price_data")
@@ -808,6 +881,44 @@ class TestDownloadPriceDataPerAsset:
 
         assert float(result["close"].iloc[0]) == pytest.approx(2_000.0)
         assert float(result["close"].iloc[-1]) == pytest.approx(2_000.0)
+
+    def test_a_day_missing_from_a_read_only_store_raises_before_any_fetch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A campaign's snapshot is mounted read-only and stops at its cutoff: the day it lacks is
+        after the cutoff, and must not be fetched from the venue."""
+        monkeypatch.chdir(tmp_path)
+        day = datetime(2026, 3, 20, tzinfo=UTC)
+        root = tmp_path / "market_data" / "pyth" / "ETH" / "1m"
+        self._write_partition(root, day, price=2_000.0)
+        fetch = MagicMock()
+        monkeypatch.setattr("synth_lib.backtester.loading.MinutePriceStore.ingest_range", fetch)
+        root.chmod(0o555)
+        try:
+            with pytest.raises(FileNotFoundError, match="2026-03-21 in the read-only store"):
+                download_price_data(day, day + timedelta(days=1, hours=1), "ETH", freq="1min")
+        finally:
+            root.chmod(0o755)
+        fetch.assert_not_called()
+
+    def test_a_day_missing_from_a_writable_store_is_ingested(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        day = datetime(2026, 3, 20, tzinfo=UTC)
+        root = tmp_path / "market_data" / "pyth" / "ETH" / "1m"
+        self._write_partition(root, day, price=2_000.0)
+        fetched = []
+
+        def ingest(store, start_day, end_day, verbose=True):
+            fetched.append(start_day)
+            self._write_partition(store.root, datetime(start_day.year, start_day.month, start_day.day), 2_100.0)
+
+        monkeypatch.setattr("synth_lib.backtester.loading.MinutePriceStore.ingest_range", ingest)
+        result = download_price_data(day, day + timedelta(days=1, hours=1), "ETH", freq="1min")
+
+        assert [str(d) for d in fetched] == ["2026-03-21"]
+        assert float(result["close"].iloc[-1]) == pytest.approx(2_100.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1364,6 +1475,35 @@ class TestNoScoresAvailable:
 
         assert df.empty
 
+    @patch("synth_lib.backtester.loading._http_get")
+    def test_online_pages_are_cut_to_the_requested_range(self, mock_get: MagicMock) -> None:
+        """The API's `to` names a whole day: a page ending at midnight returns the day after it."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            {"miner_uid": 1, "asset": "BTC", "crps": 1.0, "time_length": 86_400, "scored_time": t}
+            for t in ("2026-09-13T12:00:00Z", "2026-09-14T00:00:00Z", "2026-09-14T12:00:00Z")
+        ]
+        mock_get.return_value = resp
+
+        df = get_miner_scores(datetime(2026, 9, 13, tzinfo=UTC), datetime(2026, 9, 14, tzinfo=UTC), "BTC", 86_400, 300)
+
+        assert list(df["scored_time"]) == [pd.Timestamp("2026-09-13T12:00:00Z")]
+
+    @patch("synth_lib.backtester.loading._http_get")
+    def test_online_rewards_are_cut_to_the_requested_range(self, mock_get: MagicMock) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = [
+            {"miner_uid": 1, "reward_weight": 0.1, "updated_at": t}
+            for t in ("2026-09-13T12:00:00Z", "2026-09-14T12:00:00Z")
+        ]
+        mock_get.return_value = resp
+
+        df = get_rewards_history(datetime(2026, 9, 13, tzinfo=UTC), datetime(2026, 9, 14, tzinfo=UTC))
+
+        assert list(df["updated_at"]) == [pd.Timestamp("2026-09-13T12:00:00Z")]
+
     @patch("synth_lib.backtester.orchestration.get_miner_scores")
     def test_backtest_raises_no_scores_available(self, mock_scores: MagicMock, tmp_path: Path) -> None:
         """Must not degrade to a bare RuntimeError — run_backtest keys SKIPPED off it."""
@@ -1412,6 +1552,15 @@ class TestSliceRealPrices:
         assert len(real_prices) == 13
         assert np.isnan(real_prices).all()  # must not raise on object/None input
 
+    def test_an_ohlcv_frame_is_sliced_on_close(self) -> None:
+        """`open` comes first in the store's columns; scoring it moves CRPS by a few percent."""
+        frame = self._frame(61)
+        ohlcv = pd.DataFrame({"open": frame["close"] - 1.0, "high": frame["close"] + 1.0, "close": frame["close"]})
+
+        prices = _slice_real_prices(ohlcv, pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300)
+
+        assert prices[:2] == [100.0, 105.0]
+
     def test_nan_minutes_survive_the_slice(self) -> None:
         """NaN is repairable by the fallback, so the slice must pass it through."""
         prices = _slice_real_prices(self._frame(61, gap_at=5), pd.Timestamp("2026-07-20T00:00:00Z"), 3600, 300)
@@ -1456,6 +1605,26 @@ class TestFillGapsFromRealizedPaths:
         assert _fill_gaps_from_realized_paths(prompts, "[test]") == 1
         assert prompts[0]["real_prices"] == path.to_list()
         mock_prefetch.assert_called_once()
+
+    @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
+    @patch("synth_lib.backtester.preparation.RealizedPathStore")
+    def test_says_what_it_fetches(
+        self,
+        mock_store_cls: MagicMock,
+        mock_prefetch: MagicMock,
+        capsys: pytest.CaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One request per uncached prompt at the API's pace: without a word, a sweep looks hung."""
+        monkeypatch.delenv("SYNTH_BACKTESTER_OFFLINE_DATA_ROOT", raising=False)
+        expected_steps = 86_400 // 300 + 1
+        mock_store_cls.return_value.get.return_value = pd.Series(
+            [1.0] * expected_steps, index=pd.date_range(self.START, periods=expected_steps, freq="5min")
+        )
+
+        _fill_gaps_from_realized_paths([self._prompt([float("nan")] * expected_steps)], "[test]")
+
+        assert "[test] fetching the validator's realized paths for up to 1 XAU prompts" in capsys.readouterr().out
 
     @patch("synth_lib.backtester.preparation.prefetch_realized_paths")
     @patch("synth_lib.backtester.preparation.RealizedPathStore")
@@ -1559,7 +1728,7 @@ class TestVolCrpsCutover:
     PATHS = np.array([[100.0 + i * 0.1 + k for i in range(61)] for k in range(8)], dtype=float)
     REAL = np.array([100.0 + i * 0.1 for i in range(61)], dtype=float)
 
-    def _score(self, tmp_path, scored_time):
+    def _score(self, tmp_path, scored_time, latest_formula=False):
         f = tmp_path / "p.json"
         f.write_text(json.dumps({"paths": self.PATHS.tolist()}))
         return _score_single_prompt(
@@ -1573,6 +1742,7 @@ class TestVolCrpsCutover:
             scoring_intervals=CRYPTO_1H.scoring_intervals,
             vol_scoring_blocks=CRYPTO_1H.vol_scoring_blocks,
             miner_id=999,
+            latest_formula=latest_formula,
         )["crps"]
 
     def test_before_the_cutover_scores_price_only(self, tmp_path):
@@ -1602,6 +1772,21 @@ class TestVolCrpsCutover:
     def test_the_24h_competitions_have_no_volatility_term(self):
         """No vol_scoring_blocks, so the cutover date never applies to them."""
         assert not CRYPTO_24H.vol_scoring_blocks
+
+    def test_the_latest_formula_scores_a_prompt_from_before_the_cutover_with_the_volatility_term(self, tmp_path):
+        """What a champion scored after the cutover is judged on, measured on an older window."""
+        before = pd.Timestamp(VOL_CRPS_1H_DATE) - pd.Timedelta(days=7)
+        assert self._score(tmp_path, before, latest_formula=True) == pytest.approx(
+            self._score(tmp_path, pd.Timestamp(VOL_CRPS_1H_DATE))
+        )
+
+    def test_the_latest_formula_warns_that_field_ranks_before_the_cutover_compare_two_formulas(self):
+        with pytest.warns(UserWarning, match="field-relative numbers before it do not"):
+            _maybe_warn_latest_formula(CRYPTO_1H, pd.Timestamp(VOL_CRPS_1H_DATE) - pd.Timedelta(days=1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            _maybe_warn_latest_formula(CRYPTO_1H, pd.Timestamp(VOL_CRPS_1H_DATE))
+            _maybe_warn_latest_formula(CRYPTO_24H, pd.Timestamp(VOL_CRPS_1H_DATE) - pd.Timedelta(days=1))
 
 
 class TestOutlierCapCutover:
@@ -1675,6 +1860,37 @@ class TestRegistrationLookback:
         start = self._queried_start(monkeypatch, tmp_path, reg.to_pydatetime())
         # Clamping to prediction coverage would put this one horizon back; the backfill needs ten days.
         assert start <= reg - pd.Timedelta(days=CRYPTO_24H.window_days)
+
+
+def test_the_score_query_reaches_the_prompts_the_last_prediction_answers(monkeypatch, tmp_path):
+    """On a 120-minute grid ending 21:00, the 22:30 prompt is answered by the 21:00 prediction and
+    scored at 23:30: the query has to reach the tolerance past the last prediction's horizon."""
+    seen = {}
+
+    def fake_scores(*, start_time, end_time, asset, time_length, time_increment):
+        seen["end"] = end_time
+        raise NoScoresAvailable("stop here — the query bound is what this test is about")
+
+    monkeypatch.setattr("synth_lib.backtester.orchestration.get_miner_scores", fake_scores)
+    monkeypatch.setattr("synth_lib.backtester.orchestration.download_price_data", lambda *a, **k: pd.DataFrame())
+    last = pd.Timestamp("2026-09-17T21:00:00Z")
+    preds = tmp_path / "predictions"
+    preds.mkdir()
+    name = last.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_BTC_{CRYPTO_1H.time_length}.json"
+    (preds / name).write_text(json.dumps({"paths": [[1.0, 2.0]]}))
+    with pytest.raises(NoScoresAvailable):
+        backtest(
+            miner_name="m",
+            asset="BTC",
+            time_length=CRYPTO_1H.time_length,
+            time_increment=CRYPTO_1H.time_increment,
+            n_backtest_days=1,
+            predictions_dir=preds,
+            competition=CRYPTO_1H,
+            eval_end=(last + pd.Timedelta(days=2)).to_pydatetime(),
+            match_tolerance_minutes=120,
+        )
+    assert pd.Timestamp(seen["end"]) >= pd.Timestamp("2026-09-17T23:30:00Z")
 
 
 def test_a_day_file_scores_the_same_prompt_as_its_json_twin(tmp_path):

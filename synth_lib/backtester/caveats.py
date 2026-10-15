@@ -8,15 +8,15 @@ from datetime import datetime, timedelta
 import pandas as pd
 import requests
 
-from synth.validator.competition_config import CRYPTO_1H, CompetitionConfig
+from synth.validator.competition_config import CompetitionConfig
 
 from synth_lib.backtester.config import (
     COMPETITION_SPLIT_DATE,
     HF_CRPS_FORMULA_CHANGE_DATE,
     UTC,
+    VOL_CRPS_1H_DATE,
     slug_for,
 )
-
 
 
 def _is_rate_limit_or_server_error(resp: requests.Response) -> bool:
@@ -36,18 +36,10 @@ def _warn_on_middle_gap(
     if len(chunk_log) < 3:
         return
     first_nonempty = next((i for i, (_, _, n) in enumerate(chunk_log) if n > 0), None)
-    last_nonempty = next(
-        (i for i in range(len(chunk_log) - 1, -1, -1) if chunk_log[i][2] > 0), None
-    )
-    if (
-        first_nonempty is None
-        or last_nonempty is None
-        or last_nonempty - first_nonempty < 2
-    ):
+    last_nonempty = next((i for i in range(len(chunk_log) - 1, -1, -1) if chunk_log[i][2] > 0), None)
+    if first_nonempty is None or last_nonempty is None or last_nonempty - first_nonempty < 2:
         return
-    bad = [
-        (s, e) for s, e, n in chunk_log[first_nonempty + 1 : last_nonempty] if n == 0
-    ]
+    bad = [(s, e) for s, e, n in chunk_log[first_nonempty + 1 : last_nonempty] if n == 0]
     if not bad:
         return
     ranges = ", ".join(f"{s.date()}→{e.date()}" for s, e in bad)
@@ -104,9 +96,7 @@ def _maybe_warn_hf_crps_formula_change(
     )
     if window_start >= HF_CRPS_FORMULA_CHANGE_DATE:
         return
-    safe_sim_reg = (
-        HF_CRPS_FORMULA_CHANGE_DATE + timedelta(days=competition.window_days)
-    ).date()
+    safe_sim_reg = (HF_CRPS_FORMULA_CHANGE_DATE + timedelta(days=competition.window_days)).date()
     cutoff = HF_CRPS_FORMULA_CHANGE_DATE.date()
     warnings.warn(
         f"crypto-1h backtest window starts {window_start.date()}, before "
@@ -133,8 +123,11 @@ def _maybe_warn_competition_split(
     are scored under a 2-profile structure that no longer exists.
     """
     window_start = _hf_crps_window_start(
-        n_backtest_days, competition, eval_end,
-        simulate_registration, simulate_deregistration,
+        n_backtest_days,
+        competition,
+        eval_end,
+        simulate_registration,
+        simulate_deregistration,
     )
     if window_start >= COMPETITION_SPLIT_DATE:
         return
@@ -146,4 +139,17 @@ def _maybe_warn_competition_split(
         f"Restrict the window to >= {COMPETITION_SPLIT_DATE.date()}.",
         UserWarning,
         stacklevel=2,
+    )
+
+
+def _maybe_warn_latest_formula(competition: CompetitionConfig, first_scored: pd.Timestamp) -> None:
+    """Warn when the latest formula scores prompts the field was scored on under an earlier one."""
+    if not competition.vol_scoring_blocks or first_scored >= VOL_CRPS_1H_DATE:
+        return
+    warnings.warn(
+        f"{slug_for(competition)}: latest_formula scores the prompts scored before "
+        f"{VOL_CRPS_1H_DATE:%Y-%m-%d %H:%M} UTC with the volatility term, and the field was scored "
+        f"without it. CRPS compares across the change; field-relative numbers before it do not.",
+        UserWarning,
+        stacklevel=3,
     )

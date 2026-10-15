@@ -15,6 +15,8 @@ EFFORT_LEVELS = {
     "claude-code": ("low", "medium", "high", "xhigh", "max"),
     "codex": ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
 }
+# claude-code's workflowSizeGuideline values: the agent count it tells the model to aim for per workflow.
+WORKFLOW_SIZES = ("unrestricted", "small", "medium", "large")
 PRIMARY_METRIC = "synth_competition_rank"
 # CampaignConfig fields that must be strictly positive (checked in _validate).
 POSITIVE_FIELDS = (
@@ -35,6 +37,8 @@ class ModelSpec:
     effort: str | None = None  # an EFFORT_LEVELS name for the leg's CLI; None = the CLI's default for the model
     ultracode: bool = False  # claude-code only: a dynamic workflow for every substantive task
     goal: bool = False  # claude-code only: an evaluator holds the session to cli_adapters.GOAL_CONDITION
+    workflow_size: str | None = None  # with ultracode: a WORKFLOW_SIZES name; None = the CLI's default
+    max_workflow_agents: int | None = None  # with ultracode: workflow agents at once; None = the CLI's default
 
 
 PACKAGED_BASELINE = "synth_lib.benchmark.verdict.baseline_default"
@@ -87,6 +91,9 @@ class CampaignConfig:
     # bound. Structural breaks make this a real choice, not just a size knob — see CAMPAIGN.md.tmpl.
     data_start: date | None = None
     gpu: bool = True  # --gpus all in the sandbox; false = campaign without GPU (e.g. smoke test)
+    # GPU-busy minutes the driver must have metered before a nomination stands (gpu_usage.GpuUsage);
+    # 0 = no requirement.
+    min_gpu_minutes: float = 0.0
     # Sandbox envelope per run (docker --memory / --cpus). Here rather than hardcoded in
     # run_campaign so a campaign declares the machine it was sized for: the host must have at
     # least this much, and the constitution tells the agent what it got (`hardware:`).
@@ -134,6 +141,8 @@ def _validate(cfg: CampaignConfig) -> None:
             raise ValueError(f"{name} must be > 0")
     if not 0 < cfg.soft_landing_pct < 1:
         raise ValueError("soft_landing_pct must be in (0, 1)")
+    if cfg.min_gpu_minutes < 0 or (cfg.min_gpu_minutes and not cfg.gpu):
+        raise ValueError("min_gpu_minutes must be >= 0, and needs gpu: true")
     if cfg.data_start is not None and cfg.data_start > cfg.data_cutoff:
         raise ValueError(f"data_start ({cfg.data_start}) must be <= data_cutoff ({cfg.data_cutoff})")
     if cfg.primary_metric != PRIMARY_METRIC:
@@ -151,3 +160,9 @@ def _validate_model(m: ModelSpec) -> None:
         raise ValueError(f"{m.id}: ultracode is a claude-code setting")
     if m.goal and m.cli != "claude-code":
         raise ValueError(f"{m.id}: goal is a claude-code setting")
+    if (m.workflow_size is not None or m.max_workflow_agents is not None) and not m.ultracode:
+        raise ValueError(f"{m.id}: workflow_size and max_workflow_agents need ultracode")
+    if m.workflow_size is not None and m.workflow_size not in WORKFLOW_SIZES:
+        raise ValueError(f"{m.id}: workflow_size {m.workflow_size!r} is not one of {WORKFLOW_SIZES}")
+    if m.max_workflow_agents is not None and not 1 <= m.max_workflow_agents <= 256:
+        raise ValueError(f"{m.id}: max_workflow_agents must be between 1 and 256")

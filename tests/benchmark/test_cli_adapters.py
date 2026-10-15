@@ -18,10 +18,16 @@ def test_claude_adapter_cmd_and_env():
     assert env["ANTHROPIC_BASE_URL"] == "http://localhost:4000"
     assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-v"
     assert a.resume_cmd("continue") is not None  # claude can resume via a generic session id (-c)
-    assert "--effort" not in cmd and "--settings" not in cmd  # defaults: the CLI's own effort, no hook
-    # every subagent and workflow agent on the leg's model; background workflows waited for
+    assert "--effort" not in cmd  # default: the CLI's own effort
+    # no hook, no ultracode; only the leg's model may serve a request, so a flagged one is refused
+    # instead of re-running on a fallback model
+    assert json.loads(cmd[cmd.index("--settings") + 1]) == {"availableModels": ["claude-model"]}
+    # every subagent and workflow agent on the leg's model, the built-in Explore one included;
+    # background workflows waited for
     assert env["CLAUDE_CODE_SUBAGENT_MODEL_FORCE"] == "1"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "claude-model"
     assert env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] == "0"
+    assert "CLAUDE_CODE_EFFORT_LEVEL" not in env and "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS" not in env
 
 
 def test_claude_adapter_carries_effort_ultracode_and_goal_into_every_launch():
@@ -40,6 +46,30 @@ def test_claude_adapter_carries_effort_ultracode_and_goal_into_every_launch():
         assert hook["model"] == "claude-opus-5-model"  # the evaluator runs on the leg's own served alias
     # the goal rides in the settings: the prompt is the driver's, unchanged
     assert a.launch_cmd("Read CAMPAIGN.md and start.")[2] == "Read CAMPAIGN.md and start."
+
+
+def test_claude_adapter_pins_the_workflow_size_concurrency_and_every_agents_effort():
+    a = build_adapter(
+        ModelSpec(
+            id="c",
+            cli="claude-code",
+            model="claude-fable-5-1-model",
+            effort="max",
+            ultracode=True,
+            workflow_size="medium",
+            max_workflow_agents=6,
+        ),
+        proxy_url="http://localhost:4000",
+        virtual_key="sk-v",
+    )
+    for cmd in (a.launch_cmd("Read CAMPAIGN.md and start."), a.resume_cmd("continue")):
+        settings = json.loads(cmd[cmd.index("--settings") + 1])
+        assert settings["workflowSizeGuideline"] == "medium"
+        assert settings["availableModels"] == ["claude-fable-5-1-model"]
+    env = a.env()
+    assert env["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"] == "6"
+    # a subagent's own effort, which Claude can set per agent, does not override the leg's
+    assert env["CLAUDE_CODE_EFFORT_LEVEL"] == "max"
 
 
 def test_codex_adapter_writes_config_and_env():

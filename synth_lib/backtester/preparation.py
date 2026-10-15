@@ -24,7 +24,6 @@ from synth_lib.preparation.realized_path_store import (
 )
 
 
-
 def _slice_real_prices(
     prices: pd.DataFrame,
     start_time: Any,
@@ -37,16 +36,13 @@ def _slice_real_prices(
     missing minutes come back as NaN for _fill_gaps_from_realized_paths.
     """
     step_minutes = time_increment // 60
-    window = prices.loc[
-        start_time : start_time + pd.Timedelta(seconds=time_length) : step_minutes
-    ].iloc[:, 0]
+    window = prices["close"].loc[start_time : start_time + pd.Timedelta(seconds=time_length) : step_minutes]
     # Coerce: older object-dtype partitions read back as None, which np.isfinite rejects.
     real_prices = pd.to_numeric(window, errors="coerce").tolist()
     expected_steps = (time_length // time_increment) + 1
     if len(real_prices) != expected_steps:
         raise ValueError(
-            f"Price data length mismatch at {start_time}: "
-            f"got {len(real_prices)} prices, expected {expected_steps}"
+            f"Price data length mismatch at {start_time}: got {len(real_prices)} prices, expected {expected_steps}"
         )
     return real_prices
 
@@ -67,11 +63,7 @@ def _fill_gaps_from_realized_paths(
     for HYPE and every commodity/equity. Mutates `prompts` in place, returns the
     number substituted. NaN inside a realized path is left as-is.
     """
-    gaps = [
-        prompt
-        for prompt in prompts
-        if prompt["real_prices"] and _has_missing_prices(prompt["real_prices"])
-    ]
+    gaps = [prompt for prompt in prompts if prompt["real_prices"] and _has_missing_prices(prompt["real_prices"])]
     if not gaps:
         return 0
 
@@ -84,6 +76,11 @@ def _fill_gaps_from_realized_paths(
     for (asset, time_length, time_increment), group in by_prompt_config.items():
         store = RealizedPathStore(asset, time_length, time_increment)
         if _offline_root() is None:
+            print(
+                f"{log_prefix} fetching the validator's realized paths for up to {len(group)} {asset} prompts "
+                f"with price gaps, one request per prompt not cached in {store.root}",
+                flush=True,
+            )
             prefetch_realized_paths(store, [p["start_time"] for p in group], verbose=False)
         expected_steps = (time_length // time_increment) + 1
         for prompt in group:
@@ -94,8 +91,7 @@ def _fill_gaps_from_realized_paths(
             filled += 1
 
     print(
-        f"{log_prefix} filled {filled}/{len(gaps)} price-gap prompts "
-        f"from validator realized paths",
+        f"{log_prefix} filled {filled}/{len(gaps)} price-gap prompts from validator realized paths",
         flush=True,
     )
     if filled < len(gaps):
@@ -106,6 +102,7 @@ def _fill_gaps_from_realized_paths(
             stacklevel=2,
         )
     return filled
+
 
 def _parse_prediction_filename_time(path: Path) -> datetime | None:
     """Extract start_time from a prediction filename like 2026-03-23_00:01:00Z_BTC_86400.json."""
@@ -143,9 +140,7 @@ def build_prediction_index(root: Path) -> PredictionIndex:
             continue  # an index without its paths is an interrupted write, not a prompt
         key = (meta["asset"], meta["time_length"])
         for row, start in enumerate(meta["start_times"]):
-            index.setdefault(key, {})[pd.Timestamp(start)] = PredictionRef(
-                paths_file, row
-            )
+            index.setdefault(key, {})[pd.Timestamp(start)] = PredictionRef(paths_file, row)
     for prompt_file in sorted(root.glob("**/*.json")):
         start = _parse_prediction_filename_time(prompt_file)
         if start is None or prompt_file.name.startswith("_"):
@@ -163,22 +158,21 @@ def _find_prediction_file(
     time_length: int,
     tolerance_minutes: int = PREDICTION_MATCH_TOLERANCE_MINUTES,
 ) -> PredictionRef | None:
-    """The closest prediction to start_time for this (asset, time_length), or None.
+    """The latest prediction starting at or before start_time for this (asset, time_length), at most
+    tolerance_minutes earlier, or None.
 
-    start_time is approximate (derived from scored_time - time_length), so the match is
-    nearest within tolerance_minutes rather than exact. Bisects the sorted start_times:
-    a window holds thousands of prompts and this runs once per prompt.
+    Never a later one: its context would hold prices from the path the prompt is scored on. Bisects
+    the sorted start_times: a window holds thousands of prompts and this runs once per prompt.
     """
     prompts = index.get((asset, time_length))
     if not prompts:
         return None
     starts = sorted(prompts)
     target = pd.Timestamp(start_time)
-    position = bisect.bisect_left(starts, target)
-    best: pd.Timestamp | None = None
-    best_delta = timedelta(minutes=tolerance_minutes)
-    for candidate in starts[max(0, position - 1) : position + 1]:
-        delta = abs(target - candidate).to_pytimedelta()
-        if delta < best_delta:
-            best_delta, best = delta, candidate
-    return prompts[best] if best is not None else None
+    position = bisect.bisect_right(starts, target)
+    if position == 0:
+        return None
+    best = starts[position - 1]
+    if target - best > timedelta(minutes=tolerance_minutes):
+        return None
+    return prompts[best]

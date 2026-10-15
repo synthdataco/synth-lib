@@ -1,9 +1,12 @@
 """Self-evaluation via the official synth-lib backtester.
 
 Usage: uv run agent/predict.py --asset BTC --days 3 --eval-end 2026-07-15
-Generates predictions from agent/modeling.py over a grid of past prompts (covered by the
-snapshot), writes them in the standard format, then scores them with backtest() (validator
-CRPS + rank vs the real field via the Synth API).
+Answers, with agent/modeling.py, the prompts the validator scored in the --days before --eval-end,
+at the start times it actually used (read from the offline field bundle), then scores them with
+backtest() (validator CRPS + rank vs the real field, from the same bundle). A prompt is scored one
+horizon after it starts, so generation begins one horizon before the scored days.
+--cadence-minutes N answers an even grid over the same span instead; each scored prompt is then
+answered by the grid point at or before it.
 
 Works on every asset, including the ones whose minutes do not all trade. Prices load through the
 same lenient path the scored evaluation uses, so a NaN close reaches simulate() rather than
@@ -26,12 +29,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
 
+from synth_lib.backtester.config import PREDICTION_MATCH_TOLERANCE_MINUTES
+from synth_lib.backtester.loading import get_miner_scores
 from synth_lib.backtester.orchestration import backtest
 from synth_lib.benchmark.generate_predictions import context_end, load_minute_prices
 from synth_lib.preparation.config import STORE_SUBDIR
@@ -46,9 +53,10 @@ sys.path.insert(0, str(AGENT_DIR))
 from modeling import simulate  # noqa: E402  (import after adding AGENT_DIR to sys.path)
 
 CONTEXT_MINUTES = 7 * 24 * 60
-PREDICTIONS_DIR = WORKSPACE / "miner_outputs" / "campaign" / "predictions"
-# backtest() fetches prices up to 26 h past the last prompt's start (synth_lib/backtester/orchestration.py).
-BACKTEST_PADDING = timedelta(hours=26)
+# Each run writes its predictions to its own directory under this one.
+PREDICTIONS_ROOT = WORKSPACE / "miner_outputs" / "campaign"
+# Must match synth_lib.backtester.config._OFFLINE_ENV_VAR.
+OFFLINE_ROOT_ENV = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
 
 
 def ensure_workspace_cwd() -> None:
@@ -60,6 +68,18 @@ def ensure_workspace_cwd() -> None:
     nothing, and attempt an `ingest_range` (download + write) against a snapshot mounted
     READ-ONLY — a cryptic error. The snapshot is mounted at the workspace root: we move there."""
     os.chdir(WORKSPACE)
+
+
+def require_offline_bundle() -> None:
+    """Fails unless backtest() reads the field from the offline bundle.
+
+    backtest() reads scores and rewards a day past --eval-end; from the live API that is data from
+    after your cutoff."""
+    if not os.environ.get(OFFLINE_ROOT_ENV):
+        raise SystemExit(
+            f"{OFFLINE_ROOT_ENV} is not set, so backtest() would read the field from the live API, past "
+            f"--eval-end. The harness points it at the bundle in your snapshot; restore it."
+        )
 
 
 def store_root(asset: str) -> Path:
@@ -93,31 +113,34 @@ def check_snapshot_coverage(asset: str, start: datetime, end: datetime) -> None:
         )
 
 
-def check_backtest_padding(asset: str, end: datetime, time_length: int) -> None:
-    """Fails if backtest() would read past the snapshot.
-
-    backtest() reads beyond --eval-end — scores to the end of that day, rewards a day further,
-    prices 26 h past the last prompt's start — and fetches whatever the snapshot lacks from the live
-    API and the venues: data from after the cutoff. --eval-end therefore stops a horizon and 26 h
-    before the snapshot's last day."""
-    days = sorted(p.name for p in store_root(asset).glob("date=*.parquet"))
-    if not days:
-        return  # check_snapshot_coverage reports the missing partitions
-    last_day = datetime.fromisoformat(days[-1].removeprefix("date=").removesuffix(".parquet"))
-    latest = last_day.replace(tzinfo=timezone.utc) - timedelta(seconds=time_length) - BACKTEST_PADDING
-    if end > latest:
+def prompt_times(
+    asset: str,
+    end: datetime,
+    days: int,
+    time_length: int,
+    time_increment: int,
+    cadence_minutes: int | None = None,
+) -> list[pd.Timestamp]:
+    """Start times of the prompts scored in the `days` before `end`: the validator's own, from the
+    offline bundle, or every `cadence_minutes` over the same span."""
+    first = end - timedelta(days=days)
+    if cadence_minutes is not None:
+        horizon = timedelta(seconds=time_length)
+        return list(pd.date_range(first - horizon, end - horizon, freq=f"{cadence_minutes}min", inclusive="left"))
+    scores = get_miner_scores(first, end, asset, time_length, time_increment)
+    if scores.empty:
         raise SystemExit(
-            f"--eval-end {end.date()} is too late for --time-length {time_length}: backtest() reads a horizon "
-            f"and 26 h past it, beyond the snapshot's last day ({last_day.date()}), and would fetch that "
-            f"from the live API. Use --eval-end {latest.date()} or earlier."
+            f"the offline bundle has no scored {asset} prompt for --time-length {time_length} in "
+            f"{first.date()} → {end.date()} (DATA.md gives its span); --cadence-minutes answers a grid "
+            f"instead, for CRPS only."
         )
+    return sorted(pd.to_datetime(scores["start_time"], utc=True).unique())
 
 
 def generate(
     asset: str,
-    start: datetime,
-    end: datetime,
-    cadence_minutes: int = 60,
+    times: list[pd.Timestamp],
+    out_dir: Path,
     time_increment: int = 300,
     time_length: int = 86_400,
     num_simulations: int = 1000,
@@ -127,14 +150,10 @@ def generate(
     # minutes never trade), so that loader cannot read 9 of the 13 assets at all. NaN reaches
     # simulate() untouched, which is the contract — never interpolate it away.
     prices = load_minute_prices(
-        WORKSPACE / "market_data", asset, pd.Timestamp(start) - pd.Timedelta(minutes=CONTEXT_MINUTES), pd.Timestamp(end)
+        WORKSPACE / "market_data", asset, times[0] - pd.Timedelta(minutes=CONTEXT_MINUTES), times[-1]
     )
-    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    end_ts = pd.Timestamp(end)
-    n = 0
-    for t in pd.date_range(start, end, freq=f"{cadence_minutes}min", tz="UTC"):
-        if t >= end_ts:
-            break
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for t in times:
         # Never `prices.loc[:t]` — see the module docstring. Same cut the scored evaluation uses.
         context = prices.loc[: context_end(t, time_length)][-CONTEXT_MINUTES:]
         out = simulate(
@@ -156,16 +175,15 @@ def generate(
             "paths": paths,
         }
         name = t.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{asset}_{time_length}.json"
-        (PREDICTIONS_DIR / name).write_text(json.dumps(record))
-        n += 1
-    return n
+        (out_dir / name).write_text(json.dumps(record))
+    return len(times)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--asset", default="BTC")
     ap.add_argument("--days", type=int, default=3)
-    ap.add_argument("--eval-end", required=True, help="YYYY-MM-DD, at most data_cutoff minus the horizon and 26 h")
+    ap.add_argument("--eval-end", required=True, help="YYYY-MM-DD, at most the snapshot's last day")
     ap.add_argument("--time-increment", type=int, default=300, help="seconds between points (60 for CRYPTO_1H)")
     ap.add_argument("--time-length", type=int, default=86_400, help="horizon in seconds (3600 for CRYPTO_1H)")
     ap.add_argument(
@@ -176,32 +194,59 @@ def main() -> None:
         "the cost of a slightly pessimistic CRPS (empirical CRPS is biased upward for fewer "
         "sampled paths, and the real field's CRPS was computed at 1000).",
     )
+    ap.add_argument(
+        "--cadence-minutes",
+        type=int,
+        default=None,
+        help="answer an even grid every N minutes instead of the validator's own start times. A "
+        "cadence that divides an hour puts every prompt on the round hour",
+    )
+    ap.add_argument(
+        "--latest-formula",
+        action="store_true",
+        help="score every crypto-1h prompt with the volatility term, as prompts are scored now, "
+        "including those scored before it went live. Field ranks before that day then compare "
+        "two formulas; CRPS does not",
+    )
+    ap.add_argument("--keep-predictions", action="store_true", help="keep this run's prediction files")
     args = ap.parse_args()
+    require_offline_bundle()
     ensure_workspace_cwd()
     end = datetime.fromisoformat(args.eval_end).replace(tzinfo=timezone.utc)
-    check_backtest_padding(args.asset, end, args.time_length)
-    start = end - timedelta(days=args.days)
+    times = prompt_times(
+        args.asset, end, args.days, args.time_length, args.time_increment, cadence_minutes=args.cadence_minutes
+    )
     # the context reaches back 7 days before the first prompt: coverage must extend that far
-    check_snapshot_coverage(args.asset, start - timedelta(minutes=CONTEXT_MINUTES), end)
-    n = generate(
-        args.asset,
-        start,
-        end,
-        time_increment=args.time_increment,
-        time_length=args.time_length,
-        num_simulations=args.num_simulations,
-    )
-    print(f"predictions generated: {n}")
-    result = backtest(
-        miner_name="campaign",
-        asset=args.asset,
-        time_length=args.time_length,
-        time_increment=args.time_increment,
-        n_backtest_days=args.days,
-        predictions_dir=PREDICTIONS_DIR,
-        eval_end=end,
-    )
-    print("summary:", result.summary)
+    check_snapshot_coverage(args.asset, times[0] - timedelta(minutes=CONTEXT_MINUTES), end)
+    PREDICTIONS_ROOT.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(tempfile.mkdtemp(prefix="run-", dir=PREDICTIONS_ROOT))
+    try:
+        n = generate(
+            args.asset,
+            times,
+            out_dir,
+            time_increment=args.time_increment,
+            time_length=args.time_length,
+            num_simulations=args.num_simulations,
+        )
+        print(f"predictions generated: {n}")
+        result = backtest(
+            miner_name="campaign",
+            asset=args.asset,
+            time_length=args.time_length,
+            time_increment=args.time_increment,
+            n_backtest_days=args.days,
+            predictions_dir=out_dir,
+            eval_end=end,
+            latest_formula=args.latest_formula,
+            match_tolerance_minutes=args.cadence_minutes or PREDICTION_MATCH_TOLERANCE_MINUTES,
+        )
+        print("summary:", result.summary)
+    finally:
+        if args.keep_predictions:
+            print(f"predictions kept in {out_dir}")
+        else:
+            shutil.rmtree(out_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

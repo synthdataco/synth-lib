@@ -5,17 +5,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from synth_lib.benchmark.budget import BudgetStatus, BudgetTracker, Phase
 from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
 from synth_lib.benchmark.cli_adapters import CLIAdapter
+from synth_lib.benchmark.gpu_usage import GpuUsage
 from synth_lib.benchmark.nomination import probe_simulate_subprocess
 
 INITIAL_PROMPT = "Read the CAMPAIGN.md file in your agent folder and start your research campaign."
@@ -32,12 +34,22 @@ LANDING_PROMPT = (
     "IMMEDIATE LANDING ORDER: run NO new experiments. Finalize agent/journal.md, "
     "write agent/report.md, write the agent/CHAMPION file, commit all your work, That's it."
 )
+GPU_PROMPT = (
+    "Your nomination does not stand yet: this campaign accepts a champion only after {required:g} minutes "
+    "of GPU work, and the harness has metered {busy:.0f}. Train your model on the GPU, then nominate "
+    "again. BUDGET.md shows the count."
+)
+# How many times a nomination short of min_gpu_minutes is handed back before it stands anyway.
+MAX_GPU_RELAUNCHES = 3
 DELIVERABLES = ("report.md", "journal.md", "CHAMPION", "suggestions.md")
 # A safety classifier can decline a turn and the API can serve it from a different model instead.
 # Routing is then sticky for about an hour, so one declined turn can hand the rest of a leg to a
 # model the campaign never chose — and the transcript is the only place it shows. A leg whose
 # champion came from a substitute model does not measure the model on the panel.
 FALLBACK_MARKER = b"model_refusal_fallback"
+# Under artifacts_dir: each Claude Code session's workflow records and subagent transcripts, copied from
+# the run's HOME, where they are not part of the stream-json transcript.
+SESSIONS_DIR = "sessions"
 
 
 @dataclass
@@ -52,6 +64,22 @@ class RunResult:
     # Models that served a turn in place of the one asked for. Non-empty means this leg does not
     # measure the model on the panel.
     substituted_models: tuple[str, ...] = ()
+    # GPU-busy minutes and peak device memory the driver metered; None without a meter.
+    gpu_busy_minutes: float | None = None
+    gpu_peak_memory_mib: float | None = None
+
+
+def _fallback_models(node: object) -> Iterator[str]:
+    """Every `fallback_model` value in a transcript event, at any depth."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "fallback_model" and value:
+                yield str(value)
+            else:
+                yield from _fallback_models(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _fallback_models(item)
 
 
 class ModelRun:
@@ -92,6 +120,8 @@ class ModelRun:
         ]
         self._transcripts = max(existing, default=-1) + 1
         self._probe_note = ""
+        self.gpu = GpuUsage() if cfg.gpu else None
+        self._gpu_relaunches = 0
 
     def _log(self, msg: str) -> None:
         """Operator-facing progress line (lands in the nohup log). The driver used to print
@@ -115,9 +145,14 @@ class ModelRun:
         return proc
 
     def substituted_models(self) -> set[str]:
-        """Models that served a turn in place of the one this leg asked for, from the transcripts."""
+        """Models that served a turn in place of the one this leg asked for, from the transcripts and the
+        subagent transcripts collected under SESSIONS_DIR."""
         served: set[str] = set()
-        for path in sorted(self.artifacts_dir.glob("transcript-*.log")):
+        transcripts = [
+            *sorted(self.artifacts_dir.glob("transcript-*.log")),
+            *sorted(self.artifacts_dir.glob(f"{SESSIONS_DIR}/*/subagents/*.jsonl")),
+        ]
+        for path in transcripts:
             try:
                 blob = path.read_bytes()
             except OSError:
@@ -131,8 +166,7 @@ class ModelRun:
                     event = json.loads(line)
                 except ValueError:
                     continue
-                if name := event.get("fallback_model"):
-                    served.add(str(name))
+                served.update(_fallback_models(event))
         return served
 
     def _launch(self, prompt: str, resume: bool = False) -> subprocess.Popen:
@@ -201,6 +235,21 @@ class ModelRun:
             prompt += " Found CHAMPION at the workspace root — wrong location: move it to agent/CHAMPION now."
         return prompt
 
+    def _notes(self) -> str:
+        """Harness notes for BUDGET.md: the GPU meter, then the interface check once it ran."""
+        gpu = self.gpu.line(self.cfg.min_gpu_minutes) if self.gpu is not None else ""
+        return "\n".join(note for note in (gpu, self._probe_note) if note)
+
+    def _short_of_gpu(self) -> bool:
+        """A nomination made before the campaign's GPU minutes, while it can still be handed back."""
+        return (
+            self.cfg.min_gpu_minutes > 0
+            and self.gpu is not None
+            and self.gpu.available
+            and self.gpu.busy_minutes < self.cfg.min_gpu_minutes
+            and self._gpu_relaunches < MAX_GPU_RELAUNCHES
+        )
+
     def _probe_interface(self, status: BudgetStatus) -> None:
         """Checks the nominated champion's simulate() contract once and logs the result.
         The result is memoized on the instance (self._probe_note): once known, it must stay visible
@@ -213,15 +262,24 @@ class ModelRun:
         # passed ("ok (24h + 1h)"), and that distinction is the whole point of the check — a
         # champion that ignores time_increment passes 24h and breaks on crypto-1h.
         self._probe_note = f"check interface: {msg}"
-        self.tracker.write_budget_file(self.agent_dir, status, notes=self._probe_note)
+        self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
 
     def _handle_exit(
         self, proc: subprocess.Popen, exit_code: int, status: BudgetStatus, crash_resumes: int, voluntary_resumes: int
     ) -> tuple[bool, subprocess.Popen, int, int]:
-        """Decides what happens after the process exits: clean landing, infra outage
-        (wait it out), voluntary stop with no champion (unlimited relaunch, never a crash), or
+        """Decides what happens after the process exits: clean landing (unless the nomination is
+        short of min_gpu_minutes in the normal phase: relaunched, up to MAX_GPU_RELAUNCHES), infra
+        outage (wait it out), voluntary stop with no champion (unlimited relaunch, never a crash), or
         crash (relaunch capped by max_crash_resumes). Returns (done, proc, crash_resumes, voluntary_resumes)."""
         if exit_code == 0 and self._champion() is not None:
+            if status.phase is Phase.NORMAL and self._short_of_gpu():
+                self._gpu_relaunches += 1
+                self._log(
+                    f"champion nominated after {self.gpu.busy_minutes:.0f} of {self.cfg.min_gpu_minutes:g} GPU "
+                    f"minutes: relaunching ({self._gpu_relaunches}/{MAX_GPU_RELAUNCHES})"
+                )
+                prompt = GPU_PROMPT.format(required=self.cfg.min_gpu_minutes, busy=self.gpu.busy_minutes)
+                return False, self._launch(prompt, resume=True), crash_resumes, voluntary_resumes + 1
             self._log("clean landing: process exited with agent/CHAMPION present")
             return True, proc, crash_resumes, voluntary_resumes  # clean landing
         if status.infra_down:
@@ -250,7 +308,7 @@ class ModelRun:
         # BUDGET.md must exist from the very first turn: the constitution promises the agent it
         # can read it from the start, not only after the first poll_seconds sleep.
         status = self.tracker.status()
-        self.tracker.write_budget_file(self.agent_dir, status, notes=self._probe_note)
+        self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
         self._log(
             f"leg start: model={self.model.model} budget=${self.cfg.budget_usd_per_model:.2f} "
             f"deadline={self.cfg.deadline_hours_per_model}h"
@@ -265,7 +323,9 @@ class ModelRun:
         while True:
             time.sleep(self.cfg.poll_seconds)
             status = self.tracker.status()
-            self.tracker.write_budget_file(self.agent_dir, status, notes=self._probe_note)
+            if self.gpu is not None:
+                self.gpu.sample(self.cfg.poll_seconds)
+            self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
             decile = int(max(status.pct_usd, status.pct_time) * 10)
             if decile > last_decile:  # one line per 10% of envelope, not one per poll
                 last_decile = decile
@@ -319,6 +379,13 @@ class ModelRun:
         substituted = tuple(sorted(self.substituted_models()))
         if substituted:
             self._log(f"WARNING: turns were served by {', '.join(substituted)} instead of {self.model.model}")
+        gpu_minutes: float | None = None
+        gpu_peak_mib: float | None = None
+        if self.gpu is not None and self.gpu.available:
+            gpu_minutes, gpu_peak_mib = self.gpu.busy_minutes, self.gpu.peak_memory_mib
+            self._log(f"GPU: {gpu_minutes:.0f} min busy, peak memory {gpu_peak_mib / 1024:.1f} GiB")
+        elif self.gpu is not None:
+            self._log(f"GPU meter off: {self.gpu.error}")
         return RunResult(
             model_id=self.model.id,
             landed=champion is not None,
@@ -328,6 +395,8 @@ class ModelRun:
             landing_relaunches=landing_relaunches,
             final_spend_usd=status.spend_usd,
             substituted_models=substituted,
+            gpu_busy_minutes=gpu_minutes,
+            gpu_peak_memory_mib=gpu_peak_mib,
         )
 
     def _collect(self) -> None:
@@ -337,6 +406,25 @@ class ModelRun:
             if src.exists():
                 (self.artifacts_dir / name).write_bytes(src.read_bytes())
         self._bundle_workspace()
+        self._collect_sessions()
+
+    def _collect_sessions(self) -> None:
+        """Copies each Claude Code session's `workflows/` and `subagents/` out of the run's HOME.
+
+        Workflow agents write their transcripts there, not to the stream the transcript-*.log files
+        hold, and Claude Code deletes them after `cleanupPeriodDays`. Best-effort, like the bundle."""
+        home = self.extra_env.get("HOME")
+        if not home:
+            return
+        for session in sorted(Path(home).glob(".claude/projects/*/*")):
+            for part in ("workflows", "subagents"):
+                src = session / part
+                if not src.is_dir():
+                    continue
+                try:
+                    shutil.copytree(src, self.artifacts_dir / SESSIONS_DIR / session.name / part, dirs_exist_ok=True)
+                except (OSError, shutil.Error) as exc:
+                    print(f"[{self.model.id}] copying {src} FAILED: {exc}", flush=True)
 
     def _bundle_workspace(self) -> None:
         """Archives the workspace git repo alongside the markdown deliverables.

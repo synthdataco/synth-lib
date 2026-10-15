@@ -63,16 +63,18 @@ class ClaudeCodeAdapter(CLIAdapter):
         ]
         if self.spec.effort:
             flags += ["--effort", self.spec.effort]
-        # Settings are per launch: a resumed session has ultracode and the goal hook only if they are passed again.
-        settings = self._settings()
-        if settings:
-            flags += ["--settings", json.dumps(settings)]
+        # Settings are per launch: a resumed session has them only if they are passed again.
+        flags += ["--settings", json.dumps(self._settings())]
         return flags
 
     def _settings(self) -> dict:
-        settings: dict = {}
+        # The leg's model only: a request a safety classifier flags then fails as a refusal instead of
+        # re-running on the classifier's fallback model.
+        settings: dict = {"availableModels": [self.spec.model]}
         if self.spec.ultracode:
             settings["ultracode"] = True
+        if self.spec.workflow_size:
+            settings["workflowSizeGuideline"] = self.spec.workflow_size
         if self.spec.goal:
             # The prompt-based Stop hook that /goal installs; timeout in seconds, the evaluator reads the
             # whole transcript.
@@ -81,14 +83,22 @@ class ClaudeCodeAdapter(CLIAdapter):
         return settings
 
     def env(self) -> dict[str, str]:
-        return {
+        env = {
             "ANTHROPIC_BASE_URL": self.proxy_url,
             "ANTHROPIC_AUTH_TOKEN": self.virtual_key,
-            # Subagents, teammates and workflow agents run on the leg's model, whatever a script names.
+            # Subagents, teammates and workflow agents run on the leg's model, whatever a script names;
+            # the model named here also covers the built-in Explore subagent, which FORCE alone does not.
             "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1",
+            "CLAUDE_CODE_SUBAGENT_MODEL": self.spec.model,
             # 0 = no ceiling: -p otherwise stops waiting for a background workflow after 10 idle minutes.
             "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0",
         }
+        if self.spec.effort:
+            # Over a subagent's own effort, which Claude can otherwise set per agent.
+            env["CLAUDE_CODE_EFFORT_LEVEL"] = self.spec.effort
+        if self.spec.max_workflow_agents:
+            env["CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"] = str(self.spec.max_workflow_agents)
+        return env
 
 
 class CodexAdapter(CLIAdapter):

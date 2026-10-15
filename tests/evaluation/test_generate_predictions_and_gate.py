@@ -84,6 +84,34 @@ def test_context_never_reaches_past_the_prompt(tmp_path):
         assert lo >= t - pd.Timedelta(minutes=CONTEXT_MINUTES)
 
 
+def test_the_close_context_is_the_series_of_closes_with_its_gaps(tmp_path):
+    """The contract before OHLCV: a champion written against it reads context_prices as a Series."""
+    series = _series("2026-07-23", 9)
+    series.iloc[-3000] = np.nan
+    seen: list[pd.Series] = []
+
+    def spy(asset, start_time, time_increment, time_length, num_simulations, context_prices):
+        seen.append(context_prices)
+        steps = time_length // time_increment + 1
+        return (start_time, time_increment, *[[1.0] * steps] * num_simulations)
+
+    generate(
+        spy,
+        "BTC",
+        pd.Timestamp("2026-07-30", tz="UTC"),
+        pd.Timestamp("2026-07-30 01:00", tz="UTC"),
+        _frame(series),
+        tmp_path,
+        cadence_minutes=60,
+        time_increment=300,
+        time_length=86_400,
+        num_simulations=2,
+        context_mode="close",
+    )
+    assert len(seen) == 1 and isinstance(seen[0], pd.Series) and seen[0].name == "close"
+    assert seen[0].isna().sum() == 1, "a gap reaches the champion as NaN, as it did then"
+
+
 def _generate_one_day(tmp_path, window_end="2026-07-30 01:00"):
     return generate(
         load_simulate(SCAFFOLD_MODELING),

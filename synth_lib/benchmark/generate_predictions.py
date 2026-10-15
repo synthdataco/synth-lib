@@ -64,6 +64,11 @@ def context_end(start: pd.Timestamp, time_length: int, issuance_lead: int | None
     return start - pd.Timedelta(seconds=lead + BAR_SECONDS)
 
 
+# What simulate() receives as context_prices: the minute OHLCV frame, or the Series of closes (NaN
+# kept) of the contract before OHLCV, for a champion written against that one.
+CONTEXT_MODES = ("ohlcv", "close")
+
+
 # float32 is what the validator stores miner predictions as, so the field's CRPS was computed at
 # this precision too. It also quarters the cache: a day of crypto-1h is 35 MB instead of 170.
 PATH_DTYPE = "float32"
@@ -158,6 +163,7 @@ def generate_day(
     time_length: int,
     num_simulations: int,
     issuance_lead: int | None = None,
+    context_mode: str = "ohlcv",
 ) -> int:
     """Generate one day's prompts and write the pair. Returns how many were generated, 0 if the
     day was already covered.
@@ -177,6 +183,8 @@ def generate_day(
         context = price_frame.loc[
             t - pd.Timedelta(minutes=CONTEXT_MINUTES) : context_end(t, time_length, issuance_lead)
         ]
+        if context_mode == "close":
+            context = context["close"]
         out = simulate_fn(
             asset=asset,
             start_time=t.isoformat(),
@@ -218,6 +226,7 @@ def generate(
     num_simulations: int = DEFAULT_NUM_SIMULATIONS,
     prompt_times: list[pd.Timestamp] | None = None,
     issuance_lead: int | None = None,
+    context_mode: str = "ohlcv",
 ) -> tuple[int, int]:
     """Returns (generated, reused) prompt counts."""
     by_day: dict[str, list[pd.Timestamp]] = {}
@@ -237,6 +246,7 @@ def generate(
             time_length,
             num_simulations,
             issuance_lead,
+            context_mode,
         )
         generated += made
         reused += 0 if made else len(times)
@@ -268,6 +278,13 @@ def main() -> None:
         f"{ISSUANCE_LEAD_SECONDS})",
     )
     ap.add_argument(
+        "--context",
+        choices=CONTEXT_MODES,
+        default="ohlcv",
+        help="context_prices as the minute OHLCV frame, or as the Series of closes a champion written "
+        "before the OHLCV context expects",
+    )
+    ap.add_argument(
         "--prompt-times",
         type=Path,
         default=None,
@@ -293,6 +310,7 @@ def main() -> None:
         num_simulations=args.num_simulations,
         prompt_times=prompt_times,
         issuance_lead=args.issuance_lead_seconds,
+        context_mode=args.context,
     )
     print(f"{args.asset} tl={args.time_length}: {generated} predictions ({reused} reused)")
 
