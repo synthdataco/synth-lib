@@ -33,6 +33,8 @@ def miner(monkeypatch):
     monkeypatch.setattr(cm, "venue_store", lambda asset: f"store:{asset}")
     monkeypatch.setattr(cm, "FreshTail", lambda asset: None)
     monkeypatch.setattr(ChampionMiner, "_background_refresh", lambda self: None)
+    monkeypatch.setattr(ChampionMiner, "_refresh_calendar", lambda self: None)
+    monkeypatch.setenv(cm.CALENDAR_ENV, "")  # _start sets it; monkeypatch removes it after the test
     monkeypatch.setattr(cm, "serve_request", lambda fn, store, sim_input, tail: (store,))
     miner = object.__new__(ChampionMiner)  # Miner.__init__ needs a wallet, a subtensor and a chain
     miner.release_xau, miner.warmed = release_xau, warmed
