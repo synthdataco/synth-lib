@@ -27,6 +27,7 @@ from synth_lib.benchmark.metering.keys import LiteLLMAdmin
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
 from synth_lib.benchmark.snapshot import build_snapshot, render_data_md
 from synth_lib.benchmark.workspace import create_workspace
+from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 
 SANDBOX_IMAGE = DEFAULT_IMAGE
 SANDBOX_NETWORK = "bridge"
@@ -57,6 +58,13 @@ def offline_bundle_env(snapshot: Path) -> dict[str, str]:
     if not (snapshot / OFFLINE_BUNDLE_DIR).is_dir():
         return {}
     return {OFFLINE_ROOT_ENV: f"{SANDBOX_MARKET_DATA}/{OFFLINE_BUNDLE_DIR}"}
+
+
+def calendar_env(snapshot: Path) -> dict[str, str]:
+    """Point a champion at the calendar the snapshot froze, when it froze one."""
+    if not (snapshot / CALENDAR_DIR / VIEW_FILE).exists():
+        return {}
+    return {CALENDAR_ENV: f"{SANDBOX_MARKET_DATA}/{CALENDAR_DIR}/{VIEW_FILE}"}
 
 
 def require_offline_bundle(snapshot: Path) -> Path:
@@ -241,6 +249,7 @@ def run_all(
                     **adapter.env(),
                     "IS_SANDBOX": "1",
                     **offline_bundle_env(state.dir / "snapshot"),
+                    **calendar_env(state.dir / "snapshot"),
                 },
                 container_name=container_name,
                 memory_gb=cfg.sandbox_memory_gb,

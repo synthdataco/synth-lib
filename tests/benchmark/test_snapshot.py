@@ -2,7 +2,17 @@ import json
 from datetime import date
 from pathlib import Path
 
-from synth_lib.benchmark.snapshot import build_snapshot, verify_snapshot
+import numpy as np
+import pandas as pd
+
+from synth_lib.benchmark.snapshot import build_snapshot, render_data_md, verify_snapshot
+from synth_lib.preparation.event_calendar.events import (
+    CALENDAR_DIR,
+    LEDGER_COLUMNS,
+    LEDGER_FILE,
+    event_frame,
+    write_atomic,
+)
 
 ASSETS = ["BTC", "WTIOIL"]  # WTIOIL deliberately present: it must NEVER be dropped
 
@@ -136,3 +146,92 @@ def test_data_md_omits_the_span_when_nothing_is_cached(tmp_path):
     from synth_lib.benchmark.snapshot import render_data_md
 
     assert "Cached realized paths" not in render_data_md(tmp_path)
+
+
+def _write_ledger(market_data: Path, rows: list[dict]) -> None:
+    frame = pd.DataFrame(rows, columns=LEDGER_COLUMNS)
+    for column in ("time_utc", "as_of", "superseded_at"):
+        frame[column] = pd.to_datetime(frame[column], utc=True)
+    write_atomic(frame, market_data / CALENDAR_DIR / LEDGER_FILE)
+
+
+def _event(time_utc: str, event: str, as_of: str, superseded_at: str | None = None) -> dict:
+    return {
+        "time_utc": time_utc,
+        "event": event,
+        "scope": "all",
+        "detail": "",
+        "source": "test",
+        "as_of": as_of,
+        "superseded_at": superseded_at,
+    }
+
+
+def test_snapshot_freezes_the_calendar_known_at_the_cutoff(tmp_path):
+    """Upcoming dates published by the cutoff are in; one published, or moved away, by then is not."""
+    src = _make_source(tmp_path)
+    _write_ledger(
+        src,
+        [
+            _event("2026-07-10 12:30", "NFP", "2026-06-19"),
+            _event("2026-07-22 12:30", "CPI", "2026-07-01"),  # upcoming at the cutoff, published before it
+            _event("2026-07-29 18:00", "FOMC", "2026-07-16"),  # published the day after the cutoff
+            _event("2026-07-24 12:30", "PPI", "2026-07-01", superseded_at="2026-07-12"),  # moved before it
+            _event("2026-07-30 12:30", "GDP", "2026-07-01", superseded_at="2026-07-20"),  # moved after it
+        ],
+    )
+    dest = tmp_path / "snapshot"
+    manifest = build_snapshot(src, dest, cutoff=date(2026, 7, 15))
+    view = pd.read_parquet(dest / "calendar" / "events.parquet")
+    assert sorted(view["event"]) == ["CPI", "GDP", "NFP"]
+    assert "calendar/events.parquet" in manifest and verify_snapshot(dest)
+
+
+def test_a_rebuilt_snapshot_keeps_its_frozen_calendar(tmp_path):
+    """A setup run again must not change a campaign's inputs, even when the ledger has since gained
+    a backdated row the cutoff would now see."""
+    src = _make_source(tmp_path)
+    _write_ledger(src, [_event("2026-07-10 12:30", "NFP", "2026-06-19")])
+    dest = tmp_path / "snapshot"
+    build_snapshot(src, dest, cutoff=date(2026, 7, 15))
+    frozen = (dest / "calendar" / "events.parquet").read_bytes()
+    _write_ledger(
+        src, [_event("2026-07-10 12:30", "NFP", "2026-06-19"), _event("2026-07-22 12:30", "CPI", "2026-07-01")]
+    )
+    build_snapshot(src, dest, cutoff=date(2026, 7, 15))
+    assert (dest / "calendar" / "events.parquet").read_bytes() == frozen and verify_snapshot(dest)
+
+
+def test_snapshot_without_a_ledger_has_no_calendar(tmp_path):
+    dest = tmp_path / "snapshot"
+    build_snapshot(_make_source(tmp_path), dest, cutoff=date(2026, 7, 15))
+    assert not (dest / "calendar").exists()
+
+
+def test_data_md_measures_the_volatility_after_each_event_type(tmp_path):
+    root = tmp_path / "snapshot"
+    btc = root / "prices" / "BTC" / "1m"
+    btc.mkdir(parents=True)
+    events = [pd.Timestamp(f"2026-07-{day} 12:30", tz="UTC") for day in (8, 17, 26)]  # never a week apart
+    minutes = pd.date_range("2026-07-01", "2026-07-29 23:59", freq="1min", tz="UTC")
+    steps = np.random.default_rng(0).normal(0, 1e-4, len(minutes))
+    for t in events:
+        steps[(minutes >= t) & (minutes < t + pd.Timedelta(hours=1))] *= 4
+    closes = pd.Series(100 * np.exp(np.cumsum(steps)), index=minutes)
+    for day, chunk in closes.groupby(closes.index.date):
+        pd.DataFrame({"timestamp": chunk.index, "close": chunk.to_numpy()}).to_parquet(btc / f"date={day}.parquet")
+    upcoming = pd.Timestamp("2026-08-12 12:30", tz="UTC")
+    write_atomic(
+        event_frame(
+            [{"time_utc": t, "event": "CPI", "scope": "all", "source": "fred:CPI"} for t in [*events, upcoming]]
+        ),
+        root / "calendar" / "events.parquet",
+    )
+
+    md = render_data_md(root)
+    assert "**Scheduled events**" in md and "$SYNTH_BENCHMARK_CALENDAR" in md
+    row = next(line for line in md.splitlines() if line.startswith("| CPI |"))
+    cells = [cell.strip() for cell in row.strip("|").split("|")]
+    assert cells[1:3] == ["3", "1"]  # three before the snapshot's last day, one after
+    assert 3.0 < float(cells[3].rstrip("×")) < 5.0  # crypto: the hour after runs about 4x hotter
+    assert cells[4:] == ["—"] * 4  # the other groups have no prices here

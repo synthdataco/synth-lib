@@ -333,3 +333,23 @@ def test_a_git_install_gives_its_commit(monkeypatch):
 
     monkeypatch.setattr(ws_mod.Distribution, "from_name", lambda _n: _Vcs())
     assert ws_mod._host_synth_lib_rev() == "abc123"
+
+
+def test_the_constitution_states_the_calendar_only_when_the_snapshot_froze_one(tmp_path):
+    cfg = _cfg(tmp_path / "campaigns")
+    without = render_constitution(cfg, cfg.models[0])
+    assert "calendar/events.parquet" not in without and "leave-one-event-out" not in without
+    text = render_constitution(cfg, cfg.models[0], has_calendar=True)
+    assert "`market_data/calendar/events.parquet`" in text and "`$SYNTH_BENCHMARK_CALENDAR`" in text
+    assert "Event dates come only from that calendar" in text
+    assert "leave-one-event-out" in text
+    assert "$calendar" not in text and "$data_cutoff" not in text
+
+
+def test_a_workspace_on_a_snapshot_with_a_calendar_states_it(tmp_path):
+    cfg = _cfg(tmp_path / "campaigns")
+    view = cfg.dir / "snapshot" / "calendar" / "events.parquet"
+    view.parent.mkdir(parents=True)
+    view.write_bytes(b"view")
+    ws = create_workspace(cfg, cfg.models[0])
+    assert "Event dates come only from that calendar" in (ws / "CAMPAIGN.md").read_text()

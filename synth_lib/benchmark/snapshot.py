@@ -6,13 +6,23 @@ import hashlib
 import json
 import os
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from synth_lib.preparation.config import STORE_SUBDIR
+from synth_lib.preparation.event_calendar.events import (
+    CALENDAR_DIR,
+    CALENDAR_ENV,
+    LEDGER_FILE,
+    VIEW_FILE,
+    concerns,
+    known_at,
+    read_ledger,
+    write_atomic,
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -36,7 +46,8 @@ def build_snapshot(source_root: Path, dest_root: Path, cutoff: date, start: date
 
     `start` decouples what is on disk from what a campaign sees: keep 9 months of ingested
     market_data and snapshot only the 2 months a campaign should train on. None = no lower
-    bound, i.e. everything up to the cutoff."""
+    bound, i.e. everything up to the cutoff. A rebuilt snapshot keeps its partitions and its frozen
+    calendar."""
     manifest: dict[str, str] = {}
     for src in sorted(Path(source_root).rglob("date=*.parquet")):
         m = _PARTITION_RE.match(src.name)
@@ -54,6 +65,14 @@ def build_snapshot(source_root: Path, dest_root: Path, cutoff: date, start: date
     if not manifest:
         window = f"in [{start}, {cutoff}]" if start is not None else f"<= {cutoff}"
         raise ValueError(f"no partition {window} under {source_root}")
+    ledger = source_root / CALENDAR_DIR / LEDGER_FILE
+    view = dest_root / CALENDAR_DIR / VIEW_FILE
+    if ledger.exists() and not view.exists():
+        # Known by the end of the cutoff day, the last day of prices the snapshot holds.
+        at = pd.Timestamp(cutoff + timedelta(days=1), tz="UTC") - pd.Timedelta(microseconds=1)
+        write_atomic(known_at(read_ledger(ledger), at), view)
+    if view.exists():
+        manifest[str(view.relative_to(dest_root))] = sha256_file(view)
     (dest_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return manifest
 
@@ -96,7 +115,86 @@ def render_data_md(snapshot_root: Path) -> str:
     lines += _timestamp_lines(store)
     lines += _offline_bundle_lines(snapshot_root / "offline_data")
     lines += _realized_lines(snapshot_root / "realized")
+    lines += _calendar_lines(snapshot_root / CALENDAR_DIR / VIEW_FILE, store)
     return "\n".join(lines) + "\n"
+
+
+# Asset groups the calendar section measures volatility over.
+EVENT_GROUPS = {
+    "crypto": ("BTC", "ETH", "SOL", "XRP", "HYPE"),
+    "stocks": ("NVDAX", "TSLAX", "AAPLX", "GOOGLX", "SPCX"),
+    "XAU": ("XAU",),
+    "WTIOIL": ("WTIOIL",),
+    "SP500": ("SP500",),
+}
+
+
+def _calendar_lines(path: Path, store: Path) -> list[str]:
+    """The scheduled events the snapshot froze at its cutoff, and the volatility each type brought."""
+    if not path.exists():
+        return []
+    view = pd.read_parquet(path)
+    days = sorted(p.name[5:15] for p in store.glob("*/1m/date=*.parquet"))
+    if view.empty or not days:
+        return []
+    end = pd.Timestamp(days[-1], tz="UTC") + pd.Timedelta(days=1)
+    returns = {asset: _abs_returns(store / asset / "1m") for group in EVENT_GROUPS.values() for asset in group}
+    lines = [
+        "",
+        f"**Scheduled events** (`{CALENDAR_DIR}/{VIEW_FILE}`; your champion reads it at `${CALENDAR_ENV}`):",
+        f"{len(view)} events, {view['time_utc'].min():%Y-%m-%d} → {view['time_utc'].max():%Y-%m-%d}: every date",
+        "published by the cutoff, upcoming ones included. Columns: `time_utc`, `event`, `scope` (`all`, or the",
+        "assets it concerns, comma-separated), `detail`, `source`. Times are scheduled New York times in UTC,",
+        "so they move an hour with daylight saving: US macro data at 08:30, FOMC statements at 14:00, the EIA",
+        "petroleum report Wednesdays at 10:30 (holiday weeks differ). Earnings are anchored at the session,",
+        "08:00 before the open and 16:00 after the close; an NYSE closure at the 09:30 open that does not",
+        "happen, an early close at 13:00. A date published or moved after the cutoff is not here.",
+        "",
+        "Volatility in the hour after an event, over the same hour a week before and after, median over the",
+        "snapshot's events of that type (— where the type concerns no asset of the group):",
+        "",
+        "| event | before cutoff | after cutoff | " + " | ".join(EVENT_GROUPS) + " |",
+        "|---|---|---|" + "---|" * len(EVENT_GROUPS),
+    ]
+    for event, rows in view.groupby("event"):
+        past = rows[rows["time_utc"] < end]
+        cells = []
+        for assets in EVENT_GROUPS.values():
+            ratios = [
+                ratio
+                for asset in assets
+                for t in past.loc[concerns(past, asset), "time_utc"]
+                if (ratio := _hour_ratio(returns[asset], t)) is not None
+            ]
+            cells.append(f"{np.median(ratios):.2f}×" if len(ratios) >= 3 else "—")
+        lines.append(f"| {event} | {len(past)} | {len(rows) - len(past)} | " + " | ".join(cells) + " |")
+    return lines
+
+
+def _abs_returns(asset_dir: Path) -> pd.Series:
+    """Absolute 1-minute log returns of an asset's closes, NaN where a minute did not trade."""
+    frames = []
+    for part in sorted(asset_dir.glob("date=*.parquet")):
+        try:
+            frames.append(pd.read_parquet(part, columns=["timestamp", "close"]))
+        except Exception:  # unreadable/placeholder partition
+            continue
+    if not frames:
+        return pd.Series(dtype=float)
+    closes = pd.concat(frames, ignore_index=True)
+    closes["timestamp"] = pd.to_datetime(closes["timestamp"], utc=True)
+    series = closes.set_index("timestamp")["close"].sort_index()
+    return np.log(series.where(series > 0)).diff().abs()
+
+
+def _hour_ratio(returns: pd.Series, t: pd.Timestamp) -> float | None:
+    hour = pd.Timedelta(minutes=59)
+    week = pd.Timedelta(days=7)
+    after = returns.loc[t : t + hour].mean()
+    base = pd.concat([returns.loc[t - week : t - week + hour], returns.loc[t + week : t + week + hour]]).mean()
+    if not (np.isfinite(after) and np.isfinite(base)) or base <= 0:
+        return None
+    return float(after / base)
 
 
 def _coverage_row(asset_dir: Path) -> str | None:

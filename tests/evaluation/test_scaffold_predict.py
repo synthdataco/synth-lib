@@ -14,6 +14,8 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from synth_lib.preparation.event_calendar.events import CALENDAR_ENV, event_frame, write_atomic
+
 SCAFFOLD_PREDICT = (
     Path(__file__).resolve().parents[2] / "synth_lib" / "benchmark" / "scaffold" / "workspace" / "agent" / "predict.py"
 )
@@ -112,3 +114,44 @@ def test_a_grid_is_answered_from_the_grid_point_before_each_prompt(predict, monk
     predict.main()
 
     assert tolerances == [60]
+
+
+def test_the_event_split_compares_event_prompts_with_the_rest(predict, tmp_path, monkeypatch, capsys):
+    events = [
+        {"time_utc": pd.Timestamp("2026-07-14 12:30", tz="UTC"), "event": "CPI", "scope": "all", "source": "fred:CPI"},
+        {"time_utc": pd.Timestamp("2026-07-14 12:40", tz="UTC"), "event": "EARNINGS", "scope": "TSLAX", "source": "x"},
+    ]
+    write_atomic(event_frame(events), tmp_path / "events.parquet")
+    monkeypatch.setenv(CALENDAR_ENV, str(tmp_path / "events.parquet"))
+    first, second = pd.Timestamp("2026-07-14 12:00", tz="UTC"), pd.Timestamp("2026-07-14 14:00", tz="UTC")
+    prompts = pd.DataFrame(
+        {
+            "miner_id": [predict.CANDIDATE_ID, 7, predict.CANDIDATE_ID, 7],
+            "asset": "BTC",
+            "start_time": [first, first, second, second],
+            "scored_time": [first + pd.Timedelta(hours=1)] * 2 + [second + pd.Timedelta(hours=1)] * 2,
+            "crps": [12.0, 10.0, 10.5, 10.0],
+        }
+    )
+    predict.print_event_split(prompts, "BTC", 3600)
+    out = capsys.readouterr().out
+    assert "no event" in out and "+5.00%" in out  # the 14:00 prompt holds no event
+    assert "CPI" in out and "+20.00%" in out  # the 12:00 prompt holds the 12:30 release
+    assert "EARNINGS" not in out  # TSLAX's event, not BTC's
+
+
+def test_the_event_split_of_an_empty_calendar_is_all_no_event(predict, tmp_path, monkeypatch, capsys):
+    write_atomic(event_frame([]), tmp_path / "events.parquet")
+    monkeypatch.setenv(CALENDAR_ENV, str(tmp_path / "events.parquet"))
+    start = pd.Timestamp("2026-07-14 12:00", tz="UTC")
+    prompts = pd.DataFrame(
+        {
+            "miner_id": [predict.CANDIDATE_ID, 7],
+            "asset": "BTC",
+            "start_time": [start, start],
+            "scored_time": [start + pd.Timedelta(hours=1)] * 2,
+            "crps": [12.0, 10.0],
+        }
+    )
+    predict.print_event_split(prompts, "BTC", 3600)
+    assert "no event" in capsys.readouterr().out

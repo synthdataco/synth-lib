@@ -10,6 +10,7 @@ from synth_lib.benchmark.verdict.generate import generate_predictions, prompt_gr
 from synth_lib.benchmark.verdict.evaluate import asset_rank_stats, final_rank, write_verdict
 import synth_lib.benchmark.verdict.run_verdict as rv
 from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES, score
+from synth_lib.preparation.event_calendar.events import CALENDAR_ENV
 
 
 def _flat_simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100, context_prices=None):
@@ -1044,3 +1045,50 @@ def test_each_competition_gets_the_save_order_of_its_time_length(monkeypatch, tm
     )
     assert {tl: order for (tl, _), order in seen.items()} == {86400: day, 3600: hour}
     assert len(seen) == 3
+
+
+def test_generation_hands_the_campaign_calendar_to_every_sandbox(tmp_path, monkeypatch):
+    """The champion gets the view its campaign's agents saw, not the one in the data root."""
+    calendar = tmp_path / "archived" / "events.parquet"
+    calendar.parent.mkdir()
+    calendar.write_bytes(b"the view the agents saw")
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: commands.append(cmd))
+
+    rv.generate_all(
+        clone, tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), gpus=False, limits=(2, 4), seed=7, calendar=calendar
+    )
+
+    assert (clone / "calendar" / "events.parquet").read_bytes() == b"the view the agents saw"
+    assert commands and all(f"{CALENDAR_ENV}=/workspace/calendar/events.parquet" in cmd for cmd in commands)
+    assert all(f"{rv.SEED_ENV}=7" in cmd for cmd in commands)
+
+
+def test_generation_without_a_calendar_points_at_none(tmp_path, monkeypatch):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(rv, "run", lambda cmd, what, env=None: commands.append(cmd))
+    rv.generate_all(tmp_path, tmp_path, tmp_path, ("2026-08-30", "2026-09-09"), gpus=False, limits=(2, 4), seed=7)
+    assert commands and not any(arg.startswith(CALENDAR_ENV) for cmd in commands for arg in cmd)
+
+
+def test_a_calendar_keys_its_own_predictions_cache(tmp_path):
+    """Paths generated with a calendar answer differently; every campaign before calendars keeps its cache."""
+    assert rv.predictions_cache(tmp_path, "abc", 0, True, True) == tmp_path / "abc" / "seed=0" / "live-prompts"
+    keyed = rv.predictions_cache(tmp_path, "abc", 0, True, True, calendar_sha="0123456789abcdef")
+    assert keyed == tmp_path / "abc" / "seed=0" / "live-prompts-calendar-0123456789ab"
+
+
+def test_the_verdict_records_the_calendar(tmp_path):
+    result = {
+        "score": 12.3,
+        "mean_competition_rank": 40,
+        "mean_reward_vs_top": 0.123,
+        "mean_competition_percentile": 0.8,
+        "per_competition": {},
+    }
+    window = ("2026-08-30", "2026-09-09")
+    assert rv.verdict_payload(result, "abc1234", window, 7, None, True)["calendar"] is None
+    calendar = {"sha256": "f" * 64, "events": 120}
+    assert rv.verdict_payload(result, "abc1234", window, 7, None, True, calendar=calendar)["calendar"] == calendar

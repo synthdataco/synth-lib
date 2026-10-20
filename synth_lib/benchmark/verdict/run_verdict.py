@@ -55,7 +55,9 @@ from synth_lib.benchmark.generate_predictions import CONTEXT_MODES
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
+from synth_lib.benchmark.snapshot import sha256_file
 from synth_lib.benchmark.verdict.evaluate import COMPETITIONS, evaluate_candidate, prepare_offline_bundle
+from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 
 GENERATE_SCRIPT = Path(__file__).resolve().parents[1] / "generate_predictions.py"
 SANDBOX_IMAGE = DEFAULT_IMAGE
@@ -167,7 +169,13 @@ def baseline_identity(modeling: Path) -> str:
 
 
 def predictions_cache(
-    root: Path, champion: str, seed: int, live_prompts: bool, lead_in: bool, context_mode: str = "ohlcv"
+    root: Path,
+    champion: str,
+    seed: int,
+    live_prompts: bool,
+    lead_in: bool,
+    context_mode: str = "ohlcv",
+    calendar_sha: str | None = None,
 ) -> Path:
     """Where one champion's generated paths live, across runs.
 
@@ -181,6 +189,8 @@ def predictions_cache(
         mode += "-no-lead-in"
     if context_mode != "ohlcv":
         mode += f"-{context_mode}"
+    if calendar_sha is not None:
+        mode += f"-calendar-{calendar_sha[:12]}"
     return root / champion / f"seed={seed}" / mode
 
 
@@ -228,16 +238,23 @@ def generate_all(
     prompt_starts: dict[tuple[str, int], list[pd.Timestamp]] | None = None,
     cache: Path | None = None,
     context_mode: str = "ohlcv",
+    calendar: Path | None = None,
 ) -> None:
     """One --network none sandbox run per (competition, asset).
 
-    The sandbox inherits nothing from the host, so the seed and the prompt start_times have to be
-    handed to it explicitly — the latter as files in the workspace, since it has no network."""
+    The sandbox inherits nothing from the host, so the seed, the prompt start_times and the calendar
+    have to be handed to it explicitly — the latter two as files in the workspace, since it has no
+    network. The calendar is the campaign's, frozen at its cutoff, not the one in the data root."""
     if not GENERATE_SCRIPT.exists():  # packaging regression: it must ship with the package
         raise FileNotFoundError(f"generation core missing at {GENERATE_SCRIPT}")
     shutil.copy(GENERATE_SCRIPT, workspace / "generate_predictions.py")
     if prompt_starts is not None:
         write_prompt_times(workspace, prompt_starts)
+    env = generation_env(seed)
+    if calendar is not None:
+        (workspace / CALENDAR_DIR).mkdir(exist_ok=True)
+        shutil.copy(calendar, workspace / CALENDAR_DIR / VIEW_FILE)
+        env[CALENDAR_ENV] = f"/workspace/{CALENDAR_DIR}/{VIEW_FILE}"
     for comp in COMPETITIONS:
         for asset in comp.asset_list:
             inner = (
@@ -265,7 +282,7 @@ def generate_all(
                         gpus=gpus,
                         cpus=limits[0],
                         memory_gb=limits[1],
-                        env=generation_env(seed),
+                        env=env,
                         predictions=cache,
                     ),
                     f"generate {asset} tl={comp.time_length}",
@@ -448,6 +465,7 @@ def verdict_payload(
     registrations: dict | None = None,
     engine: str | None = None,
     context_mode: str = "ohlcv",
+    calendar: dict | None = None,
 ) -> dict:
     return {
         "score": result["score"],
@@ -486,6 +504,8 @@ def verdict_payload(
         "engine_rev": engine,
         # What simulate() received as context_prices (generate_predictions.CONTEXT_MODES).
         "context_prices": context_mode,
+        # The event calendar the champion was handed: the one its campaign's agents saw, or None.
+        "calendar": calendar,
     }
 
 
@@ -582,6 +602,13 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
     save_order = window_save_order(bundle, span)
     print(f"{len(record['rows'])} field registrations in {span[0]:%Y-%m-%d} -> {span[1]:%Y-%m-%d}", flush=True)
     engine = engine_rev()
+    calendar = campaign_dir / CALENDAR_DIR / VIEW_FILE
+    calendar_sha = sha256_file(calendar) if calendar.exists() else None
+    calendar_record = (
+        {"sha256": calendar_sha, "events": len(pd.read_parquet(calendar))} if calendar_sha is not None else None
+    )
+    if calendar_record is not None:
+        print(f"calendar: {calendar_record['events']} events, sha256 {calendar_sha[:12]}", flush=True)
 
     legs = args.legs or sorted(p.name for p in campaign_dir.iterdir() if p.is_dir() and (p / "CHAMPION").exists())
     work = Path(tempfile.mkdtemp(prefix=f"verdict-{args.campaign}-"))
@@ -612,7 +639,13 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         )
         print(f"[{leg}] phase 2: generation (--network none)", flush=True)
         cache = predictions_cache(
-            args.predictions_cache, champion.sha, args.seed, args.live_prompts, not args.no_lead_in, args.context
+            args.predictions_cache,
+            champion.sha,
+            args.seed,
+            args.live_prompts,
+            not args.no_lead_in,
+            args.context,
+            calendar_sha,
         )
         generate_all(
             clone,
@@ -626,11 +659,21 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             prompt_starts=prompt_starts,
             cache=cache,
             context_mode=args.context,
+            calendar=calendar if calendar_sha is not None else None,
         )
         print(f"[{leg}] scoring", flush=True)
         result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg, registrations, save_order)
         payload = verdict_payload(
-            result, champion.sha, window, args.seed, sim_reg, args.live_prompts, record, engine, args.context
+            result,
+            champion.sha,
+            window,
+            args.seed,
+            sim_reg,
+            args.live_prompts,
+            record,
+            engine,
+            args.context,
+            calendar_record,
         )
         verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n")
