@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from synth_lib.benchmark.campaign import BaselineSpec, CampaignConfig, ModelSpec
-from synth_lib.benchmark.run_campaign import CampaignState
+from synth_lib.benchmark.run_campaign import CampaignState, calendar_env
+from synth_lib.preparation.event_calendar.events import CALENDAR_ENV
 
 
 def _cfg(root: Path) -> CampaignConfig:
@@ -359,3 +360,11 @@ def test_virtual_key_persisted_and_reused_across_reruns(tmp_path):
     state.save(saved)
     run_all(state, admin=admin, sandboxed=False, fake_env={"FAKE_CLI_TICK_SECONDS": "0.02"}, python_exe=sys.executable)
     assert admin.generated == 1  # pas de second generate_key
+
+
+def test_calendar_env_points_at_the_frozen_view_only_when_there_is_one(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    assert calendar_env(snapshot) == {}
+    (snapshot / "calendar").mkdir(parents=True)
+    (snapshot / "calendar" / "events.parquet").write_bytes(b"view")
+    assert calendar_env(snapshot) == {CALENDAR_ENV: "/workspace/market_data/calendar/events.parquet"}

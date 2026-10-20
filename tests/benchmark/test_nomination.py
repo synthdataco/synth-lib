@@ -13,6 +13,17 @@ BROKEN_MODELING = "def simulate(*a, **k):\n    return (0,)\n"
 
 UNSIZED_MODELING = "def simulate(*a, **k):\n    return (0, 300, *[1] * 5)\n"
 
+CALENDAR_MODELING = """
+import os
+from pathlib import Path
+
+def simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100,
+             context_prices=None):
+    assert Path(os.environ["SYNTH_BENCHMARK_CALENDAR"]).exists()
+    steps = time_length // time_increment + 1
+    return (start_time, time_increment, *[[100.0] * steps for _ in range(num_simulations)])
+"""
+
 SLEEPY_MODELING = """
 import time
 
@@ -149,3 +160,15 @@ def test_probe_all_shapes_rejects_model_hardcoded_to_100_paths(tmp_path):
     ok, msg = probe_all_shapes(tmp_path / "modeling.py")
     assert ok is False
     assert "1000" in msg and "102" in msg, msg  # names both the expected and actual path counts
+
+
+def test_probe_subprocess_hands_the_champion_its_calendar(tmp_path):
+    """A champion that reads its calendar must pass the probe: the probe gets the env it is entitled to."""
+    (tmp_path / "modeling.py").write_text(CALENDAR_MODELING)
+    (tmp_path / "events.parquet").write_bytes(b"view")
+    ok, _ = probe_simulate_subprocess(tmp_path / "modeling.py")
+    assert ok is False
+    ok, msg = probe_simulate_subprocess(
+        tmp_path / "modeling.py", extra_env={"SYNTH_BENCHMARK_CALENDAR": str(tmp_path / "events.parquet")}
+    )
+    assert ok is True, msg

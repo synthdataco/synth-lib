@@ -12,6 +12,10 @@ Works on every asset, including the ones whose minutes do not all trade. Prices 
 same lenient path the scored evaluation uses, so a NaN close reaches simulate() rather than
 stopping the run — your model must tolerate them (drop, never interpolate).
 
+When the snapshot carries an event calendar ($SYNTH_BENCHMARK_CALENDAR), the summary is followed by
+your gap to each prompt's best miner, over the prompts whose horizon holds an event of each type and
+over those that hold none: where an event costs you, that gap is wider.
+
 --num-simulations defaults to 1000, matching the validator's real serving size
 (PromptConfig.num_simulations). Lowering it (e.g. for a quick local iteration loop) speeds up
 generation at the cost of a slightly pessimistic CRPS: empirical CRPS is biased upward for
@@ -35,6 +39,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from synth_lib.backtester.config import PREDICTION_MATCH_TOLERANCE_MINUTES
@@ -42,6 +47,7 @@ from synth_lib.backtester.loading import get_miner_scores
 from synth_lib.backtester.orchestration import backtest
 from synth_lib.benchmark.generate_predictions import context_end, load_minute_prices
 from synth_lib.preparation.config import STORE_SUBDIR
+from synth_lib.preparation.event_calendar.events import CALENDAR_ENV, concerns
 
 # All paths are resolved from the location of THIS file, never from the cwd: the
 # script therefore works whether launched from the workspace root (`uv run agent/predict.py`)
@@ -57,6 +63,8 @@ CONTEXT_MINUTES = 7 * 24 * 60
 PREDICTIONS_ROOT = WORKSPACE / "miner_outputs" / "campaign"
 # Must match synth_lib.backtester.config._OFFLINE_ENV_VAR.
 OFFLINE_ROOT_ENV = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
+# backtest()'s default miner_id: the rows of prompt_df that are yours.
+CANDIDATE_ID = 999
 
 
 def ensure_workspace_cwd() -> None:
@@ -179,6 +187,37 @@ def generate(
     return len(times)
 
 
+def print_event_split(prompts: pd.DataFrame, asset: str, time_length: int) -> None:
+    """Your gap to each prompt's best miner, over the prompts whose horizon holds an event of each type
+    and over the prompts that hold none."""
+    path = Path(os.environ[CALENDAR_ENV])
+    if not path.exists():
+        return
+    view = pd.read_parquet(path)
+    view = view[concerns(view, asset)]
+    scored = prompts[prompts["crps"] > 0]  # -1 marks a prompt the backtester could not score
+    best = scored.groupby(["asset", "scored_time"])["crps"].min().rename("best")
+    ours = scored[scored["miner_id"] == CANDIDATE_ID].join(best, on=["asset", "scored_time"])
+    if ours.empty:
+        return
+    gap = ours["crps"].to_numpy() / ours["best"].to_numpy() - 1
+    starts = pd.to_datetime(ours["start_time"], utc=True).dt.tz_localize(None).to_numpy()
+    ends = starts + np.timedelta64(time_length, "s")
+    spans_any = np.zeros(len(ours), dtype=bool)
+    lines = []
+    for event, rows in view.groupby("event"):
+        times = np.sort(pd.to_datetime(rows["time_utc"], utc=True).dt.tz_localize(None).to_numpy())
+        at = np.searchsorted(times, starts)
+        spans = (at < len(times)) & (times[np.minimum(at, len(times) - 1)] < ends)
+        spans_any |= spans
+        if spans.any():
+            lines.append(f"  {event:<17} {spans.sum():5d} prompts  gap {gap[spans].mean():+.2%}")
+    if not spans_any.all():
+        lines.insert(0, f"  {'no event':<17} {(~spans_any).sum():5d} prompts  gap {gap[~spans_any].mean():+.2%}")
+    print("event split (mean gap to each prompt's best miner):")
+    print("\n".join(lines))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--asset", default="BTC")
@@ -242,6 +281,8 @@ def main() -> None:
             match_tolerance_minutes=args.cadence_minutes or PREDICTION_MATCH_TOLERANCE_MINUTES,
         )
         print("summary:", result.summary)
+        if os.environ.get(CALENDAR_ENV):
+            print_event_split(result.prompt_df, args.asset, args.time_length)
     finally:
         if args.keep_predictions:
             print(f"predictions kept in {out_dir}")

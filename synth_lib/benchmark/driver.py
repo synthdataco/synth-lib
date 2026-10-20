@@ -19,6 +19,7 @@ from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
 from synth_lib.benchmark.cli_adapters import CLIAdapter
 from synth_lib.benchmark.gpu_usage import GpuUsage
 from synth_lib.benchmark.nomination import probe_simulate_subprocess
+from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 
 INITIAL_PROMPT = "Read the CAMPAIGN.md file in your agent folder and start your research campaign."
 RESUME_PROMPT = (
@@ -257,7 +258,12 @@ class ModelRun:
         Out-of-process with a timeout (see synth_lib.benchmark.nomination.probe_simulate_subprocess): the
         nominated champion is untrusted code — running it in-process would expose the host env, and
         a blocking simulate() would freeze run() entirely."""
-        ok, msg = probe_simulate_subprocess(self.agent_dir / "modeling.py", python_exe=self.python_exe)
+        calendar = self.cfg.dir / "snapshot" / CALENDAR_DIR / VIEW_FILE
+        ok, msg = probe_simulate_subprocess(
+            self.agent_dir / "modeling.py",
+            python_exe=self.python_exe,
+            extra_env={CALENDAR_ENV: str(calendar.resolve())} if calendar.exists() else None,
+        )
         # Surface msg on success too, not a bare "OK": probe_all_shapes reports WHICH formats
         # passed ("ok (24h + 1h)"), and that distinction is the whole point of the check — a
         # champion that ignores time_increment passes 24h and breaks on crypto-1h.

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
 from synth_lib.benchmark.constitution import render_constitution
+from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, VIEW_FILE
 
 SCAFFOLD_DIR = Path(__file__).parent / "scaffold" / "workspace"
 
@@ -141,7 +142,8 @@ def create_workspace(cfg: CampaignConfig, model: ModelSpec, data_md: str | None 
         _add_gpu_dependency(ws / "pyproject.toml")
     (ws / "agent" / "journal.md").write_text("")
     (ws / "agent" / "suggestions.md").write_text("")
-    constitution = render_constitution(cfg, model)
+    has_calendar = (cfg.dir / "snapshot" / CALENDAR_DIR / VIEW_FILE).exists()
+    constitution = render_constitution(cfg, model, has_calendar=has_calendar)
     # Agents look at the workspace root first — the copy inside agent/ remains the reference
     # for the driver/deliverables.
     (ws / "CAMPAIGN.md").write_text(constitution)

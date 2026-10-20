@@ -127,6 +127,7 @@ def probe_simulate_subprocess(
     modeling_path: Path,
     timeout_s: float = 120.0,
     python_exe: str = sys.executable,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """Like probe_simulate, but out-of-process with a hard timeout.
 
@@ -136,7 +137,8 @@ def probe_simulate_subprocess(
     budget/deadline polling would no longer be running. So we launch
     `python -m synth_lib.benchmark.nomination <modeling_path>` in a subprocess with a MINIMAL environment
     (PATH/HOME/VIRTUAL_ENV only, never the full os.environ: the champion's code must not see the
-    host's secrets) and a hard timeout.
+    host's secrets) and a hard timeout. `extra_env` adds what the champion is entitled to, such as
+    the path of the snapshot's calendar.
 
     Honest note: this does NOT cut off the network — real network isolation comes with the
     sandbox wiring (Task 14), which launches this same probe via `docker --network none`.
@@ -145,6 +147,7 @@ def probe_simulate_subprocess(
         "PATH": os.environ["PATH"],
         "HOME": os.environ.get("HOME", "/tmp"),
         "VIRTUAL_ENV": os.environ.get("VIRTUAL_ENV", ""),
+        **(extra_env or {}),
     }
     try:
         result = subprocess.run(

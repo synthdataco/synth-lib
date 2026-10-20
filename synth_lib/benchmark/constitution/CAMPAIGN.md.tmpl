@@ -144,7 +144,7 @@ horizon before the window and yours is never treated as late.
   `_price_store`). From a subfolder it would find nothing and would try to download the missing
   days — which the read-only mount refuses. `predict.py` already forces this directory and
   checks coverage before scoring; if you write your own evaluation script, reproduce these two
-  safeguards.
+  safeguards.$calendar_data
 - **synth-lib** (installed; public source: github.com/synthdataco/synth-lib): the official
   backtester — `from synth_lib.backtester.orchestration import backtest` — which computes CRPS with
   the validator's exact CRPS function, and can also place you among the recorded field. Use it
@@ -211,7 +211,7 @@ horizon before the window and yours is never treated as late.
    dashboard) for times after $data_cutoff is lookahead into your own evaluation window and
    invalidates the result. Audited on your transcript.
 2. **Prices = snapshot only.** No fetching market data online (price APIs, exchanges,
-   aggregators). The web is for knowledge only. Audited on your transcript.
+   aggregators). The web is for knowledge only. Audited on your transcript.$calendar_rule
 3. **Scoring = synth-lib.** Every CRPS evaluation goes through `synth_lib.backtester`
    (via `agent/predict.py`). One implementation of the metric is what makes results comparable.
 4. Not allowed: falsifying the journal or results; reproducing another participant's served
@@ -278,7 +278,7 @@ by the snapshot. Lessons earlier agents paid for:
   predictive power. Range estimators, volume, trade counts and the leverage effect act on future
   volatility through realized volatility, which the EWMA has already priced. What it cannot hold
   is information outside the context: the calendar, and anything older than the 7 days
-  `simulate()` receives.
+  `simulate()` receives.$calendar_method
 - **Check what `simulate()` can see before building on it**: one asset's 7-day context per
   call, nothing else. A feature that needs another asset's current prices cannot be served.
 - **Count the asset-window cells where a change helps**, across disjoint windows, not only its
