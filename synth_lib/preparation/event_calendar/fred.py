@@ -6,6 +6,7 @@ FRED lists every scheduled date of a release, past and published-ahead. It needs
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pandas as pd
@@ -13,6 +14,8 @@ import requests
 
 from synth_lib.preparation.config import venue_session
 from synth_lib.preparation.event_calendar.events import ALL_ASSETS, event_frame, new_york
+
+logger = logging.getLogger(__name__)
 
 FRED_URL = "https://api.stlouisfed.org/fred"
 KEY_ENV = "FRED_API_KEY"
@@ -42,30 +45,36 @@ def parse_release_dates(payload: dict) -> list[date]:
 
 
 def fetch(start: date, end: date, api_key: str, session: requests.Session | None = None) -> dict[str, pd.DataFrame]:
-    """One source per release, `fred:<event>`, so that a change to one is judged on its own."""
+    """One source per release, `fred:<event>`, so that a change to one is judged on its own. A release
+    that fails is logged and left out: its rows are kept as they were and the others still update."""
     session = session or venue_session()
     out = {}
     for event, (release_id, expected) in RELEASES.items():
-        params = {"release_id": release_id, "api_key": api_key}
-        name = _get(session, "release", params)["releases"][0]["name"]
-        if expected.lower() not in name.lower():
-            raise ValueError(f"FRED release {release_id} is {name!r}, not {expected!r}")
-        payload = _get(
-            session,
-            "release/dates",
-            {
-                **params,
-                "realtime_start": start.isoformat(),
-                "realtime_end": "9999-12-31",
-                "include_release_dates_with_no_data": "true",
-                "sort_order": "asc",
-                "limit": 10000,
-            },
-        )
         source = f"fred:{event}"
+        params = {"release_id": release_id, "api_key": api_key}
+        try:
+            name = _get(session, "release", params)["releases"][0]["name"]
+            if expected.lower() not in name.lower():
+                raise ValueError(f"FRED release {release_id} is {name!r}, not {expected!r}")
+            payload = _get(
+                session,
+                "release/dates",
+                {
+                    **params,
+                    "realtime_start": start.isoformat(),
+                    "realtime_end": "9999-12-31",
+                    "include_release_dates_with_no_data": "true",
+                    "sort_order": "asc",
+                    "limit": 10000,
+                },
+            )
+            days = parse_release_dates(payload)
+        except Exception as exc:  # one release down must not stop the others
+            logger.warning("%s: fetch failed (%s); its rows are kept as they were", source, exc)
+            continue
         rows = [
             {"time_utc": new_york(day, 8, 30), "event": event, "scope": ALL_ASSETS, "detail": "", "source": source}
-            for day in parse_release_dates(payload)
+            for day in days
             if start <= day <= end
         ]
         out[source] = event_frame(rows)

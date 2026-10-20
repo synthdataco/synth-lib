@@ -45,9 +45,10 @@ def _fred(start: date, end: date) -> dict[str, pd.DataFrame]:
 
 
 SOURCES: dict[str, Callable[[date, date], dict[str, pd.DataFrame]]] = {
+    # First: it needs no network, so a refresh writes a view as soon as it starts.
+    "nyse": nyse.fetch,
     "fred": _fred,
     "fomc": fomc.fetch,
-    "nyse": nyse.fetch,
     "eia": eia.fetch,
     "earnings": earnings.fetch,
 }
@@ -63,7 +64,8 @@ def update(
 ) -> pd.DataFrame:
     """Merges each source's fetch of [start, end] into the ledger under `root`; returns the view at `now`.
 
-    A source that fails, comes back empty or is refused is logged as a warning."""
+    The ledger and the view are written after each source, so a reader has the sources done so far
+    while slower ones run. A source that fails, comes back empty or is refused is logged as a warning."""
     ledger_path = root / CALENDAR_DIR / LEDGER_FILE
     ledger = read_ledger(ledger_path)
     # Every event falls on the same day in New York and in UTC, so whole UTC days bound the fetch.
@@ -81,10 +83,9 @@ def update(
                 logger.warning("%s; its rows are kept as they were", exc)
                 continue
             logger.info("%s: %d events, %d new, %d superseded", source, len(rows), added, superseded)
-    write_atomic(ledger, ledger_path)
-    view = known_at(ledger, now)
-    write_atomic(view, root / CALENDAR_DIR / VIEW_FILE)
-    return view
+        write_atomic(ledger, ledger_path)
+        write_atomic(known_at(ledger, now), root / CALENDAR_DIR / VIEW_FILE)
+    return known_at(ledger, now)
 
 
 def main() -> None:

@@ -156,5 +156,5 @@ def known_at(ledger: pd.DataFrame, at: pd.Timestamp) -> pd.DataFrame:
 
 
 def concerns(view: pd.DataFrame, asset: str) -> pd.Series:
-    """Rows of the view whose scope includes `asset`."""
-    return view["scope"].map(lambda scope: scope == ALL_ASSETS or asset in scope.split(","))
+    """Rows of the view whose scope includes `asset`, as a boolean mask, also on an empty view."""
+    return view["scope"].map(lambda scope: scope == ALL_ASSETS or asset in scope.split(",")).astype(bool)

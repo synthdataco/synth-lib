@@ -157,6 +157,11 @@ class TestConcerns:
         assert list(concerns(view, "SP500")) == [True, False, True]
         assert list(concerns(view, "BTC")) == [True, False, False]
 
+    def test_an_empty_view_gives_a_boolean_mask(self):
+        view = event_frame([])
+        mask = concerns(view, "BTC")
+        assert mask.dtype == bool and list(view[mask].columns) == list(view.columns)
+
 
 class TestNyse:
     def test_holidays_match_the_exchange_calendar(self):
@@ -248,16 +253,19 @@ class TestFred:
         dates_call = next(params for url, params in session.calls if url.endswith("/release/dates"))
         assert dates_call["include_release_dates_with_no_data"] == "true"
 
-    def test_a_release_id_naming_another_release_raises(self):
+    def test_a_release_naming_another_one_is_left_out_and_the_others_kept(self, caplog):
         session = FakeSession(self._answer(name_of={10: "Industrial Production"}))
-        with pytest.raises(ValueError, match="not 'Consumer Price Index'"):
-            fred.fetch(date(2026, 10, 1), date(2026, 10, 31), "the-key", session=session)
+        with caplog.at_level(logging.WARNING, logger=fred.__name__):
+            out = fred.fetch(date(2026, 10, 1), date(2026, 10, 31), "the-key", session=session)
+        assert set(out) == {f"fred:{event}" for event in fred.RELEASES if event != "CPI"}
+        assert "fred:CPI: fetch failed (FRED release 10 is 'Industrial Production'" in caplog.text
 
-    def test_an_http_error_never_carries_the_key(self):
+    def test_an_http_error_never_carries_the_key(self, caplog):
         session = FakeSession(self._answer(status=400))
-        with pytest.raises(RuntimeError) as raised:
-            fred.fetch(date(2026, 10, 1), date(2026, 10, 31), "the-secret-key", session=session)
-        assert "the-secret-key" not in str(raised.value)
+        with caplog.at_level(logging.WARNING, logger=fred.__name__):
+            out = fred.fetch(date(2026, 10, 1), date(2026, 10, 31), "the-secret-key", session=session)
+        assert out == {} and "HTTP 400" in caplog.text
+        assert "the-secret-key" not in caplog.text
 
 
 EIA_PAGE = """
@@ -362,6 +370,18 @@ class TestBuild:
             view = build.update(tmp_path, date(2026, 10, 1), date(2026, 12, 31), self.NOW)
         assert len(view) == 3 and any("refusing" in r.getMessage() for r in caplog.records)
         assert read_ledger(tmp_path / CALENDAR_DIR / LEDGER_FILE)["superseded_at"].isna().all()
+
+    def test_the_view_is_on_disk_before_the_next_source_runs(self, tmp_path, monkeypatch):
+        assert next(iter(build.SOURCES)) == "nyse"  # needs no network
+        seen = []
+
+        def slow(start, end):
+            seen.append((tmp_path / CALENDAR_DIR / VIEW_FILE).exists())
+            return {}
+
+        monkeypatch.setattr(build, "SOURCES", {"nyse": nyse.fetch, "slow": slow})
+        build.update(tmp_path, date(2026, 11, 1), date(2026, 11, 30), self.NOW)
+        assert seen == [True]
 
     def test_a_narrower_fetch_leaves_the_events_past_its_end(self, tmp_path, monkeypatch):
         two = _rows(("2026-10-21 12:30", "CPI"), ("2026-12-10 13:30", "CPI"))

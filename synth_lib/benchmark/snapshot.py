@@ -46,7 +46,8 @@ def build_snapshot(source_root: Path, dest_root: Path, cutoff: date, start: date
 
     `start` decouples what is on disk from what a campaign sees: keep 9 months of ingested
     market_data and snapshot only the 2 months a campaign should train on. None = no lower
-    bound, i.e. everything up to the cutoff."""
+    bound, i.e. everything up to the cutoff. A rebuilt snapshot keeps its partitions and its frozen
+    calendar."""
     manifest: dict[str, str] = {}
     for src in sorted(Path(source_root).rglob("date=*.parquet")):
         m = _PARTITION_RE.match(src.name)
@@ -65,11 +66,12 @@ def build_snapshot(source_root: Path, dest_root: Path, cutoff: date, start: date
         window = f"in [{start}, {cutoff}]" if start is not None else f"<= {cutoff}"
         raise ValueError(f"no partition {window} under {source_root}")
     ledger = source_root / CALENDAR_DIR / LEDGER_FILE
-    if ledger.exists():
+    view = dest_root / CALENDAR_DIR / VIEW_FILE
+    if ledger.exists() and not view.exists():
         # Known by the end of the cutoff day, the last day of prices the snapshot holds.
         at = pd.Timestamp(cutoff + timedelta(days=1), tz="UTC") - pd.Timedelta(microseconds=1)
-        view = dest_root / CALENDAR_DIR / VIEW_FILE
         write_atomic(known_at(read_ledger(ledger), at), view)
+    if view.exists():
         manifest[str(view.relative_to(dest_root))] = sha256_file(view)
     (dest_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return manifest

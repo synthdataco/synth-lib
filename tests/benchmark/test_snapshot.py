@@ -187,6 +187,21 @@ def test_snapshot_freezes_the_calendar_known_at_the_cutoff(tmp_path):
     assert "calendar/events.parquet" in manifest and verify_snapshot(dest)
 
 
+def test_a_rebuilt_snapshot_keeps_its_frozen_calendar(tmp_path):
+    """A setup run again must not change a campaign's inputs, even when the ledger has since gained
+    a backdated row the cutoff would now see."""
+    src = _make_source(tmp_path)
+    _write_ledger(src, [_event("2026-07-10 12:30", "NFP", "2026-06-19")])
+    dest = tmp_path / "snapshot"
+    build_snapshot(src, dest, cutoff=date(2026, 7, 15))
+    frozen = (dest / "calendar" / "events.parquet").read_bytes()
+    _write_ledger(
+        src, [_event("2026-07-10 12:30", "NFP", "2026-06-19"), _event("2026-07-22 12:30", "CPI", "2026-07-01")]
+    )
+    build_snapshot(src, dest, cutoff=date(2026, 7, 15))
+    assert (dest / "calendar" / "events.parquet").read_bytes() == frozen and verify_snapshot(dest)
+
+
 def test_snapshot_without_a_ledger_has_no_calendar(tmp_path):
     dest = tmp_path / "snapshot"
     build_snapshot(_make_source(tmp_path), dest, cutoff=date(2026, 7, 15))
