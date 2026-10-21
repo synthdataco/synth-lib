@@ -2,7 +2,6 @@ import json
 from datetime import date
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from synth_lib.benchmark.snapshot import build_snapshot, render_data_md, verify_snapshot
@@ -208,30 +207,26 @@ def test_snapshot_without_a_ledger_has_no_calendar(tmp_path):
     assert not (dest / "calendar").exists()
 
 
-def test_data_md_measures_the_volatility_after_each_event_type(tmp_path):
+def test_data_md_counts_each_event_type_and_the_ones_released_with_it(tmp_path):
     root = tmp_path / "snapshot"
     btc = root / "prices" / "BTC" / "1m"
     btc.mkdir(parents=True)
-    events = [pd.Timestamp(f"2026-07-{day} 12:30", tz="UTC") for day in (8, 17, 26)]  # never a week apart
-    minutes = pd.date_range("2026-07-01", "2026-07-29 23:59", freq="1min", tz="UTC")
-    steps = np.random.default_rng(0).normal(0, 1e-4, len(minutes))
-    for t in events:
-        steps[(minutes >= t) & (minutes < t + pd.Timedelta(hours=1))] *= 4
-    closes = pd.Series(100 * np.exp(np.cumsum(steps)), index=minutes)
-    for day, chunk in closes.groupby(closes.index.date):
-        pd.DataFrame({"timestamp": chunk.index, "close": chunk.to_numpy()}).to_parquet(btc / f"date={day}.parquet")
-    upcoming = pd.Timestamp("2026-08-12 12:30", tz="UTC")
+    for day in ("2026-07-10", "2026-07-15"):
+        minutes = pd.date_range(day, periods=60, freq="1min", tz="UTC")
+        pd.DataFrame({"timestamp": minutes, "close": 100.0}).to_parquet(btc / f"date={day}.parquet")
+    events = [
+        ("2026-07-10 12:30", "GDP"),
+        ("2026-07-10 12:30", "PCE"),
+        ("2026-07-14 12:30", "CPI"),
+        ("2026-08-27 12:30", "GDP"),  # after the snapshot's last day
+        ("2026-08-27 12:30", "PCE"),
+    ]
     write_atomic(
-        event_frame(
-            [{"time_utc": t, "event": "CPI", "scope": "all", "source": "fred:CPI"} for t in [*events, upcoming]]
-        ),
+        event_frame([{"time_utc": pd.Timestamp(t, tz="UTC"), "event": e, "scope": "all"} for t, e in events]),
         root / "calendar" / "events.parquet",
     )
 
     md = render_data_md(root)
-    assert "**Scheduled events**" in md and "$SYNTH_BENCHMARK_CALENDAR" in md
-    row = next(line for line in md.splitlines() if line.startswith("| CPI |"))
-    cells = [cell.strip() for cell in row.strip("|").split("|")]
-    assert cells[1:3] == ["3", "1"]  # three before the snapshot's last day, one after
-    assert 3.0 < float(cells[3].rstrip("×")) < 5.0  # crypto: the hour after runs about 4x hotter
-    assert cells[4:] == ["—"] * 4  # the other groups have no prices here
+    assert "**Scheduled events**" in md and "$SYNTH_BENCHMARK_CALENDAR" in md and "Volatility" not in md
+    assert "| CPI | 1 | 0 | — |" in md
+    assert "| GDP | 1 | 1 | PCE 2/2 |" in md and "| PCE | 1 | 1 | GDP 2/2 |" in md

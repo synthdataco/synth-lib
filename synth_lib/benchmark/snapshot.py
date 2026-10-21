@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -18,7 +19,6 @@ from synth_lib.preparation.event_calendar.events import (
     CALENDAR_ENV,
     LEDGER_FILE,
     VIEW_FILE,
-    concerns,
     known_at,
     read_ledger,
     write_atomic,
@@ -119,18 +119,9 @@ def render_data_md(snapshot_root: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
-# Asset groups the calendar section measures volatility over.
-EVENT_GROUPS = {
-    "crypto": ("BTC", "ETH", "SOL", "XRP", "HYPE"),
-    "stocks": ("NVDAX", "TSLAX", "AAPLX", "GOOGLX", "SPCX"),
-    "XAU": ("XAU",),
-    "WTIOIL": ("WTIOIL",),
-    "SP500": ("SP500",),
-}
-
-
 def _calendar_lines(path: Path, store: Path) -> list[str]:
-    """The scheduled events the snapshot froze at its cutoff, and the volatility each type brought."""
+    """The scheduled events the snapshot froze at its cutoff: how many of each type, and the types
+    released at the same minute."""
     if not path.exists():
         return []
     view = pd.read_parquet(path)
@@ -138,7 +129,6 @@ def _calendar_lines(path: Path, store: Path) -> list[str]:
     if view.empty or not days:
         return []
     end = pd.Timestamp(days[-1], tz="UTC") + pd.Timedelta(days=1)
-    returns = {asset: _abs_returns(store / asset / "1m") for group in EVENT_GROUPS.values() for asset in group}
     lines = [
         "",
         f"**Scheduled events** (`{CALENDAR_DIR}/{VIEW_FILE}`; your champion reads it at `${CALENDAR_ENV}`):",
@@ -150,51 +140,19 @@ def _calendar_lines(path: Path, store: Path) -> list[str]:
         "08:00 before the open and 16:00 after the close; an NYSE closure at the 09:30 open that does not",
         "happen, an early close at 13:00. A date published or moved after the cutoff is not here.",
         "",
-        "Volatility in the hour after an event, over the same hour a week before and after, median over the",
-        "snapshot's events of that type (— where the type concerns no asset of the group):",
+        "Events of each type before and after the snapshot's last day, and the other types released at the",
+        "same minute, whose effects cannot be told apart from it there:",
         "",
-        "| event | before cutoff | after cutoff | " + " | ".join(EVENT_GROUPS) + " |",
-        "|---|---|---|" + "---|" * len(EVENT_GROUPS),
+        "| event | before cutoff | after cutoff | at the same time as |",
+        "|---|---|---|---|",
     ]
+    types_at = view.groupby("time_utc")["event"].agg(set)
     for event, rows in view.groupby("event"):
         past = rows[rows["time_utc"] < end]
-        cells = []
-        for assets in EVENT_GROUPS.values():
-            ratios = [
-                ratio
-                for asset in assets
-                for t in past.loc[concerns(past, asset), "time_utc"]
-                if (ratio := _hour_ratio(returns[asset], t)) is not None
-            ]
-            cells.append(f"{np.median(ratios):.2f}×" if len(ratios) >= 3 else "—")
-        lines.append(f"| {event} | {len(past)} | {len(rows) - len(past)} | " + " | ".join(cells) + " |")
+        shared = Counter(other for t in rows["time_utc"] for other in types_at[t] - {event})
+        same = ", ".join(f"{other} {n}/{len(rows)}" for other, n in sorted(shared.items())) or "—"
+        lines.append(f"| {event} | {len(past)} | {len(rows) - len(past)} | {same} |")
     return lines
-
-
-def _abs_returns(asset_dir: Path) -> pd.Series:
-    """Absolute 1-minute log returns of an asset's closes, NaN where a minute did not trade."""
-    frames = []
-    for part in sorted(asset_dir.glob("date=*.parquet")):
-        try:
-            frames.append(pd.read_parquet(part, columns=["timestamp", "close"]))
-        except Exception:  # unreadable/placeholder partition
-            continue
-    if not frames:
-        return pd.Series(dtype=float)
-    closes = pd.concat(frames, ignore_index=True)
-    closes["timestamp"] = pd.to_datetime(closes["timestamp"], utc=True)
-    series = closes.set_index("timestamp")["close"].sort_index()
-    return np.log(series.where(series > 0)).diff().abs()
-
-
-def _hour_ratio(returns: pd.Series, t: pd.Timestamp) -> float | None:
-    hour = pd.Timedelta(minutes=59)
-    week = pd.Timedelta(days=7)
-    after = returns.loc[t : t + hour].mean()
-    base = pd.concat([returns.loc[t - week : t - week + hour], returns.loc[t + week : t + week + hour]]).mean()
-    if not (np.isfinite(after) and np.isfinite(base)) or base <= 0:
-        return None
-    return float(after / base)
 
 
 def _coverage_row(asset_dir: Path) -> str | None:

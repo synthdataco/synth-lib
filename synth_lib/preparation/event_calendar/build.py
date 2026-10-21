@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable
@@ -37,20 +38,34 @@ logger = logging.getLogger(__name__)
 DAYS_AHEAD = 90
 
 
-def _fred(start: date, end: date) -> dict[str, pd.DataFrame]:
+@dataclass
+class Fetched:
+    """A source's fetch: one frame per source name, and what to record once the ledger holding them is
+    written, given the sources whose merge was refused."""
+
+    frames: dict[str, pd.DataFrame]
+    settle: Callable[[set[str]], None] = lambda refused: None
+
+
+def _fred(start: date, end: date, calendar_dir: Path) -> Fetched:
     api_key = os.environ.get(fred.KEY_ENV)
     if not api_key:
         raise RuntimeError(f"{fred.KEY_ENV} is not set")
-    return fred.fetch(start, end, api_key)
+    return Fetched(fred.fetch(start, end, api_key))
 
 
-SOURCES: dict[str, Callable[[date, date], dict[str, pd.DataFrame]]] = {
+def _earnings(start: date, end: date, calendar_dir: Path) -> Fetched:
+    return Fetched(*earnings.fetch(start, end, settled_file=calendar_dir / earnings.SETTLED_FILE))
+
+
+# Each source fetches the days [start, end]; the calendar directory is where it may keep its own state.
+SOURCES: dict[str, Callable[[date, date, Path], Fetched]] = {
     # First: it needs no network, so a refresh writes a view as soon as it starts.
-    "nyse": nyse.fetch,
+    "nyse": lambda start, end, calendar_dir: Fetched(nyse.fetch(start, end)),
     "fred": _fred,
-    "fomc": fomc.fetch,
-    "eia": eia.fetch,
-    "earnings": earnings.fetch,
+    "fomc": lambda start, end, calendar_dir: Fetched(fomc.fetch(start, end)),
+    "eia": lambda start, end, calendar_dir: Fetched(eia.fetch(start, end)),
+    "earnings": _earnings,
 }
 
 
@@ -72,19 +87,22 @@ def update(
     span = (pd.Timestamp(start, tz="UTC"), pd.Timestamp(end + timedelta(days=1), tz="UTC"))
     for name in sources or list(SOURCES):
         try:
-            fetched = SOURCES[name](start, end)
+            fetched = SOURCES[name](start, end, root / CALENDAR_DIR)
         except Exception as exc:  # a source down must not stop the others
             logger.warning("%s: fetch failed (%s); its rows are kept as they were", name, exc)
             continue
-        for source, rows in fetched.items():
+        refused = set()
+        for source, rows in fetched.frames.items():
             try:
                 ledger, added, superseded = merge(ledger, rows, source, now, span, allow_losses)
             except TruncatedFetch as exc:
                 logger.warning("%s; its rows are kept as they were", exc)
+                refused.add(source)
                 continue
             logger.info("%s: %d events, %d new, %d superseded", source, len(rows), added, superseded)
         write_atomic(ledger, ledger_path)
         write_atomic(known_at(ledger, now), root / CALENDAR_DIR / VIEW_FILE)
+        fetched.settle(refused)
     return known_at(ledger, now)
 
 
