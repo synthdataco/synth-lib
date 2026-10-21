@@ -334,7 +334,7 @@ class TestEarnings:
             )
 
         session = FakeSession(answer)
-        out = earnings.fetch(date(2026, 10, 17), date(2026, 10, 23), session=session, pause_seconds=0)
+        out, _ = earnings.fetch(date(2026, 10, 17), date(2026, 10, 23), session=session, pause_seconds=0)
         assert [params["date"] for _, params in session.calls] == [f"2026-10-{d}" for d in (19, 20, 21, 22, 23)]
         assert set(out) == {"nasdaq:TSLA"} and len(out["nasdaq:TSLA"]) == 1  # no date, no source
 
@@ -343,16 +343,33 @@ class TestEarnings:
         today = date.today()
         past = (today - timedelta(days=40), today - timedelta(days=30))
         first = FakeSession(lambda url, params: FakeResponse({}))
-        earnings.fetch(*past, session=first, pause_seconds=0, settled_file=settled)
-        assert first.calls  # every weekday read once
+        _, commit = earnings.fetch(*past, session=first, pause_seconds=0, settled_file=settled)
+        assert first.calls and not settled.exists()  # nothing is settled before the ledger is written
+        commit(set())
         again = FakeSession(lambda url, params: FakeResponse({}))
-        assert earnings.fetch(*past, session=again, pause_seconds=0, settled_file=settled) == {}
+        assert earnings.fetch(*past, session=again, pause_seconds=0, settled_file=settled)[0] == {}
         assert again.calls == []
         # a day stays unsettled until SETTLE_DAYS after it: the last week and the future are read again
         later = FakeSession(lambda url, params: FakeResponse({}))
         earnings.fetch(past[0], today + timedelta(days=7), session=later, pause_seconds=0, settled_file=settled)
         read = [date.fromisoformat(params["date"]) for _, params in later.calls]
         assert read and min(read) > past[1]
+
+    def test_a_refused_company_keeps_its_days_readable(self, tmp_path):
+        settled = tmp_path / earnings.SETTLED_FILE
+        past = (date.today() - timedelta(days=40), date.today() - timedelta(days=30))
+        report = next(past[0] + timedelta(days=n) for n in range(7) if (past[0] + timedelta(days=n)).weekday() < 5)
+
+        def answer(url, params):
+            tsla = _nasdaq_day({"symbol": "TSLA", "time": "time-after-hours"})
+            return FakeResponse(tsla if params["date"] == report.isoformat() else {})
+
+        out, commit = earnings.fetch(*past, session=FakeSession(answer), pause_seconds=0, settled_file=settled)
+        commit({"nasdaq:TSLA"})
+        again = FakeSession(answer)
+        out, _ = earnings.fetch(*past, session=again, pause_seconds=0, settled_file=settled)
+        assert [params["date"] for _, params in again.calls] == [report.isoformat()]
+        assert set(out) == {"nasdaq:TSLA"}
 
     def test_the_read_logs_its_progress(self, caplog):
         session = FakeSession(lambda url, params: FakeResponse({}))
@@ -375,7 +392,7 @@ class TestBuild:
             {
                 "nyse": build.SOURCES["nyse"],
                 "broken": broken,
-                "empty": lambda start, end, calendar_dir: {"e:src": event_frame([])},
+                "empty": lambda start, end, calendar_dir: build.Fetched({"e:src": event_frame([])}),
             },
         )
         with caplog.at_level(logging.INFO, logger=build.__name__):
@@ -389,9 +406,13 @@ class TestBuild:
 
     def test_a_truncated_fetch_keeps_the_ledger(self, tmp_path, monkeypatch, caplog):
         three = _rows(("2026-10-21 12:30", "CPI"), ("2026-11-10 13:30", "CPI"), ("2026-12-10 13:30", "CPI"))
-        monkeypatch.setattr(build, "SOURCES", {"src": lambda start, end, calendar_dir: {"test:src": three}})
+        monkeypatch.setattr(
+            build, "SOURCES", {"src": lambda start, end, calendar_dir: build.Fetched({"test:src": three})}
+        )
         build.update(tmp_path, date(2026, 10, 1), date(2026, 12, 31), self.NOW)
-        monkeypatch.setattr(build, "SOURCES", {"src": lambda start, end, calendar_dir: {"test:src": three.iloc[:1]}})
+        monkeypatch.setattr(
+            build, "SOURCES", {"src": lambda start, end, calendar_dir: build.Fetched({"test:src": three.iloc[:1]})}
+        )
         with caplog.at_level(logging.WARNING, logger=build.__name__):
             view = build.update(tmp_path, date(2026, 10, 1), date(2026, 12, 31), self.NOW)
         assert len(view) == 3 and any("refusing" in r.getMessage() for r in caplog.records)
@@ -403,7 +424,7 @@ class TestBuild:
 
         def slow(start, end, calendar_dir):
             seen.append((tmp_path / CALENDAR_DIR / VIEW_FILE).exists())
-            return {}
+            return build.Fetched({})
 
         monkeypatch.setattr(build, "SOURCES", {"nyse": build.SOURCES["nyse"], "slow": slow})
         build.update(tmp_path, date(2026, 11, 1), date(2026, 11, 30), self.NOW)
@@ -414,9 +435,35 @@ class TestBuild:
 
         def source(start, end, calendar_dir):
             days = two["time_utc"].dt.date
-            return {"test:src": two[(days >= start) & (days <= end)]}
+            return build.Fetched({"test:src": two[(days >= start) & (days <= end)]})
 
         monkeypatch.setattr(build, "SOURCES", {"src": source})
         build.update(tmp_path, date(2026, 10, 1), date(2026, 12, 31), self.NOW)
         view = build.update(tmp_path, date(2026, 10, 1), date(2026, 11, 30), self.NOW)
         assert len(view) == 2
+
+    def test_a_source_settles_once_the_ledger_holding_its_rows_is_written(self, tmp_path, monkeypatch):
+        rows = _rows(("2026-10-21 12:30", "CPI"))
+        seen = []
+
+        def settle(refused):
+            ledger = read_ledger(tmp_path / CALENDAR_DIR / LEDGER_FILE)
+            seen.append((refused, list(ledger["source"])))
+
+        fetched = build.Fetched({"test:src": rows, "test:empty": event_frame([])}, settle)
+        monkeypatch.setattr(build, "SOURCES", {"src": lambda start, end, calendar_dir: fetched})
+        build.update(tmp_path, date(2026, 10, 1), date(2026, 12, 31), self.NOW)
+        assert seen == [({"test:empty"}, ["test:src"])]
+
+    def test_a_failed_ledger_write_settles_nothing(self, tmp_path, monkeypatch):
+        settled = []
+        fetched = build.Fetched({"test:src": _rows(("2026-10-21 12:30", "CPI"))}, settled.append)
+        monkeypatch.setattr(build, "SOURCES", {"src": lambda start, end, calendar_dir: fetched})
+
+        def disk_full(frame, path):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(build, "write_atomic", disk_full)
+        with pytest.raises(OSError):
+            build.update(tmp_path, date(2026, 10, 1), date(2026, 12, 31), self.NOW)
+        assert settled == []

@@ -4,7 +4,7 @@ Nasdaq gives the day and the session, not the minute: a release before the open 
 08:00 New York, one after the close, or with no session given, at 16:00.
 
 It answers one day per request. A day read more than `SETTLE_DAYS` after it passed is recorded in
-`SETTLED_FILE` beside the ledger and not read again.
+`SETTLED_FILE` beside the ledger, once the ledger holding its rows is written, and not read again.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 import requests
@@ -75,9 +76,13 @@ def fetch(
     session: requests.Session | None = None,
     pause_seconds: float = 0.2,
     settled_file: Path | None = None,
-) -> dict[str, pd.DataFrame]:
+) -> tuple[dict[str, pd.DataFrame], Callable[[set[str]], None]]:
     """Every weekday in [start, end] but the settled ones, one request each. A company with no date
-    in what was read is left out: its rows are kept as they were."""
+    in what was read is left out: its rows are kept as they were.
+
+    Returns the frames and a commit to call once the ledger holding them is written, with the
+    sources whose merge was refused: it records the days read that passed more than `SETTLE_DAYS`
+    ago, except the days of a refused row."""
     session = session or venue_session()
     settled = _read_settled(settled_file)
     span = (start + timedelta(days=n) for n in range((end - start).days + 1))
@@ -92,14 +97,19 @@ def fetch(
         if n % 50 == 0:
             logger.info("nasdaq: %d/%d days read", n, len(days))
         time.sleep(pause_seconds)
-    if settled_file is not None:
-        today = datetime.now(timezone.utc).date()
-        settled |= {day for day in days if day < today - timedelta(days=SETTLE_DAYS)}
-        write_atomic(pd.DataFrame({"day": sorted(day.isoformat() for day in settled)}), settled_file)
     frame = event_frame(rows)
     out = {}
     for asset in TICKERS.values():
         own = frame[frame["scope"] == asset].reset_index(drop=True)
         if not own.empty:
             out[source_of(asset)] = own
-    return out
+
+    def commit(refused: set[str]) -> None:
+        if settled_file is None:
+            return
+        today = datetime.now(timezone.utc).date()
+        held = {t.tz_convert("America/New_York").date() for source in refused for t in out[source]["time_utc"]}
+        done = {day for day in days if day < today - timedelta(days=SETTLE_DAYS) and day not in held}
+        write_atomic(pd.DataFrame({"day": sorted(day.isoformat() for day in settled | done)}), settled_file)
+
+    return out, commit
