@@ -23,9 +23,9 @@ CALENDAR_DATA = """
   events — US macro releases (CPI, NFP, PPI, PCE, retail sales, GDP), FOMC statements, NYSE closures
   and early closes, the EIA weekly petroleum report, and the earnings of the companies behind the
   tokenised stocks — with every date published before your cutoff, upcoming ones included. DATA.md
-  gives its columns, its span and the volatility each event type brought. Your miner gets the same
-  file in production, refreshed daily: read it inside `simulate()` through the env var, never from
-  a copy or a hardcoded path, and expect an event type or a date to be missing."""
+  gives its columns, its span, the count of each type and which share a release minute. Your miner
+  gets the same file in production, refreshed daily: read it inside `simulate()` through the env
+  var, never from a copy or a hardcoded path, and expect an event type or a date to be missing."""
 CALENDAR_RULE = """
    Event dates come only from that calendar: a table typed from memory or fetched from the web goes
    stale and wrong where your miner serves."""
