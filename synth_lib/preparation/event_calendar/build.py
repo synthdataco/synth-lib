@@ -37,20 +37,25 @@ logger = logging.getLogger(__name__)
 DAYS_AHEAD = 90
 
 
-def _fred(start: date, end: date) -> dict[str, pd.DataFrame]:
+def _fred(start: date, end: date, calendar_dir: Path) -> dict[str, pd.DataFrame]:
     api_key = os.environ.get(fred.KEY_ENV)
     if not api_key:
         raise RuntimeError(f"{fred.KEY_ENV} is not set")
     return fred.fetch(start, end, api_key)
 
 
-SOURCES: dict[str, Callable[[date, date], dict[str, pd.DataFrame]]] = {
+def _earnings(start: date, end: date, calendar_dir: Path) -> dict[str, pd.DataFrame]:
+    return earnings.fetch(start, end, settled_file=calendar_dir / earnings.SETTLED_FILE)
+
+
+# Each source fetches the days [start, end]; the calendar directory is where it may keep its own state.
+SOURCES: dict[str, Callable[[date, date, Path], dict[str, pd.DataFrame]]] = {
     # First: it needs no network, so a refresh writes a view as soon as it starts.
-    "nyse": nyse.fetch,
+    "nyse": lambda start, end, calendar_dir: nyse.fetch(start, end),
     "fred": _fred,
-    "fomc": fomc.fetch,
-    "eia": eia.fetch,
-    "earnings": earnings.fetch,
+    "fomc": lambda start, end, calendar_dir: fomc.fetch(start, end),
+    "eia": lambda start, end, calendar_dir: eia.fetch(start, end),
+    "earnings": _earnings,
 }
 
 
@@ -72,7 +77,7 @@ def update(
     span = (pd.Timestamp(start, tz="UTC"), pd.Timestamp(end + timedelta(days=1), tz="UTC"))
     for name in sources or list(SOURCES):
         try:
-            fetched = SOURCES[name](start, end)
+            fetched = SOURCES[name](start, end, root / CALENDAR_DIR)
         except Exception as exc:  # a source down must not stop the others
             logger.warning("%s: fetch failed (%s); its rows are kept as they were", name, exc)
             continue

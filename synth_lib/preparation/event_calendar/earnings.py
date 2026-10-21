@@ -2,18 +2,25 @@
 
 Nasdaq gives the day and the session, not the minute: a release before the open is anchored at
 08:00 New York, one after the close, or with no session given, at 16:00.
+
+It answers one day per request. A day read more than `SETTLE_DAYS` after it passed is recorded in
+`SETTLED_FILE` beside the ledger and not read again.
 """
 
 from __future__ import annotations
 
+import logging
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import requests
 
 from synth_lib.preparation.config import venue_session
-from synth_lib.preparation.event_calendar.events import event_frame, new_york
+from synth_lib.preparation.event_calendar.events import event_frame, new_york, write_atomic
+
+logger = logging.getLogger(__name__)
 
 NASDAQ_URL = "https://api.nasdaq.com/api/calendar/earnings"
 # Nasdaq refuses a client without a browser user agent.
@@ -25,6 +32,9 @@ _HEADERS = {
 TICKERS = {"NVDA": "NVDAX", "TSLA": "TSLAX", "AAPL": "AAPLX", "GOOGL": "GOOGLX", "SPCX": "SPCX"}
 SESSIONS = {"time-pre-market": ("before the open", 8, 0), "time-after-hours": ("after the close", 16, 0)}
 UNKNOWN_SESSION = ("session not given", 16, 0)
+SETTLED_FILE = "nasdaq_settled_days.parquet"
+# How long after a day its listing is taken as final.
+SETTLE_DAYS = 7
 
 
 def parse_day(payload: dict, day: date) -> list[dict]:
@@ -53,19 +63,43 @@ def source_of(asset: str) -> str:
     return f"nasdaq:{ticker}"
 
 
+def _read_settled(path: Path | None) -> set[date]:
+    if path is None or not path.exists():
+        return set()
+    return {date.fromisoformat(day) for day in pd.read_parquet(path)["day"]}
+
+
 def fetch(
-    start: date, end: date, session: requests.Session | None = None, pause_seconds: float = 0.2
+    start: date,
+    end: date,
+    session: requests.Session | None = None,
+    pause_seconds: float = 0.2,
+    settled_file: Path | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """Every weekday in [start, end], one request each."""
+    """Every weekday in [start, end] but the settled ones, one request each. A company with no date
+    in what was read is left out: its rows are kept as they were."""
     session = session or venue_session()
+    settled = _read_settled(settled_file)
+    span = (start + timedelta(days=n) for n in range((end - start).days + 1))
+    weekdays = [day for day in span if day.weekday() < 5]
+    days = [day for day in weekdays if day not in settled]
+    logger.info("nasdaq: %d of %d weekdays in %s .. %s to read, the rest settled", len(days), len(weekdays), start, end)
     rows = []
-    day = start
-    while day <= end:
-        if day.weekday() < 5:
-            response = session.get(NASDAQ_URL, params={"date": day.isoformat()}, headers=_HEADERS, timeout=30)
-            response.raise_for_status()
-            rows += parse_day(response.json(), day)
-            time.sleep(pause_seconds)
-        day += timedelta(days=1)
+    for n, day in enumerate(days, 1):
+        response = session.get(NASDAQ_URL, params={"date": day.isoformat()}, headers=_HEADERS, timeout=30)
+        response.raise_for_status()
+        rows += parse_day(response.json(), day)
+        if n % 50 == 0:
+            logger.info("nasdaq: %d/%d days read", n, len(days))
+        time.sleep(pause_seconds)
+    if settled_file is not None:
+        today = datetime.now(timezone.utc).date()
+        settled |= {day for day in days if day < today - timedelta(days=SETTLE_DAYS)}
+        write_atomic(pd.DataFrame({"day": sorted(day.isoformat() for day in settled)}), settled_file)
     frame = event_frame(rows)
-    return {source_of(asset): frame[frame["scope"] == asset].reset_index(drop=True) for asset in TICKERS.values()}
+    out = {}
+    for asset in TICKERS.values():
+        own = frame[frame["scope"] == asset].reset_index(drop=True)
+        if not own.empty:
+            out[source_of(asset)] = own
+    return out
