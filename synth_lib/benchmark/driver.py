@@ -42,6 +42,13 @@ GPU_PROMPT = (
 )
 # How many times a nomination short of min_gpu_minutes is handed back before it stands anyway.
 MAX_GPU_RELAUNCHES = 3
+INTERFACE_PROMPT = (
+    "Your nomination does not stand yet: the harness called agent/modeling.py's simulate() on both "
+    "prompt formats and got: {check}. Fix it, run no new experiments, and nominate again. BUDGET.md "
+    "shows the check."
+)
+# How many times a nomination that fails the interface check is handed back before it stands anyway.
+MAX_INTERFACE_RELAUNCHES = 1
 DELIVERABLES = ("report.md", "journal.md", "CHAMPION", "suggestions.md")
 # A safety classifier can decline a turn and the API can serve it from a different model instead.
 # Routing is then sticky for about an hour, so one declined turn can hand the rest of a leg to a
@@ -121,6 +128,8 @@ class ModelRun:
         ]
         self._transcripts = max(existing, default=-1) + 1
         self._probe_note = ""
+        self._probe_ok: bool | None = None
+        self._interface_relaunches = 0
         self.gpu = GpuUsage() if cfg.gpu else None
         self._gpu_relaunches = 0
 
@@ -267,14 +276,25 @@ class ModelRun:
         # Surface msg on success too, not a bare "OK": probe_all_shapes reports WHICH formats
         # passed ("ok (24h + 1h)"), and that distinction is the whole point of the check — a
         # champion that ignores time_increment passes 24h and breaks on crypto-1h.
+        self._probe_ok = ok
         self._probe_note = f"check interface: {msg}"
         self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
+
+    def _fails_interface(self, status: BudgetStatus) -> bool:
+        """A nomination whose interface check failed, re-checked as it stands at exit: True while it
+        still fails and can be handed back."""
+        if self._probe_ok is not False:
+            return False
+        self._probe_interface(status)
+        self._log(f"champion re-checked at exit; {self._probe_note}")
+        return self._probe_ok is False and self._interface_relaunches < MAX_INTERFACE_RELAUNCHES
 
     def _handle_exit(
         self, proc: subprocess.Popen, exit_code: int, status: BudgetStatus, crash_resumes: int, voluntary_resumes: int
     ) -> tuple[bool, subprocess.Popen, int, int]:
         """Decides what happens after the process exits: clean landing (unless the nomination is
-        short of min_gpu_minutes in the normal phase: relaunched, up to MAX_GPU_RELAUNCHES), infra
+        short of min_gpu_minutes in the normal phase: relaunched, up to MAX_GPU_RELAUNCHES; or fails
+        the interface check: relaunched, up to MAX_INTERFACE_RELAUNCHES), infra
         outage (wait it out), voluntary stop with no champion (unlimited relaunch, never a crash), or
         crash (relaunch capped by max_crash_resumes). Returns (done, proc, crash_resumes, voluntary_resumes)."""
         if exit_code == 0 and self._champion() is not None:
@@ -285,6 +305,14 @@ class ModelRun:
                     f"minutes: relaunching ({self._gpu_relaunches}/{MAX_GPU_RELAUNCHES})"
                 )
                 prompt = GPU_PROMPT.format(required=self.cfg.min_gpu_minutes, busy=self.gpu.busy_minutes)
+                return False, self._launch(prompt, resume=True), crash_resumes, voluntary_resumes + 1
+            if self._fails_interface(status):
+                self._interface_relaunches += 1
+                self._log(
+                    f"champion fails the interface check: relaunching "
+                    f"({self._interface_relaunches}/{MAX_INTERFACE_RELAUNCHES})"
+                )
+                prompt = INTERFACE_PROMPT.format(check=self._probe_note.removeprefix("check interface: ")[:600])
                 return False, self._launch(prompt, resume=True), crash_resumes, voluntary_resumes + 1
             self._log("clean landing: process exited with agent/CHAMPION present")
             return True, proc, crash_resumes, voluntary_resumes  # clean landing
