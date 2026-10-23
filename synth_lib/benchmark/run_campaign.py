@@ -183,12 +183,21 @@ def run_all(
     sandboxed: bool = True,
     fake_env: dict[str, str] | None = None,
     python_exe: str = "python",
+    legs: list[str] | None = None,
 ) -> list[RunResult]:
+    """Run the campaign's legs in order, skipping those in runs_done; `legs` restricts the run to
+    those ids."""
     cfg = state.cfg
+    unknown = sorted(set(legs or ()) - {m.id for m in cfg.models})
+    if unknown:
+        raise SystemExit(f"--legs names no leg of {cfg.name}: {', '.join(unknown)}")
     data = state.load()
     virtual_keys: dict[str, str] = data.setdefault("virtual_keys", {})
     results: list[RunResult] = []
     for model in cfg.models:
+        if legs is not None and model.id not in legs:
+            print(f"== leg {model.id}: not in --legs, skipping", flush=True)
+            continue
         if model.id in data["runs_done"]:
             print(f"== leg {model.id}: already in runs_done, skipping", flush=True)
             continue
@@ -297,6 +306,7 @@ def main() -> None:
         help="directory containing market_data/ (default: cwd)",
     )
     ap.add_argument("--master-key-env", default="LITELLM_MASTER_KEY")
+    ap.add_argument("--legs", nargs="+", default=None, help="run: only these legs, in the campaign's order")
     args = ap.parse_args()
     cfg = load_campaign(args.campaign)
     state = CampaignState(cfg=cfg, dir=cfg.dir)
@@ -305,7 +315,7 @@ def main() -> None:
     elif args.command == "run":
         require_offline_bundle(state.dir / "snapshot")
         admin = LiteLLMAdmin(cfg.proxy_url, os.environ[args.master_key_env])
-        run_all(state, admin=admin)
+        run_all(state, admin=admin, legs=args.legs)
     elif args.command == "status":
         print(json.dumps(state.load(), indent=2))
     elif args.command == "verdict":
