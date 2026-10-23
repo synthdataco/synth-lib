@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import Callable
@@ -95,6 +96,10 @@ def covered_start_times(index_path: Path, paths_path: Path) -> set[str]:
 
 
 def load_simulate(modeling_path: Path) -> Callable:
+    # A champion imports the modules beside it by name, as when its folder is the script's own.
+    folder = str(modeling_path.resolve().parent)
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
     spec = importlib.util.spec_from_file_location(f"candidate_{modeling_path.parent.name}", modeling_path)
     assert spec is not None and spec.loader is not None  # always true for a .py file path
     module = importlib.util.module_from_spec(spec)

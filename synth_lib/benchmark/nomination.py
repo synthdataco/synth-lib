@@ -72,6 +72,10 @@ def parse_champion(path: Path) -> Champion:
 
 
 def load_simulate(modeling_path: Path):
+    # A champion imports the modules beside it by name, as when its folder is the script's own.
+    folder = str(modeling_path.resolve().parent)
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
     spec = importlib.util.spec_from_file_location(f"champion_{modeling_path.parent.name}", modeling_path)
     assert spec is not None and spec.loader is not None  # always true for a .py file path
     module = importlib.util.module_from_spec(spec)

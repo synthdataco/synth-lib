@@ -195,6 +195,18 @@ def test_load_minute_prices_raises_on_missing_partition(tmp_path):
         )
 
 
+def test_load_simulate_resolves_a_sibling_import(tmp_path):
+    """The verdict runs this script from the workspace root; a champion's imports of the modules
+    beside its modeling.py must still resolve, as they do when it is served."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "modeling.py").write_text(
+        "def simulate(**kwargs):\n    from verdict_sibling import VALUE\n    return VALUE\n"
+    )
+    (agent / "verdict_sibling.py").write_text("VALUE = 42\n")
+    assert load_simulate(agent / "modeling.py")() == 42
+
+
 # -- the miner contract gate (tier 1: synthetic context, validator's own validation) ------------
 
 
