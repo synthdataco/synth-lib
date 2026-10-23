@@ -334,9 +334,9 @@ def _exited_with(run: ModelRun, phase: Phase = Phase.NORMAL) -> tuple[bool, list
     return run._handle_exit(object(), 0, status, 0, 0)[0], launched
 
 
-def _failed_nomination(tmp_path) -> ModelRun:
+def _failed_nomination(tmp_path, spend: float = 1.0) -> ModelRun:
     """A run whose champion failed the interface check when it was nominated."""
-    run = _run(tmp_path, "lands", HoldAdmin(spend=1.0))
+    run = _run(tmp_path, "lands", HoldAdmin(spend=spend))
     (run.agent_dir / "CHAMPION").write_text("sha: abc\nagent_dir: agent\nprofiles: [low]\n")
     (run.agent_dir / "modeling.py").write_text(BROKEN_SIBLING_MODELING)
     run._probe_ok = False
@@ -352,6 +352,14 @@ def test_a_nomination_failing_the_interface_check_is_handed_back_once(tmp_path):
     done, launched = _exited_with(run)
     assert done is True and launched == []  # the second failure stands
     assert "missing_sibling" in (run.agent_dir / "BUDGET.md").read_text()
+
+
+def test_no_hand_back_once_the_envelope_is_spent(tmp_path):
+    """The status handed to _handle_exit predates the re-check: a spent envelope read after it
+    lands the champion as it is instead of starting another session."""
+    run = _failed_nomination(tmp_path, spend=10.0)
+    done, launched = _exited_with(run, Phase.LANDING)
+    assert done is True and launched == []
 
 
 def test_a_champion_fixed_before_exit_stands(tmp_path):

@@ -282,12 +282,15 @@ class ModelRun:
 
     def _fails_interface(self, status: BudgetStatus) -> bool:
         """A nomination whose interface check failed, re-checked as it stands at exit: True while it
-        still fails and can be handed back."""
+        still fails and can be handed back within the envelope."""
         if self._probe_ok is not False:
             return False
         self._probe_interface(status)
         self._log(f"champion re-checked at exit; {self._probe_note}")
-        return self._probe_ok is False and self._interface_relaunches < MAX_INTERFACE_RELAUNCHES
+        if self._probe_ok is not False or self._interface_relaunches >= MAX_INTERFACE_RELAUNCHES:
+            return False
+        # The re-check can take the probe's whole timeout, so the envelope is read again after it.
+        return self.tracker.status().phase is not Phase.EXHAUSTED
 
     def _handle_exit(
         self, proc: subprocess.Popen, exit_code: int, status: BudgetStatus, crash_resumes: int, voluntary_resumes: int
