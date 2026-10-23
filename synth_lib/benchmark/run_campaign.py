@@ -212,7 +212,7 @@ def run_all(
             # leaks exactly max_budget on the /gemini passthrough, so any cap rejects everything
             # after the first call (litellm#27639 — a phantom budget 429). The
             # driver still enforces the real budget — BudgetTracker uses cfg.budget_usd_per_model
-            # and true /key/info spend, never the key's own cap. Cost: no dead-driver backstop
+            # and the key's true spend, never its own cap. Cost: no dead-driver backstop
             # for these legs, until the upstream fix lands.
             cap = None if model.cli in PASSTHROUGH_CLIS else cfg.budget_usd_per_model
             key = admin.generate_key(f"{cfg.name}-{model.id}", cap)
