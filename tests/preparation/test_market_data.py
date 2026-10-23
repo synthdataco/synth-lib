@@ -16,6 +16,7 @@ silently got no data and never answered SPYX prompts.
 
 from __future__ import annotations
 
+import threading
 from datetime import date, datetime, time, timezone
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import requests
 
 from synth.validator.price_data_provider import PriceDataProvider
 from synth_lib.preparation.binance_client import BinanceClient
@@ -32,6 +34,7 @@ from synth_lib.preparation.config import (
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
     OHLCV_COLUMNS,
+    synth_api_session,
 )
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 from synth_lib.preparation.minute_price_store import MinutePriceStore
@@ -134,8 +137,15 @@ class TestIngestSourceLabel:
                 idx = pd.date_range(start, periods=3, freq="1min", tz="UTC")
                 closes = [1.0, 2.0, 3.0]
                 return pd.DataFrame(
-                    {"timestamp": idx, "open": closes, "high": closes, "low": closes,
-                     "close": closes, "volume": 1.0, "trade_count": 1.0}
+                    {
+                        "timestamp": idx,
+                        "open": closes,
+                        "high": closes,
+                        "low": closes,
+                        "close": closes,
+                        "volume": 1.0,
+                        "trade_count": 1.0,
+                    }
                 )
 
         return _Stub()
@@ -162,9 +172,9 @@ def _api_response(payload: dict, status_code: int = 200) -> MagicMock:
 class TestGetRealizedPath:
     """GET /validation/realized-path — per-prompt realized paths."""
 
-    @patch("synth_lib.preparation.validator_api.requests.get")
-    def test_returns_indexed_series(self, mock_get: MagicMock) -> None:
-        mock_get.return_value = _api_response(
+    @patch("synth_lib.preparation.validator_api.synth_api_session")
+    def test_returns_indexed_series(self, mock_session: MagicMock) -> None:
+        mock_session.return_value.get.return_value = _api_response(
             {
                 "start_time": "2026-07-22T17:05:00Z",
                 "asset": "HYPE",
@@ -181,19 +191,21 @@ class TestGetRealizedPath:
         assert series.index[-1] == pd.Timestamp("2026-07-22T17:08:00Z")
         assert float(series.iloc[-1]) == 58.4
 
-    @patch("synth_lib.preparation.validator_api.requests.get")
-    def test_not_found_returns_none_without_raising(self, mock_get: MagicMock) -> None:
+    @patch("synth_lib.preparation.validator_api.synth_api_session")
+    def test_not_found_returns_none_without_raising(self, mock_session: MagicMock) -> None:
         """The endpoint answers 404 for a prompt it has no path for — a normal
         outcome, not an error, so raise_for_status must not be reached."""
-        mock_get.return_value = _api_response({"message": "No realized path available"}, status_code=404)
+        mock_session.return_value.get.return_value = _api_response(
+            {"message": "No realized path available"}, status_code=404
+        )
 
         assert get_realized_path("HYPE", datetime(2026, 3, 25, 2, 39, tzinfo=UTC), 3600, 60) is None
 
-    @patch("synth_lib.preparation.validator_api.requests.get")
-    def test_venue_gaps_come_back_as_nan(self, mock_get: MagicMock) -> None:
+    @patch("synth_lib.preparation.validator_api.synth_api_session")
+    def test_venue_gaps_come_back_as_nan(self, mock_session: MagicMock) -> None:
         """real_prices is nullable: the validator stores None where the venue
         had no candle. Those must survive as NaN, not blow up the parse."""
-        mock_get.return_value = _api_response({"real_prices": [10.0, None, 12.0]})
+        mock_session.return_value.get.return_value = _api_response({"real_prices": [10.0, None, 12.0]})
         series = get_realized_path("WTIOIL", datetime(2026, 7, 22, tzinfo=UTC), 120, 60)
 
         assert series is not None
@@ -201,21 +213,23 @@ class TestGetRealizedPath:
 
 
 class TestGetPromptStartTimes:
-    @patch("synth_lib.preparation.validator_api.requests.get")
-    def test_paginates_and_dedupes(self, mock_get: MagicMock) -> None:
+    @patch("synth_lib.preparation.validator_api.synth_api_session")
+    def test_paginates_and_dedupes(self, mock_session: MagicMock) -> None:
         """The endpoint caps ranges at 60 days, so a 120-day window must page,
         and overlapping pages must not duplicate a start_time."""
-        mock_get.return_value = _api_response({"start_times": ["2026-06-01T00:01:00Z", "2026-06-01T01:03:00Z"]})
+        mock_session.return_value.get.return_value = _api_response(
+            {"start_times": ["2026-06-01T00:01:00Z", "2026-06-01T01:03:00Z"]}
+        )
         starts = get_prompt_start_times(
             "XAU", 86_400, 300, datetime(2026, 4, 1, tzinfo=UTC), datetime(2026, 7, 30, tzinfo=UTC)
         )
 
-        assert mock_get.call_count == 3  # 50 + 50 + 20 days
+        assert mock_session.return_value.get.call_count == 3  # 50 + 50 + 20 days
         assert starts == [pd.Timestamp("2026-06-01T00:01:00Z"), pd.Timestamp("2026-06-01T01:03:00Z")]
 
-    @patch("synth_lib.preparation.validator_api.requests.get")
-    def test_empty_range_returns_empty_list(self, mock_get: MagicMock) -> None:
-        mock_get.return_value = _api_response({"start_times": None})
+    @patch("synth_lib.preparation.validator_api.synth_api_session")
+    def test_empty_range_returns_empty_list(self, mock_session: MagicMock) -> None:
+        mock_session.return_value.get.return_value = _api_response({"start_times": None})
 
         assert (
             get_prompt_start_times(
@@ -223,6 +237,32 @@ class TestGetPromptStartTimes:
             )
             == []
         )
+
+
+class TestSynthApiConnection:
+    """Synth API calls reuse one kept-alive connection per thread and survive a dropped connect."""
+
+    def test_a_thread_keeps_its_session(self) -> None:
+        others: list[object] = []
+        thread = threading.Thread(target=lambda: others.append(synth_api_session()))
+        thread.start()
+        thread.join()
+
+        assert synth_api_session() is synth_api_session()
+        assert others[0] is not synth_api_session()
+
+    @patch("synth_lib.preparation.validator_api.time.sleep")
+    @patch("synth_lib.preparation.validator_api.synth_api_session")
+    def test_a_dropped_connect_is_retried(self, mock_session: MagicMock, mock_sleep: MagicMock) -> None:
+        mock_session.return_value.get.side_effect = [
+            requests.ConnectTimeout("connect timed out"),
+            _api_response({"real_prices": [1.0, 2.0]}),
+        ]
+        series = get_realized_path("BTC", datetime(2026, 10, 14, tzinfo=UTC), 60, 60)
+
+        assert series is not None and series.tolist() == [1.0, 2.0]
+        assert mock_session.return_value.get.call_count == 2
+        assert mock_session.return_value.get.call_args.kwargs["timeout"] == (10, 30)
 
 
 class TestSnapToPromptStart:
@@ -299,9 +339,9 @@ class TestRealizedPathStore:
 
     def test_get_never_hits_the_network(self, tmp_path) -> None:
         """Reads are local-only so offline backtests work off a warmed store."""
-        with patch("synth_lib.preparation.validator_api.requests.get") as mock_get:
+        with patch("synth_lib.preparation.validator_api.synth_api_session") as mock_session:
             assert self._store(tmp_path).get(self.START) is None
-        mock_get.assert_not_called()
+        mock_session.assert_not_called()
 
     @patch("synth_lib.preparation.realized_path_store.time.sleep")
     @patch("synth_lib.preparation.realized_path_store.get_realized_path")
@@ -367,9 +407,7 @@ class TestLegacyPartitions:
         self._close_only(tmp_path, date(2026, 7, 21))
         store = MinutePriceStore("BTC", root=tmp_path, client=None)
         with pytest.raises(ValueError, match="force-refresh"):
-            store.load_range(
-                datetime(2026, 7, 21, 0, 0, tzinfo=UTC), datetime(2026, 7, 21, 0, 5, tzinfo=UTC)
-            )
+            store.load_range(datetime(2026, 7, 21, 0, 0, tzinfo=UTC), datetime(2026, 7, 21, 0, 5, tzinfo=UTC))
 
     def test_generation_loader_names_the_remedy(self, tmp_path) -> None:
         from synth_lib.benchmark.generate_predictions import load_minute_prices
