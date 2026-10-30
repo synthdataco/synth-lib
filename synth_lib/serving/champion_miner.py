@@ -23,7 +23,7 @@ import logging
 import os
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Callable
 
 import pandas as pd
@@ -49,14 +49,12 @@ from synth_lib.serving.serve import (
 logger = logging.getLogger(__name__)
 
 # The champion reads its volatility off the most recent bars, so the age of the newest bar at
-# request time is a scoring cost, not just a cosmetic one. Today's partition is a single venue
-# call, cheap enough to top up every minute; the deep pass that force-refetches WARMUP_DAYS and
-# repairs older gaps stays on its slower cadence.
+# request time is a scoring cost, not just a cosmetic one. Each refresh fetches only the partitions
+# that can still change — today's, and a past day not yet settled — so it runs every minute.
 #
-# Neither runs on the request path. The one venue call there is FreshTail's, for crypto-1h prompts
+# It does not run on the request path. The one venue call there is FreshTail's, for crypto-1h prompts
 # only: no retries, a short timeout, and the stored context when it fails.
-CURRENT_DAY_REFRESH_SECONDS = 60
-REFRESH_INTERVAL_SECONDS = 5 * 60
+REFRESH_SECONDS = 60
 # The served calendar reaches this far back, for a champion that measures the time since an event.
 CALENDAR_HISTORY_DAYS = 45
 CALENDAR_REFRESH_SECONDS = 24 * 3600
@@ -95,18 +93,14 @@ class ChampionMiner(Miner):
             warm_up([asset])
             self._calendar_ready.wait(max(0.0, calendar_deadline - time.monotonic()))
             self._ready.add(asset)
-        logger.info("warm-up complete; refreshing every %d s", CURRENT_DAY_REFRESH_SECONDS)
+        logger.info("warm-up complete; refreshing every %d s", REFRESH_SECONDS)
         self._background_refresh()
 
-    def _refresh_once(self, deep: bool) -> None:
+    def _refresh_once(self) -> None:
         """One pass over every store. A venue outage must not stop the others being refreshed."""
-        today = datetime.now(tz=timezone.utc).date()
         for asset, store in self._stores.items():
             try:
-                if deep:
-                    store.refresh_recent(days=WARMUP_DAYS)
-                else:
-                    store.ingest_day(today, force_refresh=True)
+                store.refresh_recent(days=WARMUP_DAYS)
             except Exception as exc:
                 logger.warning("refresh failed for %s: %s", asset, exc)
 
@@ -131,12 +125,9 @@ class ChampionMiner(Miner):
             time.sleep(CALENDAR_REFRESH_SECONDS)
 
     def _background_refresh(self) -> None:
-        deep_every = max(1, REFRESH_INTERVAL_SECONDS // CURRENT_DAY_REFRESH_SECONDS)
-        tick = 0
         while True:
-            self._refresh_once(deep=tick % deep_every == 0)
-            tick += 1
-            time.sleep(CURRENT_DAY_REFRESH_SECONDS)
+            self._refresh_once()
+            time.sleep(REFRESH_SECONDS)
 
     async def forward_miner(self, synapse: Simulation) -> Simulation:
         simulation_input = synapse.simulation_input

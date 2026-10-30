@@ -121,6 +121,40 @@ class TestNoDataGraceful:
         assert list(df.columns) == ["timestamp", *OHLCV_COLUMNS]
 
 
+class TestZeroTradeMinutes:
+    """Hyperliquid prints a flat candle for a minute without a trade; the trade archive the backtests
+    are built from has no row for it. The client leaves it out, so the minute is NaN in both."""
+
+    @staticmethod
+    def _candle(minute: int, trades: int, close: str = "100") -> dict:
+        return {
+            "t": 1783641600000 + minute * 60_000,  # 2026-07-10 00:00 UTC
+            "o": close,
+            "h": close,
+            "l": close,
+            "c": close,
+            "v": "1" if trades else "0",
+            "n": trades,
+        }
+
+    def _fetch(self, candles: list[dict]) -> pd.DataFrame:
+        with patch("synth_lib.preparation.hyperliquid_client.venue_session") as session:
+            session.return_value.post.return_value = _api_response(candles)
+            return HyperliquidClient().fetch_range(
+                "XAU",
+                datetime(2026, 7, 10, tzinfo=UTC),
+                datetime(2026, 7, 10, 0, 2, tzinfo=UTC),
+            )
+
+    def test_a_minute_without_a_trade_is_left_out(self) -> None:
+        df = self._fetch([self._candle(0, 3), self._candle(1, 0), self._candle(2, 1), self._candle(3, 2)])
+        assert list(df["timestamp"].dt.minute) == [0, 2]
+
+    def test_a_zero_trade_candle_still_proves_the_window_settled(self) -> None:
+        df = self._fetch([self._candle(0, 3), self._candle(1, 1), self._candle(2, 1), self._candle(3, 0)])
+        assert len(df) == 3
+
+
 class TestIngestSourceLabel:
     """ingest_day labels the parquet 'source' by the actual client, so
     HL/Binance-routed assets are not mislabeled 'pyth'."""

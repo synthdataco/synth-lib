@@ -1,10 +1,12 @@
-"""A forced re-fetch must not trade real prices for nothing.
+"""A re-fetch must not trade real prices for nothing, and a settled day is not fetched again.
 
 Venues serve a bounded window of history — Hyperliquid about 5000 minutes. A serving miner that
 force-refreshes its last N days therefore asks for days the venue has dropped, gets an empty
-frame, and writes it over a good partition. The result is 1440 NaN rows marked final, which
-build_context then forward-fills into a flat line: the model reads zero volatility off it and its
-fan collapses. Observed live as nine consecutive empty WTIOIL days in a miner's store.
+frame, and writes it over a good partition: 1440 NaN rows marked final, and the champion's context
+loses those days. Observed live as nine consecutive empty WTIOIL days in a miner's store.
+
+What a day needs is read from its partition: one written while it was still today, or from an empty
+fetch, is fetched again; one fetched complete after it ended never is.
 """
 
 from datetime import date, datetime, timedelta, timezone
@@ -75,3 +77,45 @@ def test_an_unbounded_venue_is_still_refreshed_in_full(tmp_path):
     _store(tmp_path, client).refresh_recent(days=8)
     today = datetime.now(tz=timezone.utc).date()
     assert today - min(client.calls) == timedelta(days=8)
+
+
+def test_a_day_written_while_it_was_today_is_completed_once_it_ends(tmp_path, monkeypatch):
+    """The skip reads the partition's own flag: a day stored partial is fetched again, once."""
+    clock = {"now": datetime(2026, 9, 25, 9, 0, tzinfo=timezone.utc)}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    monkeypatch.setattr("synth_lib.preparation.minute_price_store.datetime", Clock)
+    client = _Client(rows=500)
+    store = _store(tmp_path, client)
+    store.ingest_day(DAY)
+    assert not bool(pd.read_parquet(store.day_path(DAY))["is_final"].iloc[0])
+
+    clock["now"] = datetime(2026, 9, 26, 0, 5, tzinfo=timezone.utc)
+    client.rows = MINUTES_PER_DAY
+    assert _closes(store.ingest_day(DAY)) == MINUTES_PER_DAY
+    store.ingest_day(DAY)
+    assert client.calls == [DAY, DAY], "a settled day was fetched again"
+
+
+def test_an_empty_fetch_of_a_past_day_is_asked_again(tmp_path):
+    client = _Client(rows=0)
+    store = _store(tmp_path, client)
+    store.ingest_day(DAY)
+    client.rows = MINUTES_PER_DAY
+    assert _closes(store.ingest_day(DAY)) == MINUTES_PER_DAY
+
+
+def test_stored_zero_trade_minutes_do_not_block_a_refetch_that_leaves_them_out(tmp_path):
+    """A partition holding flat zero-trade candles has fewer real prices than its closes suggest."""
+    path = _store(tmp_path, _Client(rows=MINUTES_PER_DAY)).ingest_day(DAY, force_refresh=True)
+    frame = pd.read_parquet(path)
+    frame.loc[frame.index[::10], "trade_count"] = 0.0
+    frame.to_parquet(path, index=False)
+
+    traded = _Client(rows=MINUTES_PER_DAY - MINUTES_PER_DAY // 10)
+    written = _store(tmp_path, traded).ingest_day(DAY, force_refresh=True)
+    assert pd.read_parquet(written)["trade_count"].ne(0).all()

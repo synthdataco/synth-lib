@@ -12,7 +12,7 @@ from synth.validator import response_validation_v2  # type: ignore[import-untype
 
 from synth_lib.benchmark.generate_predictions import load_simulate
 from synth_lib.benchmark.verdict.run_verdict import DEFAULT_SEED, HASH_SEED_ENV, SEED_ENV, generation_env
-from synth_lib.serving.serve import serve_request, servable_assets, venue_store, wrap_output
+from synth_lib.serving.serve import build_context, serve_request, servable_assets, venue_store, wrap_output
 from synth_lib.serving.unpack_champion import class_name_for, unpack
 from synth_lib.preparation.binance_client import BinanceClient
 from synth_lib.preparation.minute_price_store import MinutePriceStore
@@ -87,6 +87,32 @@ def test_serve_request_end_to_end(tmp_path):
     store = _store_with(tmp_path, series)
     sim_input = SimulationInput(
         asset="BTC", start_time=t.isoformat(), time_increment=60, time_length=3_600, num_simulations=3
+    )
+    out = serve_request(load_simulate(SCAFFOLD_MODELING), store, sim_input)
+    assert response_validation_v2.validate_responses(out, sim_input, process_time_str="1.0") == "CORRECT"
+
+
+def test_missing_minutes_reach_the_champion_as_nan(tmp_path):
+    """As in the verdict's context: a minute the store has no price for is not filled, and a day the
+    store does not hold leaves the head of the window empty rather than repeating the first price."""
+    series = _series()
+    series.iloc[-100:-90] = np.nan
+    t = series.index[-1]
+    store = _store_with(tmp_path, series.loc[series.index >= t - pd.Timedelta(days=3)])
+    context = build_context(store, t)
+    assert context["close"].isna().sum() == 10 + 4 * 24 * 60
+    assert context.index[0] == t - pd.Timedelta(days=7)
+    assert context["close"].iloc[-1] == series.iloc[-1]
+
+
+def test_serve_request_end_to_end_on_a_context_with_holes(tmp_path):
+    series = _series()
+    series.iloc[: 3 * 24 * 60] = np.nan
+    series.iloc[-100:-90] = np.nan
+    t = series.index[-1]
+    store = _store_with(tmp_path, series)
+    sim_input = SimulationInput(
+        asset="BTC", start_time=t.isoformat(), time_increment=300, time_length=86_400, num_simulations=3
     )
     out = serve_request(load_simulate(SCAFFOLD_MODELING), store, sim_input)
     assert response_validation_v2.validate_responses(out, sim_input, process_time_str="1.0") == "CORRECT"
