@@ -61,7 +61,9 @@ class HyperliquidClient:
         # recoverable, whereas a partial minute written as final is not.
         if not any(int(candle["t"]) > end_ms for candle in candles):
             return EMPTY.copy()
-        inside = [candle for candle in candles if int(candle["t"]) <= end_ms]
+        # A minute without a trade is left out, as in the trade archive the backtests are built from:
+        # the venue prints it as a flat candle carrying the previous close.
+        inside = [candle for candle in candles if int(candle["t"]) <= end_ms and int(candle["n"]) > 0]
         if not inside:
             return EMPTY.copy()
 

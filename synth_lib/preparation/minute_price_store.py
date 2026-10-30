@@ -24,13 +24,23 @@ logger = logging.getLogger(__name__)
 
 
 def _real_closes(path: Path) -> int:
-    """How many minutes of a stored partition carry a price. -1 when there is no partition."""
+    """How many minutes of a stored partition carry a traded price. -1 when there is no partition."""
     if not path.exists():
         return -1
     try:
-        return int(pd.read_parquet(path, columns=["close"])["close"].notna().sum())
+        frame = pd.read_parquet(path, columns=["close", "trade_count"])
     except (OSError, ValueError, KeyError):
-        return -1  # unreadable or pre-dating the column: treat as nothing to protect
+        return -1  # unreadable or pre-dating the columns: treat as nothing to protect
+    # A stored zero-trade minute counts for nothing: the Hyperliquid client leaves such minutes out.
+    return int((frame["close"].notna() & frame["trade_count"].ne(0)).sum())
+
+
+def _settled(path: Path) -> bool:
+    """Whether a stored partition was fetched after its day ended, with prices in it."""
+    try:
+        return bool(pd.read_parquet(path, columns=["is_final"])["is_final"].all())
+    except (OSError, ValueError, KeyError):
+        return True  # no flag to read: settled by its date
 
 
 # How far back from now the current day's fetch window has to end.
@@ -87,7 +97,7 @@ class MinutePriceStore:
         path = self.day_path(day)
         today = datetime.now(tz=UTC).date()
         is_final = day < today
-        if path.exists() and is_final and not force_refresh:
+        if path.exists() and is_final and not force_refresh and _settled(path):
             return path
 
         day_start = datetime.combine(day, time.min, tzinfo=UTC)
@@ -118,7 +128,8 @@ class MinutePriceStore:
             frame[column] = fetched[column].reindex(expected_index) if not fetched.empty else float("nan")
         frame["source"] = getattr(self.client, "source_name", "unknown")
         frame["ingested_at"] = datetime.now(tz=UTC).replace(microsecond=0)
-        frame["is_final"] = bool(is_final)
+        # An empty fetch of a past day stays unsettled, so the next ingest asks again.
+        frame["is_final"] = bool(is_final) and not fetched.empty
         frame = frame.reset_index(names="timestamp")
         # A force-refresh must never trade real prices for nothing. Venues serve a limited window
         # of history — Hyperliquid about 5000 minutes — so re-fetching a day that has aged out
@@ -139,18 +150,18 @@ class MinutePriceStore:
         return path
 
     def refresh_recent(self, days: int = 8) -> list[Path]:
-        """Re-fetch the recent days the venue can still serve, including the current one.
+        """Fetch the recent days that can still change: the current one, and any not yet settled.
 
-        Bounded by the client's retention: a forced re-fetch of a day the venue has dropped comes
-        back empty, and while ingest_day now refuses to overwrite real prices with it, asking at
-        all just spends requests to be told nothing.
+        Bounded by the client's retention: a re-fetch of a day the venue has dropped comes back
+        empty, and while ingest_day refuses to overwrite real prices with it, asking at all just
+        spends requests to be told nothing.
         """
         today = datetime.now(tz=UTC).date()
         retention = getattr(self.client, "retention_minutes", None)
         if retention is not None:
             days = min(days, max(1, retention // MINUTES_PER_DAY))
         start_day = today - timedelta(days=max(1, days))
-        return self.ingest_range(start_day, today, force_refresh=True)
+        return self.ingest_range(start_day, today, verbose=False)
 
     # -- loading ------------------------------------------------------------
 

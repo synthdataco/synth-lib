@@ -147,12 +147,9 @@ def build_context(
     Deliberately not `MinutePriceStore.get_context_window`, which is strict (it raises on a missing
     day or a short window) — correct for backtesting, fatal on the request path, where a single
     feed gap would cost a whole response. Here: skip missing day partitions, reindex onto the full
-    minute grid, fill internal gaps, and DROP a trailing run of missing bars so the series ends on
-    the last real print. Ending on ffilled bars would show the model zero recent volatility and
-    collapse its fan.
+    minute grid, and DROP a trailing run of missing bars so the series ends on the last real print.
 
-    Only `close` is filled. A carried-forward high/low would assert a range that no candle traded,
-    so the other columns stay NaN on minutes the venue did not report.
+    Missing minutes stay NaN in every column, as in the context the verdict hands the champion.
 
     `tail` (FreshTail's bars) wins over the store for the same minute: today's partition holds a
     NaN row for every minute its last refresh had not settled yet.
@@ -184,14 +181,10 @@ def build_context(
     if coverage < 0.70:
         logger.warning("low real-bar coverage for %s: %.1f%% — CRPS quality degraded", store.asset, coverage * 100)
     last_real = raw["close"].last_valid_index()
-    trimmed = raw if last_real is None else raw.loc[:last_real]
-    if len(trimmed) < MIN_REAL_BARS:
-        trimmed = raw
-    trimmed = trimmed.copy()
-    trimmed["close"] = trimmed["close"].ffill().bfill()
-    if trimmed["close"].isna().any():
+    if last_real is None:
         raise ValueError(f"no usable closes for {store.asset} ending {start_time.isoformat()}")
-    return trimmed
+    trimmed = raw.loc[:last_real]
+    return raw if len(trimmed) < MIN_REAL_BARS else trimmed
 
 
 def start_time_of(simulation_input: SimulationInput) -> datetime:

@@ -3,29 +3,53 @@
 The champion reads its volatility off the most recent bars, so the age of the newest bar at
 request time shows up in CRPS. Measured on the campaign-3 champion, a context carrying a serving
 store's staleness scored worse than one cut at the issuance instant, and the gap widened with the
-refresh interval. This pins the two cadences and the split between them.
+refresh interval. This pins the cadence and what each pass asks the venue for.
 """
 
-from datetime import date
+from datetime import datetime, timedelta, timezone
 
-from synth_lib.serving.champion_miner import (
-    CURRENT_DAY_REFRESH_SECONDS,
-    REFRESH_INTERVAL_SECONDS,
-    ChampionMiner,
-)
+import pandas as pd
+import pytest
+
+from synth_lib.preparation.config import OHLCV_COLUMNS
+from synth_lib.preparation.minute_price_store import MinutePriceStore
+from synth_lib.serving.champion_miner import REFRESH_SECONDS, ChampionMiner
+from synth_lib.serving.serve import WARMUP_DAYS
 
 
 class _Store:
     def __init__(self):
-        self.deep = 0
-        self.days: list[date] = []
+        self.refreshed: list[int] = []
 
     def refresh_recent(self, days):
-        self.deep += 1
+        self.refreshed.append(days)
 
-    def ingest_day(self, day, force_refresh=False):
-        assert force_refresh, "a top-up that does not force a refetch re-reads the same partition"
-        self.days.append(day)
+
+class _Venue:
+    source_name = "test"
+    retention_minutes = None
+
+    def __init__(self):
+        self.days: list = []
+
+    def fetch_range(self, asset, start_time, end_time):
+        self.days.append(start_time.date())
+        index = pd.date_range(start_time, end_time, freq="1min", tz="UTC")
+        return pd.DataFrame({"timestamp": index, **{c: 1.0 for c in OHLCV_COLUMNS}})
+
+
+@pytest.fixture
+def midday(monkeypatch):
+    """Freeze the store's clock mid-day, so today has settled minutes to fetch."""
+    now = datetime(2026, 10, 29, 9, 30, 5, tzinfo=timezone.utc)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr("synth_lib.preparation.minute_price_store.datetime", FrozenDatetime)
+    return now
 
 
 def _miner(stores):
@@ -34,30 +58,33 @@ def _miner(stores):
     return miner
 
 
-def test_the_cheap_pass_tops_up_only_today():
+def test_each_pass_refreshes_the_warm_up_window():
     store = _Store()
-    _miner({"BTC": store})._refresh_once(deep=False)
-    assert store.days == [date.today()] and store.deep == 0
-
-
-def test_the_deep_pass_repairs_older_days():
-    store = _Store()
-    _miner({"BTC": store})._refresh_once(deep=True)
-    assert store.deep == 1 and store.days == []
+    _miner({"BTC": store})._refresh_once()
+    assert store.refreshed == [WARMUP_DAYS]
 
 
 def test_one_venue_outage_does_not_stop_the_others():
     class _Broken(_Store):
-        def ingest_day(self, day, force_refresh=False):
+        def refresh_recent(self, days):
             raise RuntimeError("venue down")
 
     ok = _Store()
-    _miner({"HYPE": _Broken(), "BTC": ok})._refresh_once(deep=False)
-    assert ok.days == [date.today()]
+    _miner({"HYPE": _Broken(), "BTC": ok})._refresh_once()
+    assert ok.refreshed == [WARMUP_DAYS]
 
 
-def test_today_is_topped_up_far_more_often_than_the_deep_pass():
-    """The deep pass force-refetches WARMUP_DAYS for every asset; running it at the top-up cadence
-    would multiply venue traffic for days that are already settled."""
-    assert CURRENT_DAY_REFRESH_SECONDS < REFRESH_INTERVAL_SECONDS
-    assert REFRESH_INTERVAL_SECONDS % CURRENT_DAY_REFRESH_SECONDS == 0
+def test_after_the_warm_up_a_pass_fetches_only_today(tmp_path, midday):
+    """Settled days are never asked for again, so the pass is cheap enough to run every minute."""
+    venue = _Venue()
+    store = MinutePriceStore("BTC", root=tmp_path, client=venue)
+    today = midday.date()
+    store.ingest_range(today - timedelta(days=WARMUP_DAYS), today, verbose=False)
+    venue.days.clear()
+
+    _miner({"BTC": store})._refresh_once()
+    assert venue.days == [today]
+
+
+def test_the_store_is_topped_up_every_minute():
+    assert REFRESH_SECONDS <= 60
