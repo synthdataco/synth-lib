@@ -60,8 +60,16 @@ class LiteLLMAdmin:
 
     # No retry here on purpose: failure is the outage signal (BudgetTracker pauses the clock).
     def key_info(self, key: str) -> dict:
-        """{'spend': float, 'max_budget': float}. Raises a network exception if the proxy is down."""
-        resp = requests.get(f"{self._base}/key/info", headers=self._headers, params={"key": key}, timeout=self._timeout)
+        """{'spend': float, 'max_budget': float}. Raises a network exception if the proxy is down.
+
+        The key goes in the request body, never the URL: the proxy's access log records URLs.
+        """
+        resp = requests.post(
+            f"{self._base}/v2/key/info", headers=self._headers, json={"keys": [key]}, timeout=self._timeout
+        )
         resp.raise_for_status()
-        info = resp.json()["info"]
+        rows = resp.json()["info"]
+        if not rows:
+            raise requests.HTTPError("/v2/key/info returned no row for the key", response=resp)
+        info = rows[0]
         return {"spend": float(info.get("spend") or 0.0), "max_budget": info.get("max_budget")}
