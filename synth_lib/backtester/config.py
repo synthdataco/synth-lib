@@ -104,10 +104,11 @@ PREDICTION_MATCH_TOLERANCE_MINUTES = 60
 # network-restricted use cases (e.g. concurrent benchmark rollouts that would
 # otherwise rate-limit the Synth API, or sandboxes with internet disabled).
 #
-# Expected layout under the root (slug ∈ crypto-1h / crypto-24h / com-equ-24h):
-#   miner_scores_{asset}_{slug}.parquet          # slug = competition slug
-#   rewards_history_{slug}.parquet               # slug = competition slug
-#   miner_pool_usd.parquet                       # columns: date, usd
+# Expected layout under the root (slug ∈ crypto-1h / crypto-24h / com-equ-24h), day partitions as
+# described in synth_lib.backtester.field_store:
+#   miner_scores/{slug}/{asset}/date=*.parquet    # legacy: miner_scores_{asset}_{slug}.parquet
+#   rewards_history/{slug}/date=*.parquet         # legacy: rewards_history_{slug}.parquet
+#   miner_pool_usd/date=*.parquet                 # columns: date, usd; legacy: miner_pool_usd.parquet
 #   market_data/prices/{asset}/1m/date=*.parquet  # daily price partitions (legacy: pyth/)
 _OFFLINE_ENV_VAR = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
 

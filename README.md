@@ -342,13 +342,19 @@ With `SYNTH_BACKTESTER_OFFLINE_DATA_ROOT` set, `get_miner_scores`,
 parquets instead of calling `api.synthdata.co`, and the realized-path fallback
 reads the warmed cache without fetching. This also makes runs reproducible and
 rate-limit-proof (prices still come from the local `market_data/` parquets
-either way). Bundle layout under the root:
+either way). Bundle layout under the root, one partition per UTC day:
 
 ```
-miner_scores_{ASSET}_{competition}.parquet
-rewards_history_{competition}.parquet
-miner_pool_usd.parquet
+miner_scores/{competition}/{ASSET}/date=YYYY-MM-DD.parquet
+rewards_history/{competition}/date=YYYY-MM-DD.parquet
+miner_pool_usd/date=YYYY-MM-DD.parquet
 ```
+
+A rerun fetches only the days of its window that have no complete partition, so a wider window
+adds only its new days (`--force-refresh` fetches every day again). A day fetched before it settled,
+or only up to the window's end, is kept as `date=YYYY-MM-DD.partial.parquet` and fetched again by
+the next run. Bundles built before day partitions (`miner_scores_{ASSET}_{competition}.parquet` and
+so on) are still read.
 
 Note the competition's smoothed-score window (`window_days`, 10 for the 24h
 competitions) is trimmed from the start of the backtest as warmup, so a

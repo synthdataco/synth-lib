@@ -346,23 +346,22 @@ def prepare_offline_bundle(
     window > ~3 days, since the live scores API rejects wider ranges) and exports
     SYNTH_BACKTESTER_OFFLINE_DATA_ROOT. Thin wrapper around build_bundle
     (synth_lib/backtester/scripts/build_offline_bundle.py — a module-level function, cleanly
-    importable, not local to the CLI script, so no subprocess is needed here); same call
-    shape as run_backtest.py's --no-auto-bundle path (l.394-402). Returns the
-    bundle directory.
+    importable, not local to the CLI script, so no subprocess is needed here). Every verdict
+    shares one bundle of day partitions, so a window fetches only the days no earlier verdict
+    did. Returns the bundle directory.
     """
     anchor = window_end.to_pydatetime()
     # Simulating registration pushes the frame back another competition.window_days before the
     # registration day, so the field has to be bundled for a period the candidate did not exist in.
     extra = max(c.window_days for c in COMPETITIONS) if simulate_registration is not None else 0
     days = window_days + extra
-    out = out_root or Path("offline_data") / f"verdict_{anchor:%Y%m%d}_{days}d"
+    out = out_root or Path("offline_data") / "field"
     for comp in COMPETITIONS:
         build_bundle(
             slug=slug_for(comp),
             days=days,
             eval_end=anchor,
             assets=list(comp.asset_list),
-            chunk_days=2.0,
             out=out,
         )
     os.environ[_OFFLINE_ENV_VAR] = str(out)

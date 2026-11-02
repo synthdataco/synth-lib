@@ -95,11 +95,20 @@ def test_render_data_md_measures_the_snapshot(tmp_path):
     assert "NaN close" in md and "Missing file" in md  # semantics block present
 
 
+def test_data_md_reads_the_span_of_a_day_partitioned_bundle(tmp_path):
+    root = tmp_path / "snapshot"
+    btc = root / "prices" / "BTC" / "1m"
+    btc.mkdir(parents=True)
+    idx = pd.date_range("2026-07-01", periods=1440, freq="1min", tz="UTC")
+    pd.DataFrame({"timestamp": idx, "close": 100.0}).to_parquet(btc / "date=2026-07-01.parquet")
+    scores = root / "offline_data" / "miner_scores" / "crypto-24h" / "BTC"
+    scores.mkdir(parents=True)
+    for day in ("2026-07-01", "2026-07-10"):
+        pd.DataFrame({"scored_time": [pd.Timestamp(day, tz="UTC")]}).to_parquet(scores / f"date={day}.parquet")
+    assert "2026-07-01 → 2026-07-10" in render_data_md(root)
+
+
 def test_data_md_counts_flat_zero_trade_minutes_as_untraded(tmp_path):
-    import pandas as pd
-
-    from synth_lib.benchmark.snapshot import render_data_md
-
     xau = tmp_path / "snapshot" / "prices" / "XAU" / "1m"
     xau.mkdir(parents=True)
     idx = pd.date_range("2026-07-01", periods=1440, freq="1min", tz="UTC")

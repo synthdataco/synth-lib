@@ -70,6 +70,19 @@ def test_require_offline_bundle_wants_scores_and_rewards(tmp_path):
     assert require_offline_bundle(snapshot) == bundle
 
 
+def test_require_offline_bundle_accepts_day_partitions(tmp_path):
+    from synth_lib.benchmark.run_campaign import require_offline_bundle
+
+    bundle = tmp_path / "snapshot" / "offline_data"
+    (bundle / "miner_scores" / "crypto-24h" / "BTC").mkdir(parents=True)
+    (bundle / "miner_scores" / "crypto-24h" / "BTC" / "date=2026-09-15.parquet").write_bytes(b"")
+    with pytest.raises(SystemExit, match="no offline scores bundle"):
+        require_offline_bundle(tmp_path / "snapshot")
+    (bundle / "rewards_history" / "crypto-24h").mkdir(parents=True)
+    (bundle / "rewards_history" / "crypto-24h" / "date=2026-09-15.parquet").write_bytes(b"")
+    assert require_offline_bundle(tmp_path / "snapshot") == bundle
+
+
 def test_run_refuses_to_start_without_a_bundle(tmp_path, monkeypatch):
     """The check comes before the proxy is touched: no key, no admin call, no leg."""
     import sys

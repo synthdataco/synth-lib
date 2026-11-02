@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from synth_lib.backtester.field_store import SCORES_DIR
 from synth_lib.preparation.config import STORE_SUBDIR
 from synth_lib.preparation.event_calendar.events import (
     CALENDAR_DIR,
@@ -204,7 +205,8 @@ def _offline_bundle_lines(offline: Path) -> list[str]:
     if not offline.is_dir():
         return []
     spans = []
-    for f in sorted(offline.glob("miner_scores_*.parquet")):
+    # Day partitions, or the single files of a bundle built before them.
+    for f in sorted([*offline.glob(f"{SCORES_DIR}/*/*/date=*.parquet"), *offline.glob("miner_scores_*.parquet")]):
         try:
             scored = pd.read_parquet(f, columns=["scored_time"])["scored_time"]
         except Exception:
