@@ -32,7 +32,7 @@ from synth_lib.backtester.config import (
     slug_for,
 )
 from synth_lib.backtester.preparation import PredictionRef
-from synth_lib.preparation.config import SYNTHDATA_API_BASE
+from synth_lib.preparation.config import SYNTH_API_CONNECT_TIMEOUT_SECONDS, SYNTHDATA_API_BASE, synth_api_session
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.preparation.price_client import build_price_client
 
@@ -57,7 +57,7 @@ def _http_get(
     occasional ReadTimeout / ConnectionError. Returns the last response; caller
     calls raise_for_status() to handle non-retryable errors (e.g. 404).
     """
-    return requests.get(url, params=params, timeout=timeout)
+    return synth_api_session().get(url, params=params, timeout=(SYNTH_API_CONNECT_TIMEOUT_SECONDS, timeout))
 
 
 def get_miner_scores(

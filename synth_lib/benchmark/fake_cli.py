@@ -16,6 +16,14 @@ import sys
 import time
 from pathlib import Path
 
+# The landed champion passes the harness's interface check.
+FAKE_MODELING = (
+    "def simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100,\n"
+    "             context_prices=None):\n"
+    "    steps = time_length // time_increment + 1\n"
+    "    return (start_time, time_increment, *[[100.0] * steps for _ in range(num_simulations)])\n"
+)
+
 
 def main() -> int:
     scenario = os.environ.get("FAKE_CLI_SCENARIO", "lands")
@@ -27,6 +35,7 @@ def main() -> int:
 
     def land() -> int:
         (agent_dir / "report.md").write_text("# Report\n\nHonest results.\n")
+        (agent_dir / "modeling.py").write_text(FAKE_MODELING)
         (agent_dir / "CHAMPION").write_text(
             f"sha: deadbeef\nagent_dir: {agent_dir.name}\nprofiles: [low]\nnotes: fake\n"
         )

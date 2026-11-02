@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,7 +38,8 @@ DEFAULT_HELDOUT_MONTHS = 0
 # -- Synth validator API --
 PROMPTS_PAGE_SIZE_DAYS = 50  # endpoint caps at 60 days; `to` is inflated +24h server-side
 SYNTH_API_REQUEST_INTERVAL_SECONDS = 0.6  # no-auth endpoints allow ~2 req/s per IP
-SYNTH_API_MAX_RETRIES = 3
+SYNTH_API_MAX_RETRIES = 6
+SYNTH_API_CONNECT_TIMEOUT_SECONDS = 10
 SYNTH_API_RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 PROMPT_START_MATCH_TOLERANCE_MINUTES = 30
 
@@ -89,6 +91,20 @@ def venue_session() -> requests.Session:
     )
     session = requests.Session()
     session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+_synth_api_sessions = threading.local()
+
+
+def synth_api_session() -> requests.Session:
+    """This thread's Synth API session: its calls reuse one kept-alive connection.
+
+    The API drops connections opened in quick succession from one address.
+    """
+    session = getattr(_synth_api_sessions, "session", None)
+    if session is None:
+        session = _synth_api_sessions.session = requests.Session()
     return session
 
 

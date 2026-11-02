@@ -179,6 +179,53 @@ def test_passthrough_legs_mint_uncapped_keys(tmp_path, monkeypatch):
     assert minted["camp-g"] is None  # passthrough leg: uncapped, driver-only enforcement
 
 
+def _two_leg_state(root: Path) -> CampaignState:
+    cfg = CampaignConfig(
+        name="camp",
+        objective="o",
+        models=(ModelSpec(id="a", cli="claude-code", model="m"), ModelSpec(id="b", cli="claude-code", model="m")),
+        budget_usd_per_model=10.0,
+        deadline_hours_per_model=1.0,
+        data_cutoff=date(2026, 7, 15),
+        forward_window_days=7,
+        baselines=(BaselineSpec(name="b", module="x"),),
+        hardware="h",
+        proxy_url="http://localhost:4000",
+        root=root,
+    )
+    state = CampaignState(cfg=cfg, dir=cfg.dir)
+    state.dir.mkdir(parents=True, exist_ok=True)
+    state.save({"runs_done": []})
+    return state
+
+
+def test_legs_runs_only_the_named_legs(tmp_path, monkeypatch):
+    import synth_lib.benchmark.run_campaign as rc
+
+    state = _two_leg_state(tmp_path / "campaigns")
+    started = []
+
+    class DummyRun:
+        def __init__(self, cfg, model, *a, **k):
+            started.append(model.id)
+
+        def run(self):
+            return None
+
+    monkeypatch.setattr(rc, "ModelRun", DummyRun)
+    rc.run_all(state, admin=None, sandboxed=False, python_exe="python", legs=["b"])
+
+    assert started == ["b"]
+    assert state.load()["runs_done"] == ["b"]
+
+
+def test_legs_refuses_an_id_the_campaign_lacks(tmp_path):
+    import synth_lib.benchmark.run_campaign as rc
+
+    with pytest.raises(SystemExit, match="no leg of camp: c"):
+        rc.run_all(_two_leg_state(tmp_path / "campaigns"), admin=None, sandboxed=False, legs=["a", "c"])
+
+
 def test_run_all_sandboxed_wires_container_and_wrapper(tmp_path, monkeypatch):
     # sandboxed=True must build a container_name per run and a cmd_wrapper that wraps the
     # adapter's raw command via sandbox_cmd (proxy rewritten to host.docker.internal in-container).

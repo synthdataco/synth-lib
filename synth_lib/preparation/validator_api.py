@@ -13,9 +13,11 @@ import requests
 from synth_lib.preparation.config import (
     PROMPT_START_MATCH_TOLERANCE_MINUTES,
     PROMPTS_PAGE_SIZE_DAYS,
+    SYNTH_API_CONNECT_TIMEOUT_SECONDS,
     SYNTH_API_MAX_RETRIES,
     SYNTH_API_RETRY_STATUS_CODES,
     SYNTHDATA_API_BASE,
+    synth_api_session,
     utc_datetime,
 )
 
@@ -28,7 +30,9 @@ def _synth_api_get(path: str, params: dict[str, Any], timeout: int = 30) -> requ
     last_exc: Exception | None = None
     for attempt in range(SYNTH_API_MAX_RETRIES):
         try:
-            response = requests.get(f"{SYNTHDATA_API_BASE}{path}", params=params, timeout=timeout)
+            response = synth_api_session().get(
+                f"{SYNTHDATA_API_BASE}{path}", params=params, timeout=(SYNTH_API_CONNECT_TIMEOUT_SECONDS, timeout)
+            )
             if response.status_code in SYNTH_API_RETRY_STATUS_CODES:
                 raise requests.HTTPError(f"{response.status_code} from {path}", response=response)
             return response

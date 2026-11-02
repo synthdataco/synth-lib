@@ -24,6 +24,16 @@ def simulate(asset, start_time, time_increment=300, time_length=86400, num_simul
     return (start_time, time_increment, *[[100.0] * steps for _ in range(num_simulations)])
 """
 
+SIBLING_MODELING = """
+def simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100,
+             context_prices=None):
+    from probe_sibling import flat_paths
+
+    return (start_time, time_increment, *flat_paths(time_length // time_increment + 1, num_simulations))
+"""
+
+SIBLING_MODULE = "def flat_paths(steps, n):\n    return [[100.0] * steps for _ in range(n)]\n"
+
 SLEEPY_MODELING = """
 import time
 
@@ -108,6 +118,14 @@ def test_probe_subprocess_ok(tmp_path):
     ok, msg = probe_simulate_subprocess(tmp_path / "modeling.py")
     assert ok is True, msg
     assert msg == "ok (24h + 1h)"  # the probe covers both competition formats
+
+
+def test_probe_subprocess_imports_a_sibling_module(tmp_path):
+    """A champion that imports a module beside it by name passes, as it does when served."""
+    (tmp_path / "modeling.py").write_text(SIBLING_MODELING)
+    (tmp_path / "probe_sibling.py").write_text(SIBLING_MODULE)
+    ok, msg = probe_simulate_subprocess(tmp_path / "modeling.py")
+    assert ok is True, msg
 
 
 def test_probe_subprocess_times_out(tmp_path):

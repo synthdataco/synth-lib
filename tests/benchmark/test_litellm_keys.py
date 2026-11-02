@@ -22,6 +22,10 @@ class _Resp:
     def json(self):
         return self._payload
 
+    def raise_for_status(self):
+        if not self.ok:
+            raise requests.HTTPError(f"{self.status_code}")
+
 
 @pytest.fixture
 def calls(monkeypatch):
@@ -65,3 +69,21 @@ def test_a_real_delete_failure_still_raises(monkeypatch):
     monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp(500, text="proxy on fire"))
     with pytest.raises(requests.HTTPError, match="/key/delete"):
         LiteLLMAdmin("http://proxy", "sk-master").delete_key_alias("x")
+
+
+def test_a_spend_read_keeps_the_key_out_of_the_url(monkeypatch):
+    seen: list[tuple[str, dict]] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen.append((url, json))
+        return _Resp(200, {"key": ["sk-leg"], "info": [{"spend": 1.25, "max_budget": 100.0}]})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    assert LiteLLMAdmin("http://proxy", "sk-master").key_info("sk-leg") == {"spend": 1.25, "max_budget": 100.0}
+    assert seen == [("http://proxy/v2/key/info", {"keys": ["sk-leg"]})]
+
+
+def test_a_key_the_proxy_does_not_know_raises(monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp(200, {"key": ["sk-gone"], "info": []}))
+    with pytest.raises(requests.HTTPError, match="no row"):
+        LiteLLMAdmin("http://proxy", "sk-master").key_info("sk-gone")

@@ -13,6 +13,7 @@ from synth_lib.benchmark.campaign import BaselineSpec, CampaignConfig, ModelSpec
 from synth_lib.benchmark.cli_adapters import FakeAdapter
 from synth_lib.benchmark.clock import RunClock
 from synth_lib.benchmark.driver import GPU_PROMPT, MAX_GPU_RELAUNCHES, SESSIONS_DIR, ModelRun
+from synth_lib.benchmark.fake_cli import FAKE_MODELING
 from synth_lib.benchmark.gpu_usage import GpuUsage
 
 
@@ -319,6 +320,54 @@ def test_a_nomination_stands_after_the_last_hand_back(tmp_path):
         spend_usd=1.0, budget_usd=10.0, pct_usd=0.1, elapsed_s=0.0, remaining_s=100.0, pct_time=0.1, phase=Phase.NORMAL
     )
     assert run._handle_exit(object(), 0, status, 0, 0)[0] is True
+
+
+BROKEN_SIBLING_MODELING = "def simulate(**kwargs):\n    from missing_sibling import paths\n"
+
+
+def _exited_with(run: ModelRun, phase: Phase = Phase.NORMAL) -> tuple[bool, list[str]]:
+    launched: list[str] = []
+    run._launch = lambda prompt, resume=False: launched.append(prompt) or object()
+    status = BudgetStatus(
+        spend_usd=1.0, budget_usd=10.0, pct_usd=0.1, elapsed_s=0.0, remaining_s=100.0, pct_time=0.1, phase=phase
+    )
+    return run._handle_exit(object(), 0, status, 0, 0)[0], launched
+
+
+def _failed_nomination(tmp_path, spend: float = 1.0) -> ModelRun:
+    """A run whose champion failed the interface check when it was nominated."""
+    run = _run(tmp_path, "lands", HoldAdmin(spend=spend))
+    (run.agent_dir / "CHAMPION").write_text("sha: abc\nagent_dir: agent\nprofiles: [low]\n")
+    (run.agent_dir / "modeling.py").write_text(BROKEN_SIBLING_MODELING)
+    run._probe_ok = False
+    return run
+
+
+def test_a_nomination_failing_the_interface_check_is_handed_back_once(tmp_path):
+    run = _failed_nomination(tmp_path)
+    done, launched = _exited_with(run, Phase.LANDING)
+    assert done is False and len(launched) == 1
+    assert launched[0].startswith("Your nomination does not stand yet") and "missing_sibling" in launched[0]
+
+    done, launched = _exited_with(run)
+    assert done is True and launched == []  # the second failure stands
+    assert "missing_sibling" in (run.agent_dir / "BUDGET.md").read_text()
+
+
+def test_no_hand_back_once_the_envelope_is_spent(tmp_path):
+    """The status handed to _handle_exit predates the re-check: a spent envelope read after it
+    lands the champion as it is instead of starting another session."""
+    run = _failed_nomination(tmp_path, spend=10.0)
+    done, launched = _exited_with(run, Phase.LANDING)
+    assert done is True and launched == []
+
+
+def test_a_champion_fixed_before_exit_stands(tmp_path):
+    run = _failed_nomination(tmp_path)
+    (run.agent_dir / "modeling.py").write_text(FAKE_MODELING)
+    done, launched = _exited_with(run)
+    assert done is True and launched == []
+    assert "check interface: ok" in (run.agent_dir / "BUDGET.md").read_text()
 
 
 def test_the_gpu_line_reaches_budget_md(tmp_path):
