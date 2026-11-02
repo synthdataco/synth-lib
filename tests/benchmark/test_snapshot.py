@@ -95,6 +95,19 @@ def test_render_data_md_measures_the_snapshot(tmp_path):
     assert "NaN close" in md and "Missing file" in md  # semantics block present
 
 
+def test_data_md_counts_flat_zero_trade_minutes_as_untraded(tmp_path):
+    import pandas as pd
+
+    from synth_lib.benchmark.snapshot import render_data_md
+
+    xau = tmp_path / "snapshot" / "prices" / "XAU" / "1m"
+    xau.mkdir(parents=True)
+    idx = pd.date_range("2026-07-01", periods=1440, freq="1min", tz="UTC")
+    trades = [0.0] * 288 + [1.0] * 1152  # 20% flat candles
+    pd.DataFrame({"timestamp": idx, "close": 100.0, "trade_count": trades}).to_parquet(xau / "date=2026-07-01.parquet")
+    assert "| XAU | 2026-07-01 | 2026-07-01 | 1 | 20.0% |" in render_data_md(tmp_path / "snapshot")
+
+
 def _realized(root: Path, asset: str, days: list[str]) -> None:
     d = root / "realized" / asset / "86400_300"
     d.mkdir(parents=True, exist_ok=True)

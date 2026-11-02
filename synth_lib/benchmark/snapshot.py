@@ -90,21 +90,24 @@ def render_data_md(snapshot_root: Path) -> str:
         "Each day is one parquet file, `date=YYYY-MM-DD.parquet`, a full 1440-row minute grid",
         "with columns `open, high, low, close, volume, trade_count`. `close` is the scored series.",
         "`close` is the venue's 1-minute candle close (the last trade of that minute); the other",
-        "columns describe the same minute. For the Hyperliquid-routed assets open/high/low are",
-        "derived from 1-second closes, so a minute's range is sampled rather than continuous.",
+        "columns describe the same minute. For the Hyperliquid-routed assets each minute is",
+        "aggregated from the venue's 1-second candles (first open, highest high, lowest low, last",
+        "close), the same values as the venue's 1-minute candle.",
         "`source`/`ingested_at`/`is_final` are ingestion provenance — ignore them. Semantics:",
         "",
-        "- **NaN close** = no trade that minute (thin market or feed gap). NOT market hours:",
-        "  these venues trade 24/7. Real density varies by asset and era — see the table.",
+        "- **`trade_count` 0** = no trade that minute: the venue prints a flat candle (open, high, low",
+        "  and close at the previous close, volume 0), and the validator scores against it. NOT market",
+        "  hours: these venues trade 24/7. Trade density varies by asset and era — see the table.",
+        "- **NaN close** = no price at all: before the market's first trade, or a hole in the feed.",
         "- **Missing file** = before that market's first trade. Nothing existed; nothing is hidden.",
         "- Scoring drops NaN per prompt. Never interpolate: inventing prices in the gaps is how",
         "  you fool your own validation.",
         "",
-        "Per-asset coverage, measured from this snapshot (nan% = share of NaN minutes among the",
-        "asset's real days; first/last 30d columns show density drift — early months of newer",
-        "listings are genuinely thin, low realized volatility there is real):",
+        "Per-asset coverage, measured from this snapshot (untraded% = share of minutes without a",
+        "trade, flat or NaN, among the asset's real days; first/last 30d columns show density drift —",
+        "early months of newer listings are genuinely thin, low realized volatility there is real):",
         "",
-        "| asset | first day | last day | real days | nan% total | nan% first 30d | nan% last 30d |",
+        "| asset | first day | last day | real days | untraded% total | untraded% first 30d | untraded% last 30d |",
         "|---|---|---|---|---|---|---|",
     ]
     store = snapshot_root / STORE_SUBDIR
@@ -156,14 +159,18 @@ def _calendar_lines(path: Path, store: Path) -> list[str]:
 
 
 def _coverage_row(asset_dir: Path) -> str | None:
-    per_day: list[tuple[str, int, int]] = []  # (day, nan_cells, total_cells)
+    per_day: list[tuple[str, int, int]] = []  # (day, untraded_cells, total_cells)
     for part in sorted((asset_dir / "1m").glob("date=*.parquet")):
         try:
-            closes = pd.read_parquet(part, columns=["close"])["close"]
+            frame = pd.read_parquet(part)
         except Exception:  # unreadable/placeholder partition: not coverage, skip it
             continue
-        if closes.notna().any():
-            per_day.append((part.name[5:-8], int(closes.isna().sum()), len(closes)))
+        if "close" not in frame or not frame["close"].notna().any():
+            continue
+        untraded = frame["close"].isna()
+        if "trade_count" in frame:
+            untraded |= frame["trade_count"].eq(0)
+        per_day.append((part.name[5:-8], int(untraded.sum()), len(frame)))
     if not per_day:
         return None
 

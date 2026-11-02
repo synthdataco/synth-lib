@@ -31,7 +31,7 @@ def _real_closes(path: Path) -> int:
         frame = pd.read_parquet(path, columns=["close", "trade_count"])
     except (OSError, ValueError, KeyError):
         return -1  # unreadable or pre-dating the columns: treat as nothing to protect
-    # A stored zero-trade minute counts for nothing: the Hyperliquid client leaves such minutes out.
+    # Counts traded minutes: a zero-trade candle repeats the previous close.
     return int((frame["close"].notna() & frame["trade_count"].ne(0)).sum())
 
 

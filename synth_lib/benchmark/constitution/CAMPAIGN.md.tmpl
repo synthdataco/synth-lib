@@ -102,8 +102,9 @@ horizon before the window and yours is never treated as late.
   | 2026-03-18 / 2026-05-17 | SP500 / SPCX |
 
   **Read `DATA.md` at the workspace root FIRST**: it is generated from this exact snapshot at
-  setup and carries the measured truth — the partition schema, NaN semantics (NaN close = no
-  trade that minute, NOT market hours; missing file = before the market's first trade), and a
+  setup and carries the measured truth — the partition schema, the minute semantics (a minute
+  without a trade is a flat candle with `trade_count` 0, NOT market hours; NaN close = no price
+  at all; missing file = before the market's first trade), and a
   per-asset coverage table with density by era. Two caveats it quantifies that will bite if
   ignored: the early months of the newer Hyperliquid listings are genuinely THIN (low realized
   volatility there is real, not smoothing), and these are venue-specific perpetual prices with
