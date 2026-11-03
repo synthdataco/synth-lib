@@ -24,15 +24,13 @@ logger = logging.getLogger(__name__)
 
 
 def _real_closes(path: Path) -> int:
-    """How many minutes of a stored partition carry a traded price. -1 when there is no partition."""
+    """How many minutes of a stored partition carry a price. -1 when there is no partition."""
     if not path.exists():
         return -1
     try:
-        frame = pd.read_parquet(path, columns=["close", "trade_count"])
+        return int(pd.read_parquet(path, columns=["close"])["close"].notna().sum())
     except (OSError, ValueError, KeyError):
-        return -1  # unreadable or pre-dating the columns: treat as nothing to protect
-    # A stored zero-trade minute counts for nothing: the Hyperliquid client leaves such minutes out.
-    return int((frame["close"].notna() & frame["trade_count"].ne(0)).sum())
+        return -1  # unreadable or pre-dating the column: treat as nothing to protect
 
 
 def _settled(path: Path) -> bool:

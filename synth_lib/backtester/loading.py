@@ -31,6 +31,7 @@ from synth_lib.backtester.config import (
     competition_for,
     slug_for,
 )
+from synth_lib.backtester.field_store import pool_dir, read_days, rewards_dir, scores_dir
 from synth_lib.backtester.preparation import PredictionRef
 from synth_lib.preparation.config import SYNTH_API_CONNECT_TIMEOUT_SECONDS, SYNTHDATA_API_BASE, synth_api_session
 from synth_lib.preparation.minute_price_store import MinutePriceStore
@@ -60,6 +61,18 @@ def _http_get(
     return synth_api_session().get(url, params=params, timeout=(SYNTH_API_CONNECT_TIMEOUT_SECONDS, timeout))
 
 
+def _offline_frame(directory: Path, legacy: Path, start: datetime, end: datetime) -> pd.DataFrame:
+    """The bundle's day partitions for [start, end), or its single file from before day partitions."""
+    frame = read_days(directory, start, end)
+    if frame is not None:
+        return frame
+    if not legacy.exists():
+        raise FileNotFoundError(
+            f"Offline mode: expected {directory} or {legacy}. Pre-fetch the bundled data snapshot first."
+        )
+    return pd.read_parquet(legacy)
+
+
 def get_miner_scores(
     start_time: datetime,
     end_time: datetime,
@@ -78,10 +91,10 @@ def get_miner_scores(
 
     offline = _offline_root()
     if offline is not None:
-        path = offline / f"miner_scores_{asset}_{slug_for(competition_for(asset, time_length))}.parquet"
-        if not path.exists():
-            raise FileNotFoundError(f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first.")
-        df = pd.read_parquet(path)
+        slug = slug_for(competition_for(asset, time_length))
+        df = _offline_frame(
+            scores_dir(offline, slug, asset), offline / f"miner_scores_{asset}_{slug}.parquet", start_time, end_time
+        )
         df = _filter_time_range(df, "scored_time", start_time, end_time)
         if df.empty:
             return df
@@ -153,10 +166,9 @@ def get_rewards_history(
     offline = _offline_root()
     if offline is not None:
         suffix = prompt_name or "all"
-        path = offline / f"rewards_history_{suffix}.parquet"
-        if not path.exists():
-            raise FileNotFoundError(f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first.")
-        df = pd.read_parquet(path)
+        df = _offline_frame(
+            rewards_dir(offline, suffix), offline / f"rewards_history_{suffix}.parquet", start_time, end_time
+        )
         df = _filter_time_range(df, "updated_at", start_time, end_time)
         if df.empty:
             return df
@@ -274,10 +286,7 @@ def get_daily_miner_pool_usd(
 
     offline = _offline_root()
     if offline is not None:
-        path = offline / "miner_pool_usd.parquet"
-        if not path.exists():
-            raise FileNotFoundError(f"Offline mode: expected {path}. Pre-fetch the bundled data snapshot first.")
-        df = pd.read_parquet(path)
+        df = _offline_frame(pool_dir(offline), offline / "miner_pool_usd.parquet", start_date, end_date)
         if df.empty:
             return pd.Series(dtype=float)
         df["date"] = pd.to_datetime(df["date"], utc=True)

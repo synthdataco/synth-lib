@@ -98,13 +98,9 @@ def _generate_random_predictions(
     now = datetime.now(UTC)
     query_start = now - timedelta(days=days)
 
-    print(
-        f"Fetching miner scores for {asset} (time_length={time_length}s) over last {days} days..."
-    )
+    print(f"Fetching miner scores for {asset} (time_length={time_length}s) over last {days} days...")
     try:
-        scores = get_miner_scores(
-            query_start, now, asset, time_length, time_increment=time_increment
-        )
+        scores = get_miner_scores(query_start, now, asset, time_length, time_increment=time_increment)
     except Exception as e:
         print(f"  Failed to fetch scores for {asset}/{time_length}: {e} — skipping.")
         return
@@ -113,9 +109,7 @@ def _generate_random_predictions(
         return
 
     start_times = sorted(scores["start_time"].unique())
-    print(
-        f"  Found {len(start_times)} scored prompts. Generating random predictions..."
-    )
+    print(f"  Found {len(start_times)} scored prompts. Generating random predictions...")
 
     price_start = min(start_times) - timedelta(hours=1)
     price_end = max(start_times) + timedelta(seconds=time_length) + timedelta(hours=1)
@@ -150,24 +144,18 @@ def _generate_random_predictions(
             continue
 
         filename = ts.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{asset}_{time_length}.json"
-        pred = _generate_random_prediction(
-            ts, current_price, asset, time_length, time_increment
-        )
+        pred = _generate_random_prediction(ts, current_price, asset, time_length, time_increment)
         (output_dir / filename).write_text(json.dumps(pred))
         generated += 1
 
     print(f"  Generated {generated} random prediction files for {asset}/{time_length}")
 
 
-def _populate_random_dir(
-    filtered_competitions: list[CompetitionConfig], days: int, output_dir: Path
-) -> None:
+def _populate_random_dir(filtered_competitions: list[CompetitionConfig], days: int, output_dir: Path) -> None:
     """Populate `output_dir` with random predictions for every asset in each filtered competition."""
     for comp in filtered_competitions:
         for asset in comp.asset_list:
-            _generate_random_predictions(
-                days, output_dir, asset, comp.time_length, comp.time_increment
-            )
+            _generate_random_predictions(days, output_dir, asset, comp.time_length, comp.time_increment)
 
 
 # ---------------------------------------------------------------------------
@@ -241,9 +229,7 @@ def _run(
     results_by_competition: dict[str, list[BacktestResult]] = {}
     combined_by_competition: dict[str, pd.DataFrame] = {}
 
-    with ThreadPoolExecutor(
-        max_workers=max(len(filtered_competitions), 1)
-    ) as executor:
+    with ThreadPoolExecutor(max_workers=max(len(filtered_competitions), 1)) as executor:
         futures = {
             executor.submit(
                 run_backtest,
@@ -270,28 +256,20 @@ def _run(
     print(f"\n{'='*60}\nALL BACKTESTS COMPLETE\n{'='*60}")
 
     # Grand-total charts require ≥2 competitions to have combined frames with data.
-    if len(combined_by_competition) >= 2 and all(
-        not c.empty for c in combined_by_competition.values()
-    ):
+    if len(combined_by_competition) >= 2 and all(not c.empty for c in combined_by_competition.values()):
         try:
-            path = plot_grand_total_rank_evolution(
-                results_by_competition, combined_by_competition
-            )
+            path = plot_grand_total_rank_evolution(results_by_competition, combined_by_competition)
             print(f"  Grand-total rank chart saved to: {path}")
         except (RuntimeError, FileNotFoundError, KeyError) as e:
             print(f"  Grand-total rank chart failed: {e}")
 
         try:
-            path = plot_grand_total_earnings(
-                results_by_competition, combined_by_competition
-            )
+            path = plot_grand_total_earnings(results_by_competition, combined_by_competition)
             print(f"  Grand-total earnings chart saved to: {path}")
         except (RuntimeError, FileNotFoundError, KeyError) as e:
             print(f"  Grand-total earnings chart failed: {e}")
     else:
-        print(
-            "  Skipping grand-total charts: need ≥2 competitions with data each."
-        )
+        print("  Skipping grand-total charts: need ≥2 competitions with data each.")
 
 
 # ---------------------------------------------------------------------------
@@ -300,17 +278,13 @@ def _run(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Run backtests against Synth subnet data"
-    )
+    parser = argparse.ArgumentParser(description="Run backtests against Synth subnet data")
     parser.add_argument(
         "--miner-name",
         default="btc_research",
         help="Miner name (default: btc_research)",
     )
-    parser.add_argument(
-        "--days", type=int, default=2, help="Number of backtest days (default: 2)"
-    )
+    parser.add_argument("--days", type=int, default=2, help="Number of backtest days (default: 2)")
     parser.add_argument(
         "--asset",
         nargs="+",
@@ -351,8 +325,7 @@ def main() -> None:
         type=str,
         default=None,
         metavar="YYYY-MM-DD",
-        help="Simulate the miner leaving on this date. Drops our CRPS rows after "
-        "this date.",
+        help="Simulate the miner leaving on this date. Drops our CRPS rows after " "this date.",
     )
     parser.add_argument(
         "--no-auto-bundle",
@@ -380,33 +353,24 @@ def main() -> None:
         sel = "ALL" if asset_selection is None else " ".join(asset_selection)
         avail = ", ".join(f"{slug_for(c)}={c.asset_list}" for c in ALL_COMPETITIONS)
         print(
-            f"ERROR: no assets match --asset '{sel}' in --competition {args.competition}. "
-            f"Available: {avail}",
+            f"ERROR: no assets match --asset '{sel}' in --competition {args.competition}. " f"Available: {avail}",
             file=sys.stderr,
         )
         sys.exit(2)
 
-    asset_summary = ", ".join(
-        f"{c.label}={c.asset_list}" for c in filtered_competitions
-    )
+    asset_summary = ", ".join(f"{c.label}={c.asset_list}" for c in filtered_competitions)
     print(f"Running backtests for {args.miner_name}: {asset_summary}")
 
     # Long backtests default to an offline bundle: the scores endpoints reject
     # ranges over a few days, so fetching live would fail. Bundle downloads are
     # chunked and resumable; the bundle directory is keyed by (anchor, days) so
     # a different window never silently reuses stale files.
-    if (
-        args.days > AUTO_BUNDLE_MIN_DAYS
-        and not args.no_auto_bundle
-        and os.environ.get(_OFFLINE_ENV_VAR) is None
-    ):
+    if args.days > AUTO_BUNDLE_MIN_DAYS and not args.no_auto_bundle and os.environ.get(_OFFLINE_ENV_VAR) is None:
         anchor = simulate_deregistration or eval_end or datetime.now(UTC)
         bundle_days = args.days
         if simulate_registration is not None:
             window_days = max(c.window_days for c in filtered_competitions)
-            bundle_days = max(
-                bundle_days, (anchor - simulate_registration).days + window_days + 1
-            )
+            bundle_days = max(bundle_days, (anchor - simulate_registration).days + window_days + 1)
         root = Path("offline_data") / f"auto_{anchor:%Y%m%d}_{bundle_days}d"
         print(
             f"--days {args.days} exceeds the live scores-API range; building an "
@@ -419,7 +383,6 @@ def main() -> None:
                 days=bundle_days,
                 eval_end=anchor,
                 assets=list(comp.asset_list),
-                chunk_days=2.0,
                 out=root,
             )
         os.environ[_OFFLINE_ENV_VAR] = str(root)
@@ -432,9 +395,7 @@ def main() -> None:
         default_dir = Path(f"miner_outputs/{args.miner_name}/predictions")
         has_predictions = default_dir.exists() and any(default_dir.glob("**/*.json"))
         if not has_predictions:
-            print(
-                f"No predictions found in {default_dir}, falling back to random predictions."
-            )
+            print(f"No predictions found in {default_dir}, falling back to random predictions.")
             use_tmp = True
 
     max_workers = max((os.cpu_count() or 4) - 2, 1)

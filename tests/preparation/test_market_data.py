@@ -125,8 +125,8 @@ class TestNoDataGraceful:
 
 
 class TestZeroTradeMinutes:
-    """Hyperliquid prints a flat candle for a minute without a trade; the trade archive the backtests
-    are built from has no row for it. The client leaves it out, so the minute is NaN in both."""
+    """Hyperliquid prints a flat candle for a minute without a trade, and the archive the backtests are
+    built from is ingested the same way. The client keeps it."""
 
     @staticmethod
     def _candle(minute: int, trades: int, close: str = "100") -> dict:
@@ -149,9 +149,10 @@ class TestZeroTradeMinutes:
                 datetime(2026, 7, 10, 0, 2, tzinfo=UTC),
             )
 
-    def test_a_minute_without_a_trade_is_left_out(self) -> None:
+    def test_a_minute_without_a_trade_keeps_the_venues_flat_candle(self) -> None:
         df = self._fetch([self._candle(0, 3), self._candle(1, 0), self._candle(2, 1), self._candle(3, 2)])
-        assert list(df["timestamp"].dt.minute) == [0, 2]
+        assert list(df["timestamp"].dt.minute) == [0, 1, 2]
+        assert list(df["trade_count"]) == [3, 0, 1] and list(df["volume"]) == [1, 0, 1]
 
     def test_a_zero_trade_candle_still_proves_the_window_settled(self) -> None:
         df = self._fetch([self._candle(0, 3), self._candle(1, 1), self._candle(2, 1), self._candle(3, 0)])

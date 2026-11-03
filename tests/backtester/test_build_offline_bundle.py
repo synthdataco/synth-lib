@@ -2,85 +2,118 @@
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
-import pytest
 
-from synth_lib.backtester.scripts.build_offline_bundle import MANIFEST_NAME, build_bundle
+from synth_lib.backtester.field_store import day_path, pool_dir, rewards_dir, scores_dir
+from synth_lib.backtester.loading import get_miner_scores, get_rewards_history
+from synth_lib.backtester.scripts.build_offline_bundle import build_bundle
 
 UTC = timezone.utc
 MODULE = "synth_lib.backtester.scripts.build_offline_bundle"
 EVAL_END = datetime(2026, 9, 16, tzinfo=UTC)
 
 
-def _build(out: Path, days: int, eval_end: datetime = EVAL_END) -> None:
-    scores = pd.DataFrame(
-        {
-            "miner_uid": [1, 2],
-            "asset": ["BTC", "BTC"],
-            "crps": [1.0, 2.0],
-            "scored_time": [eval_end - timedelta(hours=1)] * 2,
-            "time_length": [86400, 86400],
-            "time_increment": [300, 300],
-        }
-    )
+class _Api:
+    """Hourly rows over each requested range, recording the requests."""
+
+    def __init__(self):
+        self.scores: list[tuple[datetime, datetime]] = []
+        self.rewards: list[tuple[datetime, datetime]] = []
+
+    def get_miner_scores(self, start, end, asset, time_length, time_increment):
+        self.scores.append((start, end))
+        scored = pd.date_range(start, end, freq="1h", inclusive="left")
+        return pd.DataFrame(
+            {
+                "miner_uid": 1,
+                "asset": asset,
+                "crps": 1.0,
+                "scored_time": scored,
+                "time_length": time_length,
+                "time_increment": time_increment,
+                "start_time": scored - pd.Timedelta(seconds=time_length),
+            }
+        )
+
+    def get_rewards_history(self, start, end, prompt_name=None):
+        self.rewards.append((start, end))
+        return pd.DataFrame({"updated_at": pd.date_range(start, end, freq="1h", inclusive="left"), "miner_uid": 1})
+
+    def get_daily_miner_pool_usd(self, start, end):
+        days = pd.date_range(pd.Timestamp(start).floor("D"), end, freq="1D", inclusive="left")
+        return pd.Series(1.0, index=days)
+
+
+def _build(out: Path, days: int, eval_end: datetime = EVAL_END, force_refresh: bool = False) -> _Api:
+    api = _Api()
     with (
-        patch(f"{MODULE}.get_miner_scores", return_value=scores),
-        patch(f"{MODULE}.get_rewards_history", return_value=pd.DataFrame({"updated_at": [eval_end]})),
-        patch(f"{MODULE}.get_daily_miner_pool_usd", return_value=pd.Series([1.0], index=[eval_end.date()])),
+        patch(f"{MODULE}.get_miner_scores", side_effect=api.get_miner_scores),
+        patch(f"{MODULE}.get_rewards_history", side_effect=api.get_rewards_history),
+        patch(f"{MODULE}.get_daily_miner_pool_usd", side_effect=api.get_daily_miner_pool_usd),
+        patch(f"{MODULE}.REQUEST_SPACING_SECONDS", 0),
     ):
         build_bundle(
             slug="crypto-24h",
             days=days,
             eval_end=eval_end,
             assets=["BTC"],
-            chunk_days=60.0,
             out=out,
             realized_paths=False,
+            force_refresh=force_refresh,
         )
+    return api
 
 
-class TestBundleWindowManifest:
-    def test_every_bundled_file_records_its_window(self, tmp_path):
-        _build(tmp_path, days=17)
+def _days(directory: Path) -> list[str]:
+    return sorted(p.name for p in directory.glob("date=*.parquet"))
 
-        manifest = json.loads((tmp_path / MANIFEST_NAME).read_text())
-        assert set(manifest) == {
-            "miner_scores_BTC_crypto-24h.parquet",
-            "rewards_history_crypto-24h.parquet",
-            "miner_pool_usd.parquet",
-        }
-        scores = manifest["miner_scores_BTC_crypto-24h.parquet"]
-        assert scores["start"].startswith("2026-08-29") and scores["end"].startswith("2026-09-16")
 
-    def test_the_same_window_still_resumes(self, tmp_path):
-        """Skipping an already-written file is the point of the bundle; the check must not break it."""
-        _build(tmp_path, days=17)
-        _build(tmp_path, days=17)  # no exception
+class TestDayPartitions:
+    def test_each_day_lands_in_a_partition_named_by_its_date(self, tmp_path):
+        _build(tmp_path, days=2)
+        # Scores from one pad hour before the window; the window ends at midnight.
+        assert _days(scores_dir(tmp_path, "crypto-24h", "BTC")) == [
+            "date=2026-09-13.parquet",
+            "date=2026-09-14.parquet",
+            "date=2026-09-15.parquet",
+        ]
+        # Rewards reach 25 h past the window: the last day stops there and is kept partial.
+        rewards = _days(rewards_dir(tmp_path, "crypto-24h"))
+        assert rewards[0] == "date=2026-09-12.parquet" and rewards[-1] == "date=2026-09-17.partial.parquet"
+        assert len(pd.read_parquet(day_path(rewards_dir(tmp_path, "crypto-24h"), date(2026, 9, 17), True))) == 1
+        assert _days(pool_dir(tmp_path))[-1] == "date=2026-09-17.partial.parquet"
 
-    def test_a_narrower_window_is_covered(self, tmp_path):
-        _build(tmp_path, days=17)
-        _build(tmp_path, days=10)
+    def test_the_same_window_fetches_no_complete_day_again(self, tmp_path):
+        _build(tmp_path, days=2)
+        api = _build(tmp_path, days=2)
+        assert api.scores == []
+        assert api.rewards == [(datetime(2026, 9, 17, tzinfo=UTC), datetime(2026, 9, 17, 1, tzinfo=UTC))]
 
-    def test_a_wider_window_is_refused(self, tmp_path):
-        """The filename carries the asset and the competition but not the dates, so without this a
-        bundle built for one window scores another over whatever days the two share."""
-        _build(tmp_path, days=10)
+    def test_a_wider_window_fetches_only_its_new_days(self, tmp_path):
+        _build(tmp_path, days=2)
+        api = _build(tmp_path, days=4)
+        assert [s.date() for s, _ in api.scores] == [date(2026, 9, 11), date(2026, 9, 12)]
 
-        with pytest.raises(SystemExit) as excinfo:
-            _build(tmp_path, days=17)
-        message = str(excinfo.value)
-        assert "2026-09-05" in message and "2026-08-29" in message
-        assert "fresh --out" in message
+    def test_force_refresh_fetches_every_day_again(self, tmp_path):
+        _build(tmp_path, days=2)
+        assert len(_build(tmp_path, days=2, force_refresh=True).scores) == 3
 
-    def test_a_bundle_without_a_manifest_is_refused(self, tmp_path):
-        """Every bundle built before window tracking looks exactly like a correct one."""
-        _build(tmp_path, days=17)
-        (tmp_path / MANIFEST_NAME).unlink()
+    def test_the_loader_reads_the_partitions_of_its_range(self, tmp_path, monkeypatch):
+        _build(tmp_path, days=2)
+        monkeypatch.setenv("SYNTH_BACKTESTER_OFFLINE_DATA_ROOT", str(tmp_path))
+        scores = get_miner_scores(datetime(2026, 9, 14, tzinfo=UTC), EVAL_END, "BTC", 86400, 300)
+        assert len(scores) == 48 and scores["scored_time"].min() == pd.Timestamp("2026-09-14", tz="UTC")
+        rewards = get_rewards_history(EVAL_END, EVAL_END + timedelta(hours=1), prompt_name="crypto-24h")
+        assert len(rewards) == 1
 
-        with pytest.raises(SystemExit, match="predates window tracking"):
-            _build(tmp_path, days=17)
+    def test_the_loader_still_reads_a_bundle_of_single_files(self, tmp_path, monkeypatch):
+        scored = pd.date_range("2026-09-14", periods=3, freq="1h", tz="UTC")
+        pd.DataFrame({"miner_uid": 1, "crps": 1.0, "scored_time": scored}).to_parquet(
+            tmp_path / "miner_scores_BTC_crypto-24h.parquet"
+        )
+        monkeypatch.setenv("SYNTH_BACKTESTER_OFFLINE_DATA_ROOT", str(tmp_path))
+        assert len(get_miner_scores(scored[0].to_pydatetime(), EVAL_END, "BTC", 86400, 300)) == 3

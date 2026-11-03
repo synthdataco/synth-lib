@@ -2,12 +2,13 @@
 
 Long backtests need more scores/rewards history than the Synth API serves in
 one request (the scores endpoints cap ranges at a few days). This script
-downloads the required data in small chunks and writes the exact layout the
-backtester's offline mode (SYNTH_BACKTESTER_OFFLINE_DATA_ROOT) expects:
+downloads the required data one day at a time and writes the day partitions the
+backtester's offline mode (SYNTH_BACKTESTER_OFFLINE_DATA_ROOT) reads
+(synth_lib.backtester.field_store):
 
-    {out}/miner_scores_{asset}_{slug}.parquet
-    {out}/rewards_history_{slug}.parquet
-    {out}/miner_pool_usd.parquet
+    {out}/miner_scores/{slug}/{asset}/date=YYYY-MM-DD.parquet
+    {out}/rewards_history/{slug}/date=YYYY-MM-DD.parquet
+    {out}/miner_pool_usd/date=YYYY-MM-DD.parquet
 
 Prices are not bundled: the backtester reads them from the local
 market_data/prices/{asset}/1m parquets (see synth_lib/preparation/market_data.py
@@ -15,10 +16,8 @@ to pre-download them). Hyperliquid-routed assets have no minute history beyond
 ~3.5 days, so each bundled prompt's realized path is cached under
 market_data/realized/ instead.
 
-Already-written parquets are skipped, so an interrupted run can be resumed. The window each one
-was fetched for is recorded in manifest.json and checked before that skip: the filenames carry
-the asset and the competition but not the dates, so without it a bundle built for one window
-satisfies any --days/--eval-end and the backtest runs over whatever days the two windows share.
+A run fetches only the days of its window that have no complete partition, so an interrupted run
+resumes and a wider window adds only its new days; --force-refresh fetches every day again.
 
 Usage (then run the backtest with SYNTH_BACKTESTER_OFFLINE_DATA_ROOT={out}):
 
@@ -33,7 +32,6 @@ Usage (then run the backtest with SYNTH_BACKTESTER_OFFLINE_DATA_ROOT={out}):
 from __future__ import annotations
 
 import argparse
-import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import sleep
@@ -44,6 +42,7 @@ import requests
 
 from synth.validator.competition_config import CompetitionConfig
 from synth_lib.backtester.config import SLUG_TO_COMPETITION
+from synth_lib.backtester.field_store import pool_dir, read_days, refresh_days, rewards_dir, scores_dir
 from synth_lib.backtester.loading import (
     get_daily_miner_pool_usd,
     get_miner_scores,
@@ -64,77 +63,36 @@ MAX_RETRIES = 3
 
 REQUEST_SPACING_SECONDS = 0.2
 
-MANIFEST_NAME = "manifest.json"
 
+def retrying(
+    fetch: Callable[[datetime, datetime], pd.DataFrame], label: str
+) -> Callable[[datetime, datetime], pd.DataFrame]:
+    """`fetch` with retries, a 404 as no rows, and numeric columns that parquet accepts."""
 
-def _manifest(out: Path) -> dict[str, dict[str, str]]:
-    path = out / MANIFEST_NAME
-    return json.loads(path.read_text()) if path.exists() else {}
-
-
-def _record_window(out: Path, filename: str, start: datetime, end: datetime) -> None:
-    """Stamp the window a file was fetched for, as each file lands rather than at the end, so an
-    interrupted run still describes everything it wrote."""
-    manifest = _manifest(out)
-    manifest[filename] = {"start": start.isoformat(), "end": end.isoformat()}
-    (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-
-
-def _require_window(out: Path, filename: str, start: datetime, end: datetime) -> None:
-    """Refuse a file on disk that was not fetched for a window containing [start, end].
-
-    A bundle may be the archived record a published verdict was produced from, so a file that does
-    not cover the requested window is never refetched over in place.
-    """
-    entry = _manifest(out).get(filename)
-    if entry is not None:
-        if datetime.fromisoformat(entry["start"]) <= start and datetime.fromisoformat(entry["end"]) >= end:
-            return
-        held = f"covers {entry['start']} .. {entry['end']}"
-    else:
-        held = f"predates window tracking, so what it covers is unknown ({MANIFEST_NAME} has no entry)"
-    raise SystemExit(
-        f"{out / filename} {held}, but this run needs {start.isoformat()} .. {end.isoformat()}.\n"
-        f"Build into a fresh --out, or delete the file to refetch it."
-    )
-
-
-def fetch_chunked(
-    fetch: Callable[[datetime, datetime], pd.DataFrame],
-    start: datetime,
-    end: datetime,
-    chunk_days: float,
-    label: str,
-) -> pd.DataFrame:
-    """Fetch [start, end) in chunk_days slices with retry, concat the results."""
-    frames = []
-    cursor = start
-    while cursor < end:
-        chunk_end = min(cursor + timedelta(days=chunk_days), end)
+    def fetch_range(start: datetime, end: datetime) -> pd.DataFrame:
         for attempt in range(MAX_RETRIES):
             try:
-                df = fetch(cursor, chunk_end)
+                df = fetch(start, end)
                 break
             except requests.HTTPError as e:
                 # A 404 means the endpoint has no rows for this range — the asset was
                 # not yet listed in the competition (assets are added mid-window).
-                # Treat it as an empty chunk, not a transient error.
+                # Treat it as an empty range, not a transient error.
                 if e.response is not None and e.response.status_code == 404:
                     df = pd.DataFrame()
                     break
-                print(f"  {label} [{cursor:%m-%d} -> {chunk_end:%m-%d}] attempt {attempt + 1} failed: {e}")
+                print(f"  {label} [{start:%m-%d %H:%M} -> {end:%m-%d %H:%M}] attempt {attempt + 1} failed: {e}")
                 sleep(10 * (attempt + 1))
             except Exception as e:  # noqa: BLE001 - transient API errors, retried
-                print(f"  {label} [{cursor:%m-%d} -> {chunk_end:%m-%d}] attempt {attempt + 1} failed: {e}")
+                print(f"  {label} [{start:%m-%d %H:%M} -> {end:%m-%d %H:%M}] attempt {attempt + 1} failed: {e}")
                 sleep(10 * (attempt + 1))
         else:
-            raise RuntimeError(f"{label}: chunk [{cursor} -> {chunk_end}] failed {MAX_RETRIES} times")
-        if not df.empty:
-            frames.append(df)
-        print(f"  {label} [{cursor:%m-%d} -> {chunk_end:%m-%d}]: {len(df)} rows", flush=True)
-        cursor = chunk_end
+            raise RuntimeError(f"{label}: [{start} -> {end}] failed {MAX_RETRIES} times")
+        print(f"  {label} [{start:%m-%d %H:%M} -> {end:%m-%d %H:%M}]: {len(df)} rows", flush=True)
         sleep(REQUEST_SPACING_SECONDS)
-    return pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame()
+        return coerce_numeric_columns(df.drop_duplicates()) if not df.empty else df
+
+    return fetch_range
 
 
 def coerce_numeric_columns(frame: pd.DataFrame) -> pd.DataFrame:
@@ -187,70 +145,39 @@ def build_bundle(
     days: int,
     eval_end: datetime,
     assets: list[str],
-    chunk_days: float,
     out: Path,
     realized_paths: bool = True,
+    force_refresh: bool = False,
 ) -> None:
     competition = SLUG_TO_COMPETITION[slug]
     out.mkdir(parents=True, exist_ok=True)
-
     scores_start = eval_end - timedelta(days=days) - SCORES_PAD
     rewards_start = scores_start - REWARDS_PAD
     rewards_end = eval_end + REWARDS_PAD
-
     for asset in assets:
-        name = f"miner_scores_{asset}_{slug}.parquet"
-        path = out / name
-        if path.exists():
-            _require_window(out, name, scores_start, eval_end)
-            print(f"skip {path} (exists)")
-            df = pd.read_parquet(path)
-        else:
-            df = fetch_chunked(
-                lambda s, e, a=asset: get_miner_scores(s, e, a, competition.time_length, competition.time_increment),
-                scores_start,
-                eval_end,
-                chunk_days,
-                f"scores/{asset}",
-            )
-            df = coerce_numeric_columns(df)
-            df.to_parquet(path, index=False)
-            _record_window(out, name, scores_start, eval_end)
-            prompts = df["scored_time"].nunique() if not df.empty else 0
-            print(f"wrote {path}: {len(df)} rows, {prompts} prompts")
-        if realized_paths:
-            bundle_realized_paths(asset, competition, df)
-
-    name = f"rewards_history_{slug}.parquet"
-    path = out / name
-    if path.exists():
-        _require_window(out, name, rewards_start, rewards_end)
-        print(f"skip {path} (exists)")
-    else:
-        df = fetch_chunked(
-            lambda s, e: get_rewards_history(s, e, prompt_name=slug),
-            rewards_start,
-            rewards_end,
-            chunk_days,
-            "rewards",
+        directory = scores_dir(out, slug, asset)
+        fetch = retrying(
+            lambda s, e, a=asset: get_miner_scores(s, e, a, competition.time_length, competition.time_increment),
+            f"scores/{asset}",
         )
-        df = coerce_numeric_columns(df)
-        df.to_parquet(path, index=False)
-        _record_window(out, name, rewards_start, rewards_end)
-        rounds = df["updated_at"].nunique() if not df.empty else 0
-        print(f"wrote {path}: {len(df)} rows, {rounds} update rounds")
+        fetched = refresh_days(directory, scores_start, eval_end, fetch, "scored_time", force=force_refresh)
+        print(f"{directory}: {fetched} days fetched")
+        if realized_paths:
+            scores = read_days(directory, scores_start, eval_end)
+            bundle_realized_paths(asset, competition, scores)
 
-    name = "miner_pool_usd.parquet"
-    path = out / name
-    if path.exists():
-        _require_window(out, name, rewards_start, rewards_end)
-        print(f"skip {path} (exists)")
-    else:
-        pool = get_daily_miner_pool_usd(rewards_start, rewards_end)
-        pd.DataFrame({"date": pool.index, "usd": pool.values}).to_parquet(path, index=False)
-        _record_window(out, name, rewards_start, rewards_end)
-        print(f"wrote {path}: {len(pool)} days")
+    directory = rewards_dir(out, slug)
+    fetch = retrying(lambda s, e: get_rewards_history(s, e, prompt_name=slug), "rewards")
+    fetched = refresh_days(directory, rewards_start, rewards_end, fetch, "updated_at", force=force_refresh)
+    print(f"{directory}: {fetched} days fetched")
 
+    def pool(start: datetime, end: datetime) -> pd.DataFrame:
+        series = get_daily_miner_pool_usd(start, end)
+        return pd.DataFrame({"date": series.index, "usd": series.values})
+
+    directory = pool_dir(out)
+    fetched = refresh_days(directory, rewards_start, rewards_end, retrying(pool, "pool"), "date", force=force_refresh)
+    print(f"{directory}: {fetched} days fetched")
     print(f"bundle complete: {out.resolve()}")
     print(f"run backtests with SYNTH_BACKTESTER_OFFLINE_DATA_ROOT={out}")
 
@@ -278,10 +205,9 @@ def main() -> None:
         help="assets to bundle (default: the competition's full asset list)",
     )
     parser.add_argument(
-        "--chunk-days",
-        type=float,
-        default=2.0,
-        help="per-request range in days; the scores API rejects ranges over ~3 days (default: 2)",
+        "--force-refresh",
+        action="store_true",
+        help="fetch every day of the window again, complete partitions included",
     )
     parser.add_argument(
         "--out",
@@ -311,9 +237,9 @@ def main() -> None:
         args.days,
         eval_end,
         assets,
-        args.chunk_days,
         out,
         realized_paths=not args.no_realized_paths,
+        force_refresh=args.force_refresh,
     )
 
 

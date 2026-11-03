@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from synth_lib.backtester.field_store import REWARDS_DIR, SCORES_DIR
 from synth_lib.benchmark.budget import BudgetTracker
 from synth_lib.benchmark.campaign import CampaignConfig, load_campaign
 from synth_lib.benchmark.cli_adapters import build_adapter
@@ -45,8 +46,8 @@ OFFLINE_ROOT_ENV = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
 def offline_bundle_env(snapshot: Path) -> dict[str, str]:
     """Point synth-lib's offline mode at a bundle inside the snapshot, when one is present.
 
-    The bundle's scores/rewards/pool parquets are not date partitions, so build_snapshot does not
-    link them — the operator builds them straight into <snapshot>/offline_data. With
+    build_snapshot does not link the bundle — the operator builds it straight into
+    <snapshot>/offline_data, for the days the campaign may see. With
     this set, the agent reads field scores from disk instead of paginating api.synthdata.co one day
     at a time (three concurrent agents would rate-limit each other). `run` refuses to start without
     it (`require_offline_bundle`). It is NOT optional for the verdict either, which runs with
@@ -71,8 +72,13 @@ def require_offline_bundle(snapshot: Path) -> Path:
     """The bundle agents backtest against, or exit. Without it every agent backtest calls the live
     API, and the backtester's padding past the requested window reaches past the data cutoff."""
     bundle = snapshot / OFFLINE_BUNDLE_DIR
-    has_scores = bundle.is_dir() and any(bundle.glob("miner_scores_*.parquet"))
-    has_rewards = bundle.is_dir() and any(bundle.glob("rewards_history_*.parquet"))
+    # Day partitions, or the single files of a bundle built before them.
+    has_scores = bundle.is_dir() and any(
+        [*bundle.glob(f"{SCORES_DIR}/*/*/date=*.parquet"), *bundle.glob("miner_scores_*.parquet")]
+    )
+    has_rewards = bundle.is_dir() and any(
+        [*bundle.glob(f"{REWARDS_DIR}/*/date=*.parquet"), *bundle.glob("rewards_history_*.parquet")]
+    )
     if not (has_scores and has_rewards):
         raise SystemExit(
             f"no offline scores bundle in {bundle}: build it before `run`, one call per competition —\n"

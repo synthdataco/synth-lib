@@ -8,9 +8,9 @@ horizon after it starts, so generation begins one horizon before the scored days
 --cadence-minutes N answers an even grid over the same span instead; each scored prompt is then
 answered by the grid point at or before it.
 
-Works on every asset, including the ones whose minutes do not all trade. Prices load through the
-same lenient path the scored evaluation uses, so a NaN close reaches simulate() rather than
-stopping the run — your model must tolerate them (drop, never interpolate).
+Works on every asset. A minute without a trade is a flat candle with trade_count 0. Prices load
+through the same lenient path the scored evaluation uses, so a NaN close (no price at all) reaches
+simulate() rather than stopping the run — your model must tolerate them (drop, never interpolate).
 
 When the snapshot carries an event calendar ($SYNTH_BENCHMARK_CALENDAR), the summary is followed by
 your gap to each prompt's best miner, over the prompts whose horizon holds an event of each type and
@@ -154,9 +154,8 @@ def generate(
     num_simulations: int = 1000,
 ) -> int:
     # The same loader the scored evaluation uses. NOT MinutePriceStore.load_range, which raises
-    # on a single NaN close: an untraded minute is normal on the thin markets (42% of AAPLX
-    # minutes never trade), so that loader cannot read 9 of the 13 assets at all. NaN reaches
-    # simulate() untouched, which is the contract — never interpolate it away.
+    # on a single NaN close. NaN reaches simulate() untouched, which is the contract — never
+    # interpolate it away.
     prices = load_minute_prices(
         WORKSPACE / "market_data", asset, times[0] - pd.Timedelta(minutes=CONTEXT_MINUTES), times[-1]
     )

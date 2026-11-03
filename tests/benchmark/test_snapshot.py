@@ -95,6 +95,28 @@ def test_render_data_md_measures_the_snapshot(tmp_path):
     assert "NaN close" in md and "Missing file" in md  # semantics block present
 
 
+def test_data_md_reads_the_span_of_a_day_partitioned_bundle(tmp_path):
+    root = tmp_path / "snapshot"
+    btc = root / "prices" / "BTC" / "1m"
+    btc.mkdir(parents=True)
+    idx = pd.date_range("2026-07-01", periods=1440, freq="1min", tz="UTC")
+    pd.DataFrame({"timestamp": idx, "close": 100.0}).to_parquet(btc / "date=2026-07-01.parquet")
+    scores = root / "offline_data" / "miner_scores" / "crypto-24h" / "BTC"
+    scores.mkdir(parents=True)
+    for day in ("2026-07-01", "2026-07-10"):
+        pd.DataFrame({"scored_time": [pd.Timestamp(day, tz="UTC")]}).to_parquet(scores / f"date={day}.parquet")
+    assert "2026-07-01 → 2026-07-10" in render_data_md(root)
+
+
+def test_data_md_counts_flat_zero_trade_minutes_as_untraded(tmp_path):
+    xau = tmp_path / "snapshot" / "prices" / "XAU" / "1m"
+    xau.mkdir(parents=True)
+    idx = pd.date_range("2026-07-01", periods=1440, freq="1min", tz="UTC")
+    trades = [0.0] * 288 + [1.0] * 1152  # 20% flat candles
+    pd.DataFrame({"timestamp": idx, "close": 100.0, "trade_count": trades}).to_parquet(xau / "date=2026-07-01.parquet")
+    assert "| XAU | 2026-07-01 | 2026-07-01 | 1 | 20.0% |" in render_data_md(tmp_path / "snapshot")
+
+
 def _realized(root: Path, asset: str, days: list[str]) -> None:
     d = root / "realized" / asset / "86400_300"
     d.mkdir(parents=True, exist_ok=True)
