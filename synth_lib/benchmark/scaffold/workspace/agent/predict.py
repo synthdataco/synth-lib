@@ -8,6 +8,11 @@ horizon after it starts, so generation begins one horizon before the scored days
 --cadence-minutes N answers an even grid over the same span instead; each scored prompt is then
 answered by the grid point at or before it.
 
+--crps-only scores CRPS alone, against the snapshot's own prices, on an even grid (--cadence-minutes,
+by default every 60 minutes for 24h prompts and every 10 for 1h, on the round hour): no field, no
+rank, and any window of the snapshot, including before the bundle's span. Compare models on the same
+grid with it; it is not an absolute calibration level. crypto-1h is scored with the latest formula.
+
 Works on every asset. A minute without a trade is a flat candle with trade_count 0. Prices load
 through the same lenient path the scored evaluation uses, so a NaN close (no price at all) reaches
 simulate() rather than stopping the run — your model must tolerate them (drop, never interpolate).
@@ -44,7 +49,7 @@ import pandas as pd
 
 from synth_lib.backtester.config import PREDICTION_MATCH_TOLERANCE_MINUTES
 from synth_lib.backtester.loading import get_miner_scores
-from synth_lib.backtester.orchestration import backtest
+from synth_lib.backtester.orchestration import backtest, score_crps
 from synth_lib.benchmark.generate_predictions import context_end, load_minute_prices
 from synth_lib.preparation.config import STORE_SUBDIR
 from synth_lib.preparation.event_calendar.events import CALENDAR_ENV, concerns
@@ -65,6 +70,8 @@ PREDICTIONS_ROOT = WORKSPACE / "miner_outputs" / "campaign"
 OFFLINE_ROOT_ENV = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
 # backtest()'s default miner_id: the rows of prompt_df that are yours.
 CANDIDATE_ID = 999
+# The --crps-only grid, by time_length. Must match synth_lib.benchmark.verdict.run_verdict.CADENCE_MINUTES.
+CRPS_ONLY_CADENCE_MINUTES = {86_400: 60, 3_600: 10}
 
 
 def ensure_workspace_cwd() -> None:
@@ -139,8 +146,8 @@ def prompt_times(
     if scores.empty:
         raise SystemExit(
             f"the offline bundle has no scored {asset} prompt for --time-length {time_length} in "
-            f"{first.date()} → {end.date()} (DATA.md gives its span); --cadence-minutes answers a grid "
-            f"instead, for CRPS only."
+            f"{first.date()} → {end.date()} (DATA.md gives its span); --crps-only scores CRPS alone "
+            f"on any window of the snapshot."
         )
     return sorted(pd.to_datetime(scores["start_time"], utc=True).unique())
 
@@ -236,8 +243,9 @@ def main() -> None:
         "--cadence-minutes",
         type=int,
         default=None,
-        help="answer an even grid every N minutes instead of the validator's own start times. A "
-        "cadence that divides an hour puts every prompt on the round hour",
+        help="answer an even grid every N minutes instead of the validator's own start times (with "
+        "--crps-only, 60 for 24h prompts and 10 for 1h by default). A cadence that divides an hour "
+        "puts every prompt on the round hour",
     )
     ap.add_argument(
         "--latest-formula",
@@ -246,14 +254,22 @@ def main() -> None:
         "including those scored before it went live. Field ranks before that day then compare "
         "two formulas; CRPS does not",
     )
+    ap.add_argument(
+        "--crps-only",
+        action="store_true",
+        help="CRPS alone, against the snapshot's own prices, on an even grid: no field and no rank, "
+        "on any window of the snapshot. crypto-1h is scored with the latest formula",
+    )
     ap.add_argument("--keep-predictions", action="store_true", help="keep this run's prediction files")
     args = ap.parse_args()
-    require_offline_bundle()
+    if not args.crps_only:
+        require_offline_bundle()
     ensure_workspace_cwd()
     end = datetime.fromisoformat(args.eval_end).replace(tzinfo=timezone.utc)
-    times = prompt_times(
-        args.asset, end, args.days, args.time_length, args.time_increment, cadence_minutes=args.cadence_minutes
-    )
+    cadence = args.cadence_minutes
+    if args.crps_only:
+        cadence = cadence or CRPS_ONLY_CADENCE_MINUTES[args.time_length]
+    times = prompt_times(args.asset, end, args.days, args.time_length, args.time_increment, cadence_minutes=cadence)
     # the context reaches back 7 days before the first prompt: coverage must extend that far
     check_snapshot_coverage(args.asset, times[0] - timedelta(minutes=CONTEXT_MINUTES), end)
     PREDICTIONS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -268,6 +284,16 @@ def main() -> None:
             num_simulations=args.num_simulations,
         )
         print(f"predictions generated: {n}")
+        if args.crps_only:
+            result = score_crps(
+                miner_name="campaign",
+                asset=args.asset,
+                time_length=args.time_length,
+                time_increment=args.time_increment,
+                predictions_dir=out_dir,
+            )
+            print("summary:", result.summary)
+            return
         result = backtest(
             miner_name="campaign",
             asset=args.asset,

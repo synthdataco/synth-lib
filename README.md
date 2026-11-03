@@ -237,7 +237,7 @@ the asset count would suggest:
 
 ```python
 from synth.validator.competition_config import CRYPTO_24H
-from synth_lib.backtester.backtest import run_backtest, backtest
+from synth_lib.backtester.orchestration import backtest, run_backtest, score_crps
 
 # Single asset. If `competition` is omitted, backtest() auto-resolves it from
 # (asset, time_length) — here (BTC, 86400) → CRYPTO_24H.
@@ -260,6 +260,11 @@ results, combined = run_backtest(
 print(single.summary)       # {num_prompts, mean_crps, final_smoothed_score, ...}
 single.prompt_df            # per-prompt CRPS and scores (incl. every other miner)
 single.smoothed_scores      # per-round smoothed score + reward_weight
+
+# CRPS alone, each prediction scored at its own start time against the local store: no field,
+# no API call, so any window the store covers. crypto-1h uses the latest formula.
+crps = score_crps(miner_name="gbm_agent", asset="BTC", time_length=86_400)
+print(crps.summary)         # {num_prompts, mean_crps, realized_coverage, ...}
 ```
 
 ### Output
