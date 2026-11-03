@@ -109,13 +109,13 @@ def test_an_empty_fetch_of_a_past_day_is_asked_again(tmp_path):
     assert _closes(store.ingest_day(DAY)) == MINUTES_PER_DAY
 
 
-def test_stored_zero_trade_minutes_do_not_block_a_refetch_that_leaves_them_out(tmp_path):
-    """A partition holding flat zero-trade candles has fewer real prices than its closes suggest."""
+def test_a_day_of_zero_trade_candles_is_not_replaced_by_a_shorter_refetch(tmp_path):
+    """A flat zero-trade candle is a price: it counts on both sides of the comparison."""
     path = _store(tmp_path, _Client(rows=MINUTES_PER_DAY)).ingest_day(DAY, force_refresh=True)
     frame = pd.read_parquet(path)
-    frame.loc[frame.index[::10], "trade_count"] = 0.0
+    frame.loc[frame.index[::2], "trade_count"] = 0.0
     frame.to_parquet(path, index=False)
 
-    traded = _Client(rows=MINUTES_PER_DAY - MINUTES_PER_DAY // 10)
-    written = _store(tmp_path, traded).ingest_day(DAY, force_refresh=True)
-    assert pd.read_parquet(written)["trade_count"].ne(0).all()
+    # the venue still serves only 800 minutes of the day
+    written = _store(tmp_path, _Client(rows=800)).ingest_day(DAY, force_refresh=True)
+    assert _closes(written) == MINUTES_PER_DAY
