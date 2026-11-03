@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from synth_lib.backtester.field_store import day_path, read_days, refresh_days
 
@@ -60,6 +62,27 @@ def test_a_day_that_has_not_settled_is_partial(tmp_path):
     )
     assert day_path(tmp_path, date(2026, 9, 15), partial=True).exists()
     assert not day_path(tmp_path, date(2026, 9, 15)).exists()
+
+
+def test_a_settled_day_that_came_back_empty_is_partial_and_fetched_again(tmp_path):
+    def empty(start, end):
+        return pd.DataFrame(columns=["scored_time", "crps"])
+
+    refresh_days(tmp_path, DAY, DAY + timedelta(days=1), empty, "scored_time", now=LATER)
+    assert day_path(tmp_path, date(2026, 9, 15), partial=True).exists()
+    assert refresh_days(tmp_path, DAY, DAY + timedelta(days=1), _Fetch(), "scored_time", now=LATER) == 1
+    assert len(pd.read_parquet(day_path(tmp_path, date(2026, 9, 15)))) == 24
+
+
+def test_an_interrupted_write_leaves_no_partition_behind(tmp_path, monkeypatch):
+    def cut_short(self, path, **kwargs):
+        Path(path).write_bytes(b"PAR1")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", cut_short)
+    with pytest.raises(KeyboardInterrupt):
+        refresh_days(tmp_path, DAY, DAY + timedelta(days=1), _Fetch(), "scored_time", now=LATER)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_rows_outside_the_day_are_dropped(tmp_path):

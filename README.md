@@ -352,9 +352,9 @@ miner_pool_usd/date=YYYY-MM-DD.parquet
 
 A rerun fetches only the days of its window that have no complete partition, so a wider window
 adds only its new days (`--force-refresh` fetches every day again). A day fetched before it settled,
-or only up to the window's end, is kept as `date=YYYY-MM-DD.partial.parquet` and fetched again by
-the next run. Bundles built before day partitions (`miner_scores_{ASSET}_{competition}.parquet` and
-so on) are still read.
+only up to the window's end, or that came back empty, is kept as `date=YYYY-MM-DD.partial.parquet`
+and fetched again by the next run. Bundles built before day partitions
+(`miner_scores_{ASSET}_{competition}.parquet` and so on) are still read.
 
 Note the competition's smoothed-score window (`window_days`, 10 for the 24h
 competitions) is trimmed from the start of the backtest as warmup, so a

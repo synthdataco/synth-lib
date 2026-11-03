@@ -4,8 +4,9 @@
     rewards_history/{slug}/date=YYYY-MM-DD.parquet        # rows by updated_at
     miner_pool_usd/date=YYYY-MM-DD.parquet                # rows by date
 
-A day fetched whole once it had settled is complete. A day fetched before that, or only up to the
-end a run asked for, is kept as date=YYYY-MM-DD.partial.parquet and fetched again by the next run.
+A day fetched whole, with rows, once it had settled is complete. A day fetched before that, only up
+to the end a run asked for, or that came back empty, is kept as date=YYYY-MM-DD.partial.parquet and
+fetched again by the next run.
 """
 
 from __future__ import annotations
@@ -16,8 +17,10 @@ from typing import Callable
 
 import pandas as pd
 
-# Imports nothing from synth-lib, so the campaign orchestrator can read the layout without pulling
-# the backtester in.
+from synth_lib.preparation.event_calendar.events import write_atomic
+
+# Imports nothing from the backtester, so the campaign orchestrator can read the layout without
+# pulling it in.
 UTC = timezone.utc
 
 SCORES_DIR = "miner_scores"
@@ -94,8 +97,8 @@ def refresh_days(
         if not frame.empty:
             stamps = pd.to_datetime(frame[time_column], utc=True)
             frame = frame.loc[(stamps >= day_start) & (stamps < fetch_end)]
-        whole = fetch_end == day_end and now >= day_end + SETTLE
-        frame.to_parquet(complete if whole else partial, index=False)
+        whole = fetch_end == day_end and now >= day_end + SETTLE and not frame.empty
+        write_atomic(frame, complete if whole else partial)
         if whole:
             partial.unlink(missing_ok=True)
         fetched += 1
