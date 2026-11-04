@@ -59,6 +59,17 @@ can land far apart on it without differing in any way that matters.
 So: **judge every experiment on CRPS**, per configuration and per asset. Report position if you
 like, but never trade a CRPS regression for a better one.
 
+**Your champion will also mine live, where it is paid in emission.** After the campaign, champions
+are deployed as miners on the subnet, and emission rewards two things a mean CRPS hides:
+
+- **Every prompt answered.** A request that times out, raises, or returns a wrong path count is a
+  miss, and a miss is scored like the field's 95th percentile on that prompt.
+- **Contexts rougher than the snapshot.** A live context can hold longer gaps, and a shorter real
+  history after the miner restarts.
+
+None of this makes position a target: emission is earned by a low CRPS on every prompt, with no
+exceptions.
+
 How the reported position is formed, for completeness: the aggregation does not average across
 assets. It weights each asset by `ASSET_COEFFICIENTS` (`synth.validator.moving_average`),
 normalizes per miner, then applies a softmax, so a high-coefficient asset carries much more
@@ -274,6 +285,12 @@ windows of opposite regimes (within the limits of the snapshot), one variable at
 frequent commits. Watch out for the edges of eval windows: only backtest windows fully covered
 by the snapshot. Lessons earlier agents paid for:
 
+- **Explain your CRPS before you tune it.** Break a backtest's CRPS down by asset, configuration,
+  hour of day and day, and read the worst prompts: the realized path, your fan, and the field's CRPS
+  on the same prompt (`backtest()` returns every miner's CRPS per prompt in `prompt_df`; save it from
+  `agent/predict.py`). For each anomaly, find the explanation: a gap in the context, an event, a
+  regime change, a bug in your model. Write it in your journal before you change anything. An
+  explained anomaly tells you what to fix; a sweep over an unexplained one tunes to noise.
 - **Price a residual before fitting it.** For a Gaussian fan, expected CRPS at scale σ against
   the right σ* is about 1 + ¼·(ln σ/σ*)² times the optimum: a ±20 % global scale error costs about
   1 %, and a width correction across buckets can gain at most about ¼ of the variance of the
