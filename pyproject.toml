@@ -40,6 +40,11 @@ benchmark = [
     "pyyaml>=6.0",
 ]
 
+# Competition kinds, looked up by name (synth_lib.benchmark.kinds.load_kind). Another package
+# registers its own kinds under the same group.
+[project.entry-points."synth_lib.benchmark.kinds"]
+monte-carlo = "synth_lib.benchmark.monte_carlo:KIND"
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",

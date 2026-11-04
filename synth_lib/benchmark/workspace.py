@@ -12,9 +12,8 @@ from pathlib import Path
 
 from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
 from synth_lib.benchmark.constitution import render_constitution
+from synth_lib.benchmark.kinds import load_kind
 from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, VIEW_FILE
-
-SCAFFOLD_DIR = Path(__file__).parent / "scaffold" / "workspace"
 
 # Anchored on the list brackets, not on the dep names, so reordering the scaffold's
 # dependencies does not silently stop pre-seeding torch.
@@ -127,17 +126,18 @@ def create_workspace(cfg: CampaignConfig, model: ModelSpec, data_md: str | None 
         raise ValueError(
             f"workspace already present and non-empty: {ws} — clean it up with `rm -rf {ws}` before rerunning"
         )
+    kind = load_kind(cfg.kind)
     ws.parent.mkdir(parents=True, exist_ok=True)
     # dirs_exist_ok: an EMPTY leftover directory passes the guard above (a setup that died before
     # writing anything leaves one), and copytree would then raise FileExistsError instead — a worse
     # error than the actionable one above.
-    shutil.copytree(SCAFFOLD_DIR, ws, dirs_exist_ok=True)
+    shutil.copytree(kind.scaffold, ws, dirs_exist_ok=True)
     # Shipped as gitignore.tmpl because a packaged dotfile is easily lost by build backends;
     # written out under its real name here, the same post-processing the pyproject gets below.
     tmpl = ws / "gitignore.tmpl"
     if tmpl.exists():
         tmpl.rename(ws / ".gitignore")
-    _pin_scaffold_to_host(ws / "pyproject.toml")
+    kind.pin_workspace(ws)
     if cfg.gpu:
         _add_gpu_dependency(ws / "pyproject.toml")
     (ws / "agent" / "journal.md").write_text("")

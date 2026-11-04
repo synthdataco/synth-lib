@@ -55,7 +55,7 @@ from synth_lib.benchmark.generate_predictions import CONTEXT_MODES
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
-from synth_lib.benchmark.snapshot import sha256_file
+from synth_lib.benchmark.manifest import sha256_file
 from synth_lib.benchmark.verdict.evaluate import COMPETITIONS, evaluate_candidate, prepare_offline_bundle
 from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 

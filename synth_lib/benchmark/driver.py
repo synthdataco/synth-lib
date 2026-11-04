@@ -18,8 +18,7 @@ from synth_lib.benchmark.budget import BudgetStatus, BudgetTracker, Phase
 from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
 from synth_lib.benchmark.cli_adapters import CLIAdapter
 from synth_lib.benchmark.gpu_usage import GpuUsage
-from synth_lib.benchmark.nomination import probe_simulate_subprocess
-from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
+from synth_lib.benchmark.kinds import load_kind
 
 INITIAL_PROMPT = "Read the CAMPAIGN.md file in your agent folder and start your research campaign."
 RESUME_PROMPT = (
@@ -42,11 +41,6 @@ GPU_PROMPT = (
 )
 # How many times a nomination short of min_gpu_minutes is handed back before it stands anyway.
 MAX_GPU_RELAUNCHES = 3
-INTERFACE_PROMPT = (
-    "Your nomination does not stand yet: the harness called agent/modeling.py's simulate() on both "
-    "prompt formats and got: {check}. Fix it, run no new experiments, and nominate again. BUDGET.md "
-    "shows the check."
-)
 # How many times a nomination that fails the interface check is handed back before it stands anyway.
 MAX_INTERFACE_RELAUNCHES = 1
 DELIVERABLES = ("report.md", "journal.md", "CHAMPION", "suggestions.md")
@@ -105,6 +99,7 @@ class ModelRun:
         cmd_wrapper: Callable[[list[str]], list[str]] | None = None,
     ):
         self.cfg = cfg
+        self.kind = load_kind(cfg.kind)
         self.model = model
         self.adapter = adapter
         self.tracker = tracker
@@ -261,18 +256,10 @@ class ModelRun:
         )
 
     def _probe_interface(self, status: BudgetStatus) -> None:
-        """Checks the nominated champion's simulate() contract once and logs the result.
+        """Checks the nominated champion's interface once, with the kind's probe, and logs the result.
         The result is memoized on the instance (self._probe_note): once known, it must stay visible
-        in BUDGET.md on every subsequent poll, not just the one where the probe ran.
-        Out-of-process with a timeout (see synth_lib.benchmark.nomination.probe_simulate_subprocess): the
-        nominated champion is untrusted code — running it in-process would expose the host env, and
-        a blocking simulate() would freeze run() entirely."""
-        calendar = self.cfg.dir / "snapshot" / CALENDAR_DIR / VIEW_FILE
-        ok, msg = probe_simulate_subprocess(
-            self.agent_dir / "modeling.py",
-            python_exe=self.python_exe,
-            extra_env={CALENDAR_ENV: str(calendar.resolve())} if calendar.exists() else None,
-        )
+        in BUDGET.md on every subsequent poll, not just the one where the probe ran."""
+        ok, msg = self.kind.probe(self.agent_dir, self.cfg.dir / "snapshot", self.python_exe)
         # Surface msg on success too, not a bare "OK": probe_all_shapes reports WHICH formats
         # passed ("ok (24h + 1h)"), and that distinction is the whole point of the check — a
         # champion that ignores time_increment passes 24h and breaks on crypto-1h.
@@ -315,7 +302,8 @@ class ModelRun:
                     f"champion fails the interface check: relaunching "
                     f"({self._interface_relaunches}/{MAX_INTERFACE_RELAUNCHES})"
                 )
-                prompt = INTERFACE_PROMPT.format(check=self._probe_note.removeprefix("check interface: ")[:600])
+                check = self._probe_note.removeprefix("check interface: ")[:600]
+                prompt = self.kind.interface_prompt.format(check=check)
                 return False, self._launch(prompt, resume=True), crash_resumes, voluntary_resumes + 1
             self._log("clean landing: process exited with agent/CHAMPION present")
             return True, proc, crash_resumes, voluntary_resumes  # clean landing

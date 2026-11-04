@@ -11,16 +11,6 @@ import requests
 
 from synth_lib.benchmark.clock import RunClock
 
-LANDING_ORDER = (
-    "## LANDING ORDER — NON-NEGOTIABLE\n\n"
-    "Your envelope is nearly exhausted. STOP any new experiment NOW.\n"
-    "1. Finalize `agent/journal.md` (including the last iteration).\n"
-    "2. Write the complete `agent/report.md` (honest results, failures included).\n"
-    "3. Nominate your champion: write the `agent/CHAMPION` file (sha, agent_dir, profiles, notes).\n"
-    "   The path matters: the harness looks ONLY at `agent/CHAMPION`.\n"
-    "4. Verify that the weights/artifacts required by `simulate()` are in the workspace.\n"
-)
-
 
 class Phase(enum.Enum):
     NORMAL = "normal"
@@ -42,12 +32,21 @@ class BudgetStatus:
 
 
 class BudgetTracker:
-    def __init__(self, admin, virtual_key: str, budget_usd: float, soft_landing_pct: float, clock: RunClock):
+    def __init__(
+        self,
+        admin,
+        virtual_key: str,
+        budget_usd: float,
+        soft_landing_pct: float,
+        clock: RunClock,
+        landing_order: str,
+    ):
         self._admin = admin
         self._key = virtual_key
         self._budget = budget_usd
         self._soft = soft_landing_pct
         self.clock = clock
+        self._landing_order = landing_order
         self._last_spend = 0.0
         self._infra_down = False
         self._last_error: str | None = None
@@ -103,7 +102,7 @@ class BudgetTracker:
                 note += f" (cause: {status.last_error})"
             lines.append(note)
         if status.phase is Phase.LANDING:
-            lines += ["", LANDING_ORDER]
+            lines += ["", self._landing_order]
         if notes:
             lines += ["", f"## Harness notes\n\n{notes}"]
         target = workspace / "BUDGET.md"

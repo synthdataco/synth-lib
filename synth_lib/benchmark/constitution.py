@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from string import Template
 
 from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
+from synth_lib.benchmark.kinds import load_kind
 
-TEMPLATE_PATH = Path(__file__).parent / "constitution" / "CAMPAIGN.md.tmpl"
 # Appended to the hardware line when the campaign sets min_gpu_minutes.
 GPU_REQUIREMENT = (
     " The harness meters GPU activity at every poll and `BUDGET.md` shows the count: a nomination "
@@ -35,7 +34,7 @@ CALENDAR_METHOD = """
 
 
 def render_constitution(cfg: CampaignConfig, model: ModelSpec, has_calendar: bool = False) -> str:
-    return Template(TEMPLATE_PATH.read_text()).substitute(
+    return Template(load_kind(cfg.kind).template.read_text()).substitute(
         calendar_data=CALENDAR_DATA if has_calendar else "",
         calendar_rule=CALENDAR_RULE if has_calendar else "",
         calendar_method=CALENDAR_METHOD if has_calendar else "",

@@ -1,10 +1,11 @@
 import json
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 
-from synth_lib.benchmark.snapshot import build_snapshot, render_data_md, verify_snapshot
+from synth_lib.benchmark.manifest import link_partitions, verify_snapshot, write_manifest
+from synth_lib.benchmark.snapshot import build_snapshot, render_data_md
 from synth_lib.preparation.event_calendar.events import (
     CALENDAR_DIR,
     LEDGER_COLUMNS,
@@ -252,3 +253,21 @@ def test_data_md_counts_each_event_type_and_the_ones_released_with_it(tmp_path):
     assert "**Scheduled events**" in md and "$SYNTH_BENCHMARK_CALENDAR" in md and "Volatility" not in md
     assert "| CPI | 1 | 0 | — |" in md
     assert "| GDP | 1 | 1 | PCE 2/2 |" in md and "| PCE | 1 | 1 | GDP 2/2 |" in md
+
+
+def _day_of_name(path: Path) -> date:
+    return datetime.strptime(path.stem.removeprefix("day-"), "%Y%m%d").date()
+
+
+def test_link_partitions_takes_any_layout_and_day_of_a_file(tmp_path):
+    """Another layout than date=YYYY-MM-DD.parquet: the day is parsed from the file name."""
+    src = tmp_path / "series"
+    (src / "a").mkdir(parents=True)
+    for day in ("20260709", "20260710", "20260715", "20260716"):
+        (src / "a" / f"day-{day}.bin").write_bytes(day.encode())
+    dest = tmp_path / "snapshot" / "series"
+    manifest = link_partitions(src, dest, "*.bin", _day_of_name, cutoff=date(2026, 7, 15), start=date(2026, 7, 10))
+    assert sorted(manifest) == ["a/day-20260710.bin", "a/day-20260715.bin"]
+    assert (dest / "a" / "day-20260710.bin").stat().st_ino == (src / "a" / "day-20260710.bin").stat().st_ino
+    write_manifest(dest, manifest)
+    assert verify_snapshot(dest)

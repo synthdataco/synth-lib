@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 import re
 from collections import Counter
 from datetime import date, timedelta
@@ -14,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from synth_lib.backtester.field_store import SCORES_DIR
+from synth_lib.benchmark.manifest import link_partitions, sha256_file, write_manifest
 from synth_lib.preparation.config import STORE_SUBDIR
 from synth_lib.preparation.event_calendar.events import (
     CALENDAR_DIR,
@@ -25,21 +23,12 @@ from synth_lib.preparation.event_calendar.events import (
     write_atomic,
 )
 
-
-def sha256_file(path: Path) -> str:
-    """SHA256 digest of a file, in chunks.
-
-    Deliberately self-contained: the benchmark depends on NO operator-private code, which keeps it
-    portable (server deployment, any git base) and avoids having to run mypy over modules
-    outside its scope."""
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
 _PARTITION_RE = re.compile(r"^date=(\d{4}-\d{2}-\d{2})\.parquet$")
+
+
+def _partition_day(path: Path) -> date | None:
+    m = _PARTITION_RE.match(path.name)
+    return date.fromisoformat(m.group(1)) if m else None
 
 
 def build_snapshot(source_root: Path, dest_root: Path, cutoff: date, start: date | None = None) -> dict[str, str]:
@@ -49,20 +38,7 @@ def build_snapshot(source_root: Path, dest_root: Path, cutoff: date, start: date
     market_data and snapshot only the 2 months a campaign should train on. None = no lower
     bound, i.e. everything up to the cutoff. A rebuilt snapshot keeps its partitions and its frozen
     calendar."""
-    manifest: dict[str, str] = {}
-    for src in sorted(Path(source_root).rglob("date=*.parquet")):
-        m = _PARTITION_RE.match(src.name)
-        if m is None:
-            continue
-        day = date.fromisoformat(m.group(1))
-        if day > cutoff or (start is not None and day < start):
-            continue
-        rel = src.relative_to(source_root)
-        dst = dest_root / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if not dst.exists():
-            os.link(src, dst)
-        manifest[str(rel)] = sha256_file(dst)
+    manifest = link_partitions(source_root, dest_root, "date=*.parquet", _partition_day, cutoff, start)
     if not manifest:
         window = f"in [{start}, {cutoff}]" if start is not None else f"<= {cutoff}"
         raise ValueError(f"no partition {window} under {source_root}")
@@ -74,7 +50,7 @@ def build_snapshot(source_root: Path, dest_root: Path, cutoff: date, start: date
         write_atomic(known_at(read_ledger(ledger), at), view)
     if view.exists():
         manifest[str(view.relative_to(dest_root))] = sha256_file(view)
-    (dest_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    write_manifest(dest_root, manifest)
     return manifest
 
 
@@ -269,8 +245,3 @@ def _flat_step_shares(realized: Path) -> list[tuple[str, float]]:
             increment = int(prompt_dir.name.split("_")[1])
             shares.append((f"{prompt_dir.parent.name} ({increment // 60} min)", flat / steps))
     return sorted(shares, key=lambda item: -item[1])
-
-
-def verify_snapshot(dest_root: Path) -> bool:
-    entries = json.loads((dest_root / "manifest.json").read_text())
-    return all(sha256_file(dest_root / rel) == digest for rel, digest in entries.items())
