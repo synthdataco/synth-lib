@@ -26,7 +26,7 @@ from synth_lib.backtester.loading import (
     load_prediction,
 )
 from synth_lib.backtester.miner_data_handler import _BacktestMinerDataHandler
-from synth_lib.backtester.orchestration import backtest
+from synth_lib.backtester.orchestration import backtest, score_crps
 from synth_lib.backtester.plots.crps import (
     _compute_relative_crps,
     plot_crps_by_day,
@@ -1933,3 +1933,80 @@ def test_an_index_without_its_paths_is_not_a_prompt(tmp_path):
         json.dumps({"start_times": ["2026-09-17T00:00:00+00:00"], "asset": "BTC", "time_length": 3600})
     )
     assert build_prediction_index(tmp_path) == {}
+
+
+class TestScoreCrps:
+    """CRPS against the local store, each prediction at its own start: no field, any window."""
+
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    def test_each_prediction_is_scored_at_its_own_start_without_the_field(
+        self, mock_prices: object, mock_crps: object, predictions_dir: Path, monkeypatch
+    ) -> None:
+        def no_field(*a, **k):
+            raise AssertionError("score_crps must not read the field")
+
+        monkeypatch.setattr("synth_lib.backtester.orchestration.get_miner_scores", no_field)
+        mock_prices.return_value = _make_price_df(T0, SCORED_T1)  # type: ignore[union-attr]
+        mock_crps.return_value = (FAKE_CRPS, [{"interval": "stub"}])  # type: ignore[union-attr]
+
+        result = score_crps(asset=ASSET, time_length=TIME_LENGTH, predictions_dir=predictions_dir)
+
+        assert mock_prices.call_args.args == (T0 - timedelta(hours=2), SCORED_T1, ASSET)  # type: ignore[union-attr]
+        assert result.summary["num_prompts"] == 2 and result.summary["mean_crps"] == pytest.approx(FAKE_CRPS)
+        assert result.summary["realized_coverage"] == 1.0
+        assert list(pd.to_datetime(result.prompt_df["scored_time"], utc=True)) == [
+            pd.Timestamp(SCORED_T0),
+            pd.Timestamp(SCORED_T1),
+        ]
+        assert result.smoothed_scores.empty
+
+    @pytest.mark.parametrize(
+        "missing, kept",
+        [
+            ((T1, SCORED_T1), [T0]),
+            ((T1 + timedelta(minutes=1), SCORED_T1), [T0]),
+            ((T1, SCORED_T1 - timedelta(minutes=1)), [T0, T1]),
+        ],
+        ids=["no-price", "start-only", "end-only"],
+    )
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    def test_a_prediction_whose_path_has_no_price_after_its_start_is_left_out(
+        self, mock_prices: object, mock_crps: object, predictions_dir: Path, missing, kept
+    ) -> None:
+        """The validator's CRPS of a path with no price after its start is 0, the best score there
+        is. A last price alone is scored."""
+        prices = _make_price_df(T0, SCORED_T1)
+        prices.loc[missing[0] : missing[1], "close"] = np.nan
+        mock_prices.return_value = prices  # type: ignore[union-attr]
+        mock_crps.return_value = (FAKE_CRPS, [{"interval": "stub"}])  # type: ignore[union-attr]
+
+        result = score_crps(asset=ASSET, time_length=TIME_LENGTH, predictions_dir=predictions_dir)
+
+        assert list(pd.to_datetime(result.prompt_df["start_time"], utc=True)) == [pd.Timestamp(s) for s in kept]
+
+    @patch("synth_lib.backtester.scoring.calculate_crps_for_miner")
+    @patch("synth_lib.backtester.scoring.calculate_total_score_for_miner")
+    @patch("synth_lib.backtester.orchestration.download_price_data")
+    def test_crypto_1h_is_scored_with_the_latest_formula(
+        self, mock_prices: object, mock_total: object, mock_crps: object, tmp_path: Path
+    ) -> None:
+        """No field to stay comparable with, so a prompt from before the volatility term is scored
+        as prompts are scored now."""
+        start = datetime(2026, 3, 28, tzinfo=UTC)
+        steps = CRYPTO_1H.time_length // CRYPTO_1H.time_increment
+        name = start.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_BTC_{CRYPTO_1H.time_length}.json"
+        (tmp_path / name).write_text(json.dumps({"paths": np.full((NUM_SIMULATIONS, steps + 1), 1e5).tolist()}))
+        mock_prices.return_value = _make_price_df(start, start + timedelta(hours=1))  # type: ignore[union-attr]
+        mock_total.return_value = (FAKE_CRPS, [])  # type: ignore[union-attr]
+
+        result = score_crps(
+            asset="BTC",
+            time_length=CRYPTO_1H.time_length,
+            predictions_dir=tmp_path,
+        )
+
+        assert start < VOL_CRPS_1H_DATE
+        assert mock_total.called and not mock_crps.called  # type: ignore[union-attr]
+        assert result.summary["mean_crps"] == pytest.approx(FAKE_CRPS)

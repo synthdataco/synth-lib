@@ -80,7 +80,10 @@ horizon before the window and yours is never treated as late.
   each run scores only its own predictions, so runs can go in parallel. It is also used for the 1h
   format (pass `--time-length 3600 --time-increment 60`). `--cadence-minutes N` answers an even
   grid instead; a cadence that divides an hour puts every prompt on the round hour, where
-  volatility spikes, so do not read an absolute calibration level off such a grid.
+  volatility spikes, so do not read an absolute calibration level off such a grid. `--crps-only`
+  scores CRPS alone, against the snapshot's own prices, on such a grid and on any window of the
+  snapshot, before the field bundle's span included: no field, no rank. Use it to compare models
+  on the same grid.
 - **`market_data/`**: a frozen snapshot of minute OHLCV (parquet partitions
   `prices/{ASSET}/1m/date=YYYY-MM-DD.parquet`, columns `open, high, low, close, volume,
   trade_count`, resolve it with
@@ -153,9 +156,9 @@ horizon before the window and yours is never treated as late.
   `SYNTH_BACKTESTER_OFFLINE_DATA_ROOT` is set in your environment and points at a bundle of
   historical scores inside your snapshot, so no API call is needed. DATA.md gives the measured
   span of scored prompts it holds: a field-relative number outside that span has nothing to
-  compare against, though CRPS is still computable. DATA.md also gives the span of the cached
-  realized paths, which are a different thing — they stand in for minutes your price store is
-  missing.
+  compare against, and `agent/predict.py --crps-only` scores CRPS alone. DATA.md also gives the
+  span of the cached realized paths, which are a different thing — they stand in for minutes your
+  price store is missing.
 - **synth-subnet** (a synth-lib dependency; source: github.com/synthdataco/synth-subnet): the
   validator's code. Read it to understand exactly how you'll be scored.
 - **Public Synth API** (api.synthdata.co): historical field scores

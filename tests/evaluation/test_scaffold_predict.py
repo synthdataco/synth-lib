@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES
 from synth_lib.preparation.event_calendar.events import CALENDAR_ENV, event_frame, write_atomic
 
 SCAFFOLD_PREDICT = (
@@ -55,6 +56,47 @@ def test_answers_the_start_times_the_validator_scored(predict, monkeypatch):
     assert asked == [(END - timedelta(days=3), END)]
 
 
+def _run_main(predict, monkeypatch, argv):
+    """main() up to scoring: the prompt_times call and the scorer it reached."""
+    seen = {}
+
+    def times(*a, **k):
+        seen["times"] = k
+        return [pd.Timestamp("2026-09-12T10:00:00Z")]
+
+    monkeypatch.setattr(predict, "prompt_times", times)
+    monkeypatch.setattr(predict, "check_snapshot_coverage", lambda *a: None)
+    monkeypatch.setattr(predict, "ensure_workspace_cwd", lambda: None)
+    monkeypatch.setattr(predict, "generate", lambda *a, **k: 1)
+
+    def fake_backtest(**kw):
+        seen["scorer"] = "backtest"
+        return SimpleNamespace(summary={})
+
+    def fake_score_crps(**kw):
+        seen["scorer"] = "score_crps"
+        return SimpleNamespace(summary={})
+
+    monkeypatch.setattr(predict, "backtest", fake_backtest)
+    monkeypatch.setattr(predict, "score_crps", fake_score_crps)
+    monkeypatch.setattr(sys, "argv", ["predict.py", "--eval-end", "2026-09-14", *argv])
+    predict.main()
+    return seen
+
+
+def test_crps_only_needs_no_field_bundle_and_answers_the_scored_density(predict, monkeypatch):
+    monkeypatch.delenv(predict.OFFLINE_ROOT_ENV)
+    seen = _run_main(predict, monkeypatch, ["--crps-only"])
+    assert seen["scorer"] == "score_crps"
+    assert seen["times"] == {"cadence_minutes": 60}
+    one_hour = ["--crps-only", "--time-length", "3600", "--time-increment", "60"]
+    assert _run_main(predict, monkeypatch, one_hour)["times"]["cadence_minutes"] == 10
+
+
+def test_the_crps_only_grid_is_the_verdicts(predict):
+    assert predict.CRPS_ONLY_CADENCE_MINUTES == CADENCE_MINUTES
+
+
 def test_a_grid_spans_the_same_prompts_a_horizon_earlier(predict):
     times = predict.prompt_times("BTC", END, 1, 3_600, 60, cadence_minutes=30)
     assert times[0] == END - timedelta(days=1, hours=1)
@@ -67,7 +109,8 @@ def test_no_scored_prompt_in_the_bundle_says_so(predict, monkeypatch):
         predict.prompt_times("BTC", END, 3, 86_400, 300)
 
 
-def test_each_run_scores_only_its_own_predictions(predict, monkeypatch):
+@pytest.mark.parametrize("scorer, flags", [("backtest", []), ("score_crps", ["--crps-only"])])
+def test_each_run_scores_only_its_own_predictions(predict, monkeypatch, scorer, flags):
     """A shared directory let a concurrent run of another model overwrite the files being scored."""
     t = pd.Timestamp("2026-09-12T10:17:00Z")
     scored_dirs: list[Path] = []
@@ -76,7 +119,7 @@ def test_each_run_scores_only_its_own_predictions(predict, monkeypatch):
         (out_dir / f"{t:%Y-%m-%d_%H:%M:%SZ}_{asset}_86400.json").write_text("{}")
         return 1
 
-    def fake_backtest(*, predictions_dir, **kw):
+    def fake_score(*, predictions_dir, **kw):
         scored_dirs.append(predictions_dir)
         assert [p.name for p in predictions_dir.iterdir()] == [f"{t:%Y-%m-%d_%H:%M:%SZ}_BTC_86400.json"]
         return SimpleNamespace(summary={})
@@ -85,11 +128,11 @@ def test_each_run_scores_only_its_own_predictions(predict, monkeypatch):
     monkeypatch.setattr(predict, "check_snapshot_coverage", lambda *a: None)
     monkeypatch.setattr(predict, "ensure_workspace_cwd", lambda: None)
     monkeypatch.setattr(predict, "generate", fake_generate)
-    monkeypatch.setattr(predict, "backtest", fake_backtest)
+    monkeypatch.setattr(predict, scorer, fake_score)
     for argv in (
-        ["--eval-end", "2026-09-14"],
-        ["--eval-end", "2026-09-14"],
-        ["--eval-end", "2026-09-14", "--keep-predictions"],
+        ["--eval-end", "2026-09-14", *flags],
+        ["--eval-end", "2026-09-14", *flags],
+        ["--eval-end", "2026-09-14", "--keep-predictions", *flags],
     ):
         monkeypatch.setattr(sys, "argv", ["predict.py", *argv])
         predict.main()

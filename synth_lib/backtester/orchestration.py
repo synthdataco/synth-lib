@@ -87,6 +87,39 @@ def _realized_coverage(prompts: list[dict]) -> dict[str, object]:
     }
 
 
+def _score_prompts(
+    prompts: list[dict[str, Any]],
+    scoring_intervals: dict[str, int],
+    competition: CompetitionConfig,
+    miner_id: int,
+    latest_formula: bool,
+    scoring_executor: ProcessPoolExecutor | None,
+) -> pd.DataFrame:
+    """One CRPS row per prompt, in parallel when an executor is given."""
+    work_items = [
+        (
+            prompt["file_path"],
+            prompt["start_time"],
+            prompt["asset"],
+            prompt["scored_time"],
+            prompt["time_length"],
+            prompt["time_increment"],
+            prompt["real_prices"],
+            scoring_intervals,
+            competition.vol_scoring_blocks,
+            miner_id,
+            latest_formula,
+        )
+        for prompt in prompts
+    ]
+    if scoring_executor is not None:
+        futures = [scoring_executor.submit(_score_single_prompt, *item) for item in work_items]
+        raw_results = [f.result() for f in futures]
+    else:
+        raw_results = [_score_single_prompt(*item) for item in work_items]
+    return pd.concat([pd.DataFrame(r, index=[0]) for r in raw_results], ignore_index=True)
+
+
 def backtest(
     miner_name: str = "initial_research",
     asset: str = "BTC",
@@ -295,39 +328,13 @@ def backtest(
     _fill_gaps_from_realized_paths(prompts, log_prefix)
     realized_coverage = _realized_coverage(prompts)
 
-    work_items = [
-        (
-            prompt["file_path"],
-            prompt["start_time"],
-            prompt["asset"],
-            prompt["scored_time"],
-            prompt["time_length"],
-            prompt["time_increment"],
-            prompt["real_prices"],
-            scoring_intervals,
-            competition.vol_scoring_blocks,
-            miner_id,
-            latest_formula,
-        )
-        for prompt in prompts
-    ]
-
-    # Dispatch scoring — parallel if executor provided, else sequential
-    if scoring_executor is not None:
-        futures = [scoring_executor.submit(_score_single_prompt, *item) for item in work_items]
-        raw_results = [f.result() for f in futures]
-    else:
-        raw_results = [_score_single_prompt(*item) for item in work_items]
-
-    scores_extensions = [pd.DataFrame(r, index=[0]) for r in raw_results]
-
     # Step 7: concatenate LLM miner scores
-    if not scores_extensions:
+    if not prompts:
         raise RuntimeError(
             "No prediction files matched any scored prompt. "
             "Check that prediction filenames align with the scored time range."
         )
-    new_scores = pd.concat(scores_extensions, ignore_index=True)
+    new_scores = _score_prompts(prompts, scoring_intervals, competition, miner_id, latest_formula, scoring_executor)
     print(
         f"{log_prefix} scored {len(new_scores)} prompts in {perf_counter()-t_score:.1f}s",
         flush=True,
@@ -477,6 +484,77 @@ def backtest(
         prompt_df=all_scores,
         smoothed_scores=recalculated_smoothed_scores,
         summary=summary,
+    )
+
+
+def score_crps(
+    miner_name: str = "initial_research",
+    asset: str = "BTC",
+    *,
+    time_length: int,
+    time_increment: int | None = None,
+    miner_id: int = 999,
+    predictions_dir: Path | None = None,
+    competition: CompetitionConfig | None = None,
+    scoring_executor: ProcessPoolExecutor | None = None,
+    latest_formula: bool = True,
+) -> BacktestResult:
+    """Each prediction's CRPS against the local store's prices, without the field: no rank, no API.
+
+    Every prediction is a prompt at its own start time, scored one horizon later with the
+    validator's CRPS, crypto-1h's latest formula unless `latest_formula` is False. It works on any
+    window the store covers, including where no field scores exist. The reference is the store's
+    closes only, never the validator's realized path: a minute without a price drops out of the
+    sum, which `realized_coverage` reports, and a prediction whose path holds no price after its
+    start is left out. `smoothed_scores` is empty.
+    """
+    if competition is None:
+        competition = competition_for(asset, time_length)
+    if time_increment is None:
+        time_increment = competition.time_increment
+    predictions_root = predictions_dir or (DEFAULT_MINER_OUTPUT_ROOT / miner_name / "predictions")
+    predictions = sorted(build_prediction_index(predictions_root).get((asset, time_length), {}).items())
+    if not predictions:
+        raise FileNotFoundError(f"No {asset} predictions for time_length={time_length} in {predictions_root}")
+
+    horizon = pd.Timedelta(seconds=time_length)
+    prices = download_price_data(
+        predictions[0][0] - pd.Timedelta(hours=2), predictions[-1][0] + horizon, asset, freq="1min"
+    )
+    prompts = []
+    for start, ref in predictions:
+        real_prices = _slice_real_prices(prices, start, time_length, time_increment)
+        # A reference with no price after its start scores 0, the best CRPS there is.
+        if not np.isfinite(np.asarray(real_prices[1:], dtype=float)).any():
+            continue
+        prompts.append(
+            {
+                "file_path": ref,
+                "start_time": start,
+                "asset": asset,
+                "scored_time": start + horizon,
+                "time_length": time_length,
+                "time_increment": time_increment,
+                "real_prices": real_prices,
+            }
+        )
+    if not prompts:
+        raise ValueError(f"The store has no {asset} price on the path of any prediction in {predictions_root}")
+    scores = _score_prompts(
+        prompts, competition.scoring_intervals, competition, miner_id, latest_formula, scoring_executor
+    )
+    answered = scores.loc[scores["crps"] != -1, "crps"]
+    return BacktestResult(
+        miner_name=miner_name,
+        prompt_df=scores,
+        smoothed_scores=pd.DataFrame(),
+        summary={
+            "miner_name": miner_name,
+            "miner_id": miner_id,
+            "num_prompts": len(answered),
+            "mean_crps": float(answered.mean()),
+            **_realized_coverage(prompts),
+        },
     )
 
 
