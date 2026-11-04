@@ -1,0 +1,30 @@
+name: Lint
+
+on:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: false
+
+      # Only the Python files the pull request changes: pyproject.toml asks to format what you touch.
+      - name: Changed Python files
+        env:
+          BASE: ${{ github.base_ref }}
+        run: git diff --name-only --diff-filter=d "origin/$BASE...HEAD" -- '*.py' | tee changed.txt
+
+      # Both read their settings from pyproject.toml; flake8 needs flake8-pyproject for that.
+      - name: black
+        run: xargs -r uvx black@26.5.1 --check --diff < changed.txt
+
+      - name: flake8
+        run: xargs -r uvx --with flake8-pyproject==1.2.3 flake8@7.1.2 < changed.txt
