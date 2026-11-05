@@ -23,7 +23,7 @@ from synth_lib.benchmark.campaign import CampaignConfig, load_campaign
 from synth_lib.benchmark.cli_adapters import build_adapter
 from synth_lib.benchmark.clock import RunClock
 from synth_lib.benchmark.driver import ModelRun, RunResult
-from synth_lib.benchmark.kinds import load_kind
+from synth_lib.benchmark.kinds import DEFAULT_KIND, load_kind
 from synth_lib.benchmark.metering.keys import LiteLLMAdmin
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
 from synth_lib.benchmark.workspace import create_workspace
@@ -210,9 +210,9 @@ def run_all(
                 home=home,
                 # IS_SANDBOX=1: otherwise Claude Code refuses --dangerously-skip-permissions as root
                 env={
+                    **kind.sandbox_env(state.dir / "snapshot"),
                     **adapter.env(),
                     "IS_SANDBOX": "1",
-                    **kind.sandbox_env(state.dir / "snapshot"),
                 },
                 container_name=container_name,
                 memory_gb=cfg.sandbox_memory_gb,
@@ -274,6 +274,8 @@ def main() -> None:
     elif args.command == "status":
         print(json.dumps(state.load(), indent=2))
     elif args.command == "verdict":
+        if cfg.kind != DEFAULT_KIND:
+            raise SystemExit(f"verdict: run_verdict scores {DEFAULT_KIND} campaigns; kind {cfg.kind} brings its own.")
         raise SystemExit(
             "verdict: run after the forward window with "
             "`python -m synth_lib.benchmark.verdict.run_verdict --campaign <name> "

@@ -39,9 +39,10 @@ class CompetitionKind:
     # (snapshot) raises SystemExit when `run` must not start.
     require_ready: Callable[[Path], object]
     # (agent_dir, snapshot, python_exe) -> (ok, message): the nominated champion's interface check. Runs
-    # the champion out of process and returns within a bounded time: the driver calls it in its poll loop.
+    # the champion out of process, with none of the host's secrets in its environment, and returns within
+    # a bounded time: the driver calls it in its poll loop. An exception counts as a failed check.
     probe: Callable[[Path, Path, str], tuple[bool, str]]
-    # Hands back a nomination that fails the probe; `{check}` is the probe's message.
+    # Hands back a nomination that fails the probe. Must contain `{check}`, replaced by the probe's message.
     interface_prompt: str
     # BUDGET.md's landing section. Must contain "LANDING ORDER": the CLI goal condition and the fake
     # CLI look for it.
@@ -59,4 +60,8 @@ def load_kind(name: str) -> CompetitionKind:
     kind = next(iter(found)).load()
     if not isinstance(kind, CompetitionKind):
         raise TypeError(f"competition kind {name!r} is a {type(kind).__name__}, not a CompetitionKind")
+    if "{check}" not in kind.interface_prompt:
+        raise ValueError(f"competition kind {name!r}: interface_prompt has no {{check}}")
+    if "LANDING ORDER" not in kind.landing_order:
+        raise ValueError(f"competition kind {name!r}: landing_order has no LANDING ORDER")
     return kind

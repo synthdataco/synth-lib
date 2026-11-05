@@ -259,10 +259,11 @@ class ModelRun:
         """Checks the nominated champion's interface once, with the kind's probe, and logs the result.
         The result is memoized on the instance (self._probe_note): once known, it must stay visible
         in BUDGET.md on every subsequent poll, not just the one where the probe ran."""
-        ok, msg = self.kind.probe(self.agent_dir, self.cfg.dir / "snapshot", self.python_exe)
-        # Surface msg on success too, not a bare "OK": probe_all_shapes reports WHICH formats
-        # passed ("ok (24h + 1h)"), and that distinction is the whole point of the check — a
-        # champion that ignores time_increment passes 24h and breaks on crypto-1h.
+        try:
+            ok, msg = self.kind.probe(self.agent_dir, (self.cfg.dir / "snapshot").resolve(), self.python_exe)
+        except Exception as exc:
+            ok, msg = False, f"the check raised {type(exc).__name__}: {exc}"
+        # msg on success too: it names what passed.
         self._probe_ok = ok
         self._probe_note = f"check interface: {msg}"
         self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
@@ -303,7 +304,7 @@ class ModelRun:
                     f"({self._interface_relaunches}/{MAX_INTERFACE_RELAUNCHES})"
                 )
                 check = self._probe_note.removeprefix("check interface: ")[:600]
-                prompt = self.kind.interface_prompt.format(check=check)
+                prompt = self.kind.interface_prompt.replace("{check}", check)
                 return False, self._launch(prompt, resume=True), crash_resumes, voluntary_resumes + 1
             self._log("clean landing: process exited with agent/CHAMPION present")
             return True, proc, crash_resumes, voluntary_resumes  # clean landing

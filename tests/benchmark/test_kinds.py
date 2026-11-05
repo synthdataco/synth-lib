@@ -1,6 +1,7 @@
 """Competition kinds: the built-in monte-carlo kind, and a kind another package registers through the
 entry-point group, set up and run for one fake-CLI leg."""
 
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_E
 from tests.benchmark.test_driver import HoldAdmin, _cfg, _exited_with, _run
 
 TOY_KIND = """
+from dataclasses import replace
 from pathlib import Path
 
 from synth_lib.benchmark.kinds import CompetitionKind
@@ -35,6 +37,8 @@ def _build_snapshot(data_root, snapshot, cfg):
 
 def _probe(agent_dir, snapshot, python_exe):
     (agent_dir / "PROBED").write_text(str(snapshot))
+    if (agent_dir / "RAISES").exists():
+        raise RuntimeError("toy exploded")
     if (agent_dir / "BROKEN").exists():
         return False, "toy broken"
     return True, "toy interface ok"
@@ -47,12 +51,14 @@ KIND = CompetitionKind(
     pin_workspace=_pin,
     build_snapshot=_build_snapshot,
     render_data_md=lambda snapshot: "toy data: " + (snapshot / "toy.txt").read_text(),
-    sandbox_env=lambda snapshot: {"TOY_DATA": "/workspace/market_data/toy.txt"},
+    sandbox_env=lambda snapshot: {"TOY_DATA": "/workspace/market_data/toy.txt", "IS_SANDBOX": "0"},
     require_ready=lambda snapshot: None,
     probe=_probe,
-    interface_prompt="toy check: {check}",
+    interface_prompt="toy check {kind}: {check}",
     landing_order="## LANDING ORDER — toy\\n\\nNominate the toy.\\n",
 )
+NO_CHECK = replace(KIND, interface_prompt="toy check")
+NO_LANDING_ORDER = replace(KIND, landing_order="## Land the toy\\n")
 """
 
 
@@ -146,7 +152,7 @@ def test_a_registered_kind_sets_up_and_runs_a_fake_leg(tmp_path, toy_kind):
     assert [r.landed for r in results] == [True]
     assert "## LANDING ORDER — toy" in (ws / "agent" / "BUDGET.md").read_text()
     assert "check interface: toy interface ok" in (ws / "agent" / "BUDGET.md").read_text()
-    assert (ws / "agent" / "PROBED").read_text() == str(state.dir / "snapshot")
+    assert (ws / "agent" / "PROBED").read_text() == str((state.dir / "snapshot").resolve())
 
 
 def test_a_registered_kind_sets_the_sandbox_env(tmp_path, toy_kind, monkeypatch):
@@ -172,6 +178,7 @@ def test_a_registered_kind_sets_the_sandbox_env(tmp_path, toy_kind, monkeypatch)
 
     argv = captured["cmd_wrapper"](["echo", "hi"])
     assert "TOY_DATA=/workspace/market_data/toy.txt" in argv
+    assert "IS_SANDBOX=1" in argv and "IS_SANDBOX=0" not in argv
     assert not any(arg.startswith((monte_carlo.OFFLINE_ROOT_ENV, CALENDAR_ENV)) for arg in argv)
 
 
@@ -181,4 +188,22 @@ def test_a_nomination_failing_a_registered_kind_s_probe_is_handed_back_with_its_
     (run.agent_dir / "BROKEN").write_text("")
     run._probe_ok = False
     done, launched = _exited_with(run, Phase.NORMAL)
-    assert not done and launched == ["toy check: toy broken"]
+    assert not done and launched == ["toy check {kind}: toy broken"]
+
+
+def test_a_probe_that_raises_is_a_failed_check(tmp_path, toy_kind):
+    run = _run(tmp_path, "lands", HoldAdmin(spend=1.0), cfg=_cfg(tmp_path / "campaigns", kind="toy"))
+    (run.agent_dir / "CHAMPION").write_text("sha: abc\nagent_dir: agent\n")
+    (run.agent_dir / "RAISES").write_text("")
+    run._probe_ok = False
+    done, launched = _exited_with(run, Phase.NORMAL)
+    assert not done and launched == ["toy check {kind}: the check raised RuntimeError: toy exploded"]
+
+
+@pytest.mark.parametrize(
+    ("target", "missing"), [("toy_kind:NO_CHECK", "{check}"), ("toy_kind:NO_LANDING_ORDER", "LANDING ORDER")]
+)
+def test_a_kind_without_its_placeholders_is_refused(tmp_path, toy_kind, target, missing):
+    _register(toy_kind, "bad_toy", "bad", target)
+    with pytest.raises(ValueError, match=f"competition kind 'bad': .* has no {re.escape(missing)}"):
+        load_kind("bad")

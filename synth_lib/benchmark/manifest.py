@@ -11,11 +11,7 @@ from typing import Callable
 
 
 def sha256_file(path: Path) -> str:
-    """SHA256 digest of a file, in chunks.
-
-    Deliberately self-contained: the benchmark depends on NO operator-private code, which keeps it
-    portable (server deployment, any git base) and avoids having to run mypy over modules
-    outside its scope."""
+    """SHA256 digest of a file, in chunks."""
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):

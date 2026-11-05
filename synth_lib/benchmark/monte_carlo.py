@@ -32,20 +32,15 @@ INTERFACE_PROMPT = (
 )
 # The bundle's subdirectory inside the snapshot.
 OFFLINE_BUNDLE_DIR = "offline_data"
-# synth_lib.backtester.config._OFFLINE_ENV_VAR. Duplicated rather than imported: the engine
-# deliberately does not pull the backtester (and its bittensor chain) in at startup.
+# Must match synth_lib.backtester.config._OFFLINE_ENV_VAR.
 OFFLINE_ROOT_ENV = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
 
 
 def offline_bundle_env(snapshot: Path) -> dict[str, str]:
-    """Point synth-lib's offline mode at a bundle inside the snapshot, when one is present.
-
-    build_snapshot does not link the bundle — the operator builds it straight into
-    <snapshot>/offline_data, for the days the campaign may see. With
-    this set, the agent reads field scores from disk instead of paginating api.synthdata.co one day
-    at a time (three concurrent agents would rate-limit each other). `run` refuses to start without
-    it (`require_offline_bundle`). It is NOT optional for the verdict either, which runs with
-    --network none.
+    """Point synth-lib's offline mode at the bundle in <snapshot>/offline_data, when one is present:
+    the agent then reads field scores from disk. The operator builds the bundle there, for the days
+    the campaign may see; build_snapshot does not link it. `run` refuses to start without it
+    (`require_offline_bundle`), and the verdict runs with --network none.
 
     Absent bundle => empty dict: only a direct run_all() caller with no bundle, such as the fake-CLI
     tests, gets there.
@@ -95,10 +90,8 @@ def _sandbox_env(snapshot: Path) -> dict[str, str]:
 
 
 def _probe(agent_dir: Path, snapshot: Path, python_exe: str) -> tuple[bool, str]:
-    """simulate() on both prompt formats, with the snapshot's calendar when it froze one.
-    Out-of-process with a timeout (see synth_lib.benchmark.nomination.probe_simulate_subprocess): the
-    nominated champion is untrusted code — running it in-process would expose the host env, and
-    a blocking simulate() would freeze the driver entirely."""
+    """simulate() on both prompt formats, with the snapshot's calendar when it froze one, out of process
+    with a timeout and without the host's secrets (synth_lib.benchmark.nomination.probe_simulate_subprocess)."""
     calendar = snapshot / CALENDAR_DIR / VIEW_FILE
     return probe_simulate_subprocess(
         agent_dir / "modeling.py",
