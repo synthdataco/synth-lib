@@ -1,5 +1,6 @@
 """The serving miner refreshes the event calendar and points the champion at it, as its campaign did."""
 
+import os
 import threading
 import time
 from pathlib import Path
@@ -12,10 +13,26 @@ from synth_lib.preparation.event_calendar import build as calendar_build
 from synth_lib.serving.champion_miner import ChampionMiner
 
 
+def _wait_until_ready(miner, asset: str) -> None:
+    deadline = time.monotonic() + 5
+    while asset not in miner._ready:
+        assert time.monotonic() < deadline, "the asset never joined"
+        time.sleep(0.01)
+
+
+def _store_calendar(root: Path, age_seconds: float) -> None:
+    view = root / "calendar" / "events.parquet"
+    view.parent.mkdir(parents=True)
+    view.write_bytes(b"stored")
+    written = time.time() - age_seconds
+    os.utime(view, (written, written))
+
+
 @pytest.fixture
-def miner(monkeypatch):
+def miner(monkeypatch, tmp_path):
     """A miner whose first calendar refresh is held until the test releases it."""
     release = threading.Event()
+    monkeypatch.setattr(cm, "MARKET_DATA_DIR", tmp_path / "market_data")
     monkeypatch.setattr(cm, "warm_up", lambda assets: None)
     monkeypatch.setattr(cm, "venue_store", lambda asset: f"store:{asset}")
     monkeypatch.setattr(cm, "FreshTail", lambda asset: None)
@@ -29,7 +46,7 @@ def miner(monkeypatch):
 
 def test_start_points_the_champion_at_the_served_calendar(miner):
     miner._start(["BTC"])
-    assert Path(cm.os.environ[cm.CALENDAR_ENV]) == (Path("market_data") / "calendar" / "events.parquet").resolve()
+    assert Path(cm.os.environ[cm.CALENDAR_ENV]) == (cm.MARKET_DATA_DIR / "calendar" / "events.parquet").resolve()
     miner.release.set()
 
 
@@ -38,10 +55,23 @@ def test_an_asset_waits_for_the_first_calendar_refresh(miner):
     time.sleep(0.2)
     assert "BTC" not in miner._ready  # warmed up, but its calendar is not written yet
     miner.release.set()
-    deadline = time.monotonic() + 5
-    while "BTC" not in miner._ready:
-        assert time.monotonic() < deadline, "the asset never joined"
-        time.sleep(0.01)
+    _wait_until_ready(miner, "BTC")
+
+
+def test_a_recent_stored_calendar_is_served_while_the_first_refresh_runs(miner):
+    _store_calendar(cm.MARKET_DATA_DIR, age_seconds=cm.CALENDAR_MAX_AGE_SECONDS - 3600)
+    miner._start(["BTC"])
+    _wait_until_ready(miner, "BTC")  # the refresh is still held
+    miner.release.set()
+
+
+def test_an_old_stored_calendar_waits_for_the_first_refresh(miner):
+    _store_calendar(cm.MARKET_DATA_DIR, age_seconds=cm.CALENDAR_MAX_AGE_SECONDS + 3600)
+    miner._start(["BTC"])
+    time.sleep(0.2)
+    assert "BTC" not in miner._ready
+    miner.release.set()
+    _wait_until_ready(miner, "BTC")
 
 
 def test_a_calendar_that_never_arrives_delays_the_assets_once(miner, monkeypatch):
