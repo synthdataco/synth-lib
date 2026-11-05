@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -17,6 +18,7 @@ from synth_lib.preparation.event_calendar.events import (
     CALENDAR_DIR,
     CALENDAR_ENV,
     LEDGER_FILE,
+    NEW_YORK,
     VIEW_FILE,
     known_at,
     read_ledger,
@@ -24,6 +26,8 @@ from synth_lib.preparation.event_calendar.events import (
 )
 
 _PARTITION_RE = re.compile(r"^date=(\d{4}-\d{2}-\d{2})\.parquet$")
+# The clocks DATA.md lists daylight-saving switches for, by the name it gives them.
+_CLOCKS = {"New York": NEW_YORK, "London": ZoneInfo("Europe/London")}
 
 
 def _partition_day(path: Path) -> date | None:
@@ -95,8 +99,64 @@ def render_data_md(snapshot_root: Path) -> str:
     lines += _timestamp_lines(store)
     lines += _offline_bundle_lines(snapshot_root / "offline_data")
     lines += _realized_lines(snapshot_root / "realized")
+    lines += _daylight_saving_lines(store)
     lines += _calendar_lines(snapshot_root / CALENDAR_DIR / VIEW_FILE, store)
     return "\n".join(lines) + "\n"
+
+
+def _offset_at_end(zone: ZoneInfo, day: date) -> timedelta:
+    """The zone's UTC offset at the end of the UTC day `day`."""
+    return datetime.combine(day + timedelta(days=1), time(), timezone.utc).astimezone(zone).utcoffset()
+
+
+def _switches(zone: ZoneInfo, start: date, end: date) -> list[tuple[date, timedelta]]:
+    """The days in [start, end] on which the zone's UTC offset changes, with the offset after the change."""
+    days = [start + timedelta(days=n) for n in range((end - start).days + 1)]
+    return [
+        (day, _offset_at_end(zone, day))
+        for day in days
+        if _offset_at_end(zone, day) != _offset_at_end(zone, day - timedelta(days=1))
+    ]
+
+
+def _utc(offset: timedelta) -> str:
+    return f"UTC{offset / timedelta(hours=1):+g}"
+
+
+def _new_york_session(offset: timedelta) -> str:
+    """The NYSE session, 09:30–16:00 in New York, in UTC at `offset`."""
+    return "–".join(f"{datetime(2000, 1, 1, h, m) - offset:%H:%M}" for h, m in ((9, 30), (16, 0)))
+
+
+def _daylight_saving_lines(store: Path) -> list[str]:
+    """Each clock's daylight-saving switches inside the snapshot's span, and its next one after it."""
+    days = sorted(p.name[5:15] for p in store.glob("*/1m/date=*.parquet"))
+    if not days:
+        return []
+    first, last = date.fromisoformat(days[0]), date.fromisoformat(days[-1])
+    year_after = (last + timedelta(days=1), last + timedelta(days=366))
+    lines = [
+        "",
+        "**Daylight saving.** Prices, prompts and the calendar are in UTC. The US session and the US releases",
+        "keep New York time, and European hours keep London time, so in UTC they move an hour at each switch.",
+        f"Switches between {first} and {last}, on the day the clock changes, with the offset after it:",
+        "",
+        f"| clock | switches in the snapshot | offset on {last} | next switch |",
+        "|---|---|---|---|",
+    ]
+    for name, zone in _CLOCKS.items():
+        inside = ", ".join(f"{day} → {_utc(offset)}" for day, offset in _switches(zone, first, last)) or "none"
+        day, offset = _switches(zone, *year_after)[0]
+        lines.append(f"| {name} | {inside} | {_utc(_offset_at_end(zone, last))} | {day} → {_utc(offset)} |")
+    now = _offset_at_end(NEW_YORK, last)
+    _, then = _switches(NEW_YORK, *year_after)[0]
+    summer, winter = max(now, then), min(now, then)
+    lines += [
+        "",
+        f"The NYSE session, 09:30–16:00 in New York, is {_new_york_session(summer)} UTC in summer time",
+        f"({_utc(summer)}) and {_new_york_session(winter)} UTC in winter time ({_utc(winter)}).",
+    ]
+    return lines
 
 
 def _calendar_lines(path: Path, store: Path) -> list[str]:

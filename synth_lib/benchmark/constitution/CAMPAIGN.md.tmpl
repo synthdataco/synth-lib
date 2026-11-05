@@ -134,6 +134,14 @@ horizon before the window and yours is never treated as late.
   seasonality yourself before you model it, and check whether it holds for each asset rather than
   assuming one shape fits the group.
 
+  **Those hours keep local time; UTC does not.** The US session and the US releases (08:30, 10:30
+  and 14:00 in New York) are fixed in New York time, and European hours in London time, so in UTC
+  they move an hour at each daylight-saving switch. Your snapshot holds both regimes, and DATA.md
+  names the switches inside it and the next one after your cutoff. A UTC-hour profile fitted on all
+  of it smears the open over two hours; one fitted on summer months sits an hour early in winter.
+  Keying a profile on New York or London time (`tz_convert`) is possible. Measure which clock each
+  asset follows, on both regimes, before you choose.
+
   Do not "repair" NaN gaps by interpolating; scoring already drops NaN per prompt, and inventing
   prices in the gaps is how you fool your own validation.
 
