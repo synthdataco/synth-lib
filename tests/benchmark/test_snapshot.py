@@ -255,6 +255,34 @@ def test_data_md_counts_each_event_type_and_the_ones_released_with_it(tmp_path):
     assert "| GDP | 1 | 1 | PCE 2/2 |" in md and "| PCE | 1 | 1 | GDP 2/2 |" in md
 
 
+def _scored(root: Path, slug: str, asset: str, times: list[pd.Timestamp]) -> None:
+    scores = root / "offline_data" / "miner_scores" / slug / asset
+    scores.mkdir(parents=True)
+    frame = pd.DataFrame({"scored_time": times})
+    for day, rows in frame.groupby(frame["scored_time"].dt.date):
+        rows.to_parquet(scores / f"date={day}.parquet")
+
+
+def test_data_md_gives_each_competitions_first_ranked_round_and_cadence(tmp_path):
+    hourly = pd.date_range("2026-07-24", "2026-10-28 23:00", freq="60min", tz="UTC")
+    slots = [
+        pd.Timestamp(day, tz="UTC") + pd.Timedelta(minutes=15 + 144 * k)
+        for day in pd.date_range("2026-10-29", "2026-11-02")
+        for k in range(10)
+    ]
+    _scored(tmp_path, "com-equ-24h", "GOOGLX", [*hourly, *slots])
+    _scored(tmp_path, "crypto-1h", "BTC", list(pd.date_range("2026-07-24", "2026-11-02 23:50", freq="10min", tz="UTC")))
+    md = render_data_md(tmp_path)
+    assert (
+        "| com-equ-24h | 2026-07-24 → 2026-11-02 | 10 | 2026-08-03 | about 24 a day (every 60 min), "
+        "2026-07-24 → 2026-10-28; about 10 a day (every 144 min), 2026-10-29 → 2026-11-02 |"
+    ) in md
+    assert "| crypto-1h | 2026-07-24 → 2026-11-02 | 5 | 2026-07-29 | about 144 a day (every 10 min) |" in md
+    assert "com-equ-24h's prompts scored since 2026-10-29 start at the same times every day" in md
+    assert "| GOOGLX | 00:15 02:39 05:03 07:27 09:51 12:15 14:39 17:03 19:27 21:51 |" in md
+    assert "crypto-1h's prompts" not in md  # 144 slots a day are not listed
+
+
 def _btc_partitions(root: Path, days: list[str]) -> None:
     btc = root / "prices" / "BTC" / "1m"
     btc.mkdir(parents=True)
