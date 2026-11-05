@@ -255,6 +255,29 @@ def test_data_md_counts_each_event_type_and_the_ones_released_with_it(tmp_path):
     assert "| GDP | 1 | 1 | PCE 2/2 |" in md and "| PCE | 1 | 1 | GDP 2/2 |" in md
 
 
+def _btc_partitions(root: Path, days: list[str]) -> None:
+    btc = root / "prices" / "BTC" / "1m"
+    btc.mkdir(parents=True)
+    for day in days:
+        (btc / f"date={day}.parquet").write_bytes(day.encode())
+
+
+def test_data_md_names_the_daylight_saving_switches_and_the_next_one(tmp_path):
+    _btc_partitions(tmp_path, ["2025-08-01", "2026-11-15"])
+    md = render_data_md(tmp_path)
+    new_york = "| New York | 2025-11-02 → UTC-5, 2026-03-08 → UTC-4, 2026-11-01 → UTC-5 | UTC-5 | 2027-03-14 → UTC-4 |"
+    london = "| London | 2025-10-26 → UTC+0, 2026-03-29 → UTC+1, 2026-10-25 → UTC+0 | UTC+0 | 2027-03-28 → UTC+1 |"
+    assert new_york in md and london in md
+    assert "13:30–20:00 UTC in summer time" in md and "14:30–21:00 UTC in winter time" in md
+
+
+def test_data_md_names_the_next_switch_of_a_snapshot_inside_one_regime(tmp_path):
+    _btc_partitions(tmp_path, ["2026-08-03", "2026-10-20"])
+    md = render_data_md(tmp_path)
+    assert "| New York | none | UTC-4 | 2026-11-01 → UTC-5 |" in md
+    assert "| London | none | UTC+1 | 2026-10-25 → UTC+0 |" in md
+
+
 def _day_of_name(path: Path) -> date:
     return datetime.strptime(path.stem.removeprefix("day-"), "%Y%m%d").date()
 
