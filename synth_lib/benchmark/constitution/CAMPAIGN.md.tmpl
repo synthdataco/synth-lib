@@ -25,7 +25,7 @@ crypto-1h.
 | Competition | Assets | Horizon | Step | Points/path |
 |---|---|---|---|---|
 | CRYPTO_24H | BTC, ETH, SOL, XRP, HYPE | 24h (86400 s) | 5min (300 s) | 289 |
-| COM_EQU_24H | XAU, NVDAX, GOOGLX, TSLAX, AAPLX, WTIOIL, SPCX, SP500 (+ SPYX, retired — see the breaks table) | 24h | 5min | 289 |
+| COM_EQU_24H | XAU, NVDAX, GOOGLX, TSLAX, AAPLX, WTIOIL, SPCX, SP500 | 24h | 5min | 289 |
 | CRYPTO_1H | BTC, ETH, SOL, XRP, HYPE | 1h (3600 s) | 1min (60 s) | 61 |
 
 BTC, ETH, SOL, XRP and HYPE are in two competitions: look one up by `(asset, time_length)`
@@ -95,6 +95,12 @@ horizon before the window and yours is never treated as late.
   scores CRPS alone, against the snapshot's own prices, on such a grid and on any window of the
   snapshot, before the field bundle's span included: no field, no rank. Use it to compare models
   on the same grid.
+  A field-relative run ranks you the way the validator's moving average does, over each
+  competition's `window_days` of reward rounds. In a window's first `window_days`, that average
+  would read scores from before the window, so `backtest()` drops those rounds: `--days N` ranks
+  only the rounds after them. With N no longer than `window_days`, nothing is dropped, and the
+  ranks rest on a truncated history. DATA.md gives each competition's `window_days` and the first
+  round the bundle can rank.
 - **`market_data/`**: a frozen snapshot of minute OHLCV (parquet partitions
   `prices/{ASSET}/1m/date=YYYY-MM-DD.parquet`, columns `open, high, low, close, volume,
   trade_count`, resolve it with
@@ -145,18 +151,25 @@ horizon before the window and yours is never treated as late.
   Do not "repair" NaN gaps by interpolating; scoring already drops NaN per prompt, and inventing
   prices in the gaps is how you fool your own validation.
 
-  **Fitting vs comparing**: the FULL price history is yours to fit, train and calibrate on. The
-  2026-06-23 configuration split (breaks table below) constrains only FIELD-RELATIVE numbers —
-  never compute one on a window that starts before it. CRPS itself is unaffected.
+  **Fitting vs comparing**: the FULL price history is yours to fit, train and calibrate on.
+  FIELD-RELATIVE numbers start on each competition's first ranked round in DATA.md: **2026-08-03**
+  for CRYPTO_24H and COM_EQU_24H, a few days earlier for CRYPTO_1H, whose moving average is
+  shorter. From those rounds on, the field was scored on the prices your store holds, and so were
+  all the rounds its moving average covers; the competitions and assets are today's, and
+  COM_EQU_24H's scores have no holes. Never compute one on a window before them. Before them, and
+  back to each asset's first day, `agent/predict.py --crps-only` scores CRPS alone: that is how you
+  test a change on older regimes.
 
-  **Four structural breaks in the subnet's history. Do not backtest across them:**
+  **Changes in the subnet's history, and what each means for a backtest across it:**
 
   | Date | What changed |
   |---|---|
-  | 2026-06-23 | The subnet split into the 3 current competitions. Before it: 2 profiles, and COM_EQU_24H did not exist. A field-relative rank spanning this date mixes incompatible reward structures — `synth_lib` will warn, and the number it gives you is meaningless. |
   | 2026-03-11 | The crypto-1h CRPS formula changed. Ranks before it are not comparable to today's. |
+  | 2026-06-23 | The subnet split into the 3 current competitions. Before it: 2 profiles, and COM_EQU_24H did not exist. A field-relative rank spanning this date mixes incompatible reward structures — `synth_lib` will warn, and the number it gives you is meaningless. |
+  | 2026-07-23 | The validator stopped scoring on Pyth prices: BTC, ETH, SOL and XRP moved to Binance spot, the others to Hyperliquid. Before it, the field was scored on prices your store does not hold. SPYX was retired the same day and SP500 introduced as a NEW asset, carrying the HIGHEST coefficient (3.44) in COM_EQU_24H; SP500's scored history starts here. Fit SP500 on its whole price series, and spend nothing on SPYX. |
+  | 2026-09-04 | An outlier cap, in every competition: a CRPS above 10x the prompt's median is capped and ranked last. The backtester replays it by each prompt's scored time, so ranks across it stay comparable; CRPS itself is unaffected. |
   | 2026-09-22 | crypto-1h scoring added a volatility term. A crypto-1h CRPS from before it is not comparable with one after; `agent/predict.py --latest-formula` scores earlier prompts with it too, which keeps CRPS comparable (field ranks before the date then are not). |
-  | ~2026-07-17 | SPYX was retired and SP500 introduced as a NEW asset, carrying the HIGHEST coefficient (3.44) in COM_EQU_24H. **SPYX is DEAD**: its feed stopped, the validator no longer prompts or scores it, and no post-mid-July prices exist — it still appears in the pinned competition config, but spend NOTHING on it. SP500 has scored field history from ~2026-07-19 onward; fit on its whole price series, validate its RANK on the scored weeks. |
+  | 2026-10-28 | The prompt cadence changed. COM_EQU_24H's scored prompts went from about 24 a day per asset to 10, at the same times every day (DATA.md lists them), so a backtest after it samples a different mix of start times than one before it. |
 
   **Loader expectations**: synth-lib's strict `load_range` RAISES on any NaN or missing day in
   the requested range — that is a feature for scoring, a trap for exploration. `agent/predict.py`
@@ -287,7 +300,9 @@ to the Synth miner community.
 
 ## Method (your choice, but recommended)
 
-You choose your own research questions, hypotheses, splits, and criteria. What works here:
+You choose your own research questions, hypotheses, splits, and criteria, and your own in-sample
+and out-of-sample windows: there is no holdout rule, and the field bundle covers the span DATA.md
+gives. What works here:
 write the hypothesis BEFORE the experiment, pre-registered kill thresholds, validation on 2
 windows of opposite regimes (within the limits of the snapshot), one variable at a time,
 frequent commits. Watch out for the edges of eval windows: only backtest windows fully covered
@@ -313,6 +328,9 @@ by the snapshot. Lessons earlier agents paid for:
 - **Count the asset-window cells where a change helps**, across disjoint windows, not only its
   average: a small gain signed the same way in most cells survives; a larger one that flips sign
   between windows is noise.
+- **Do not tune on the last weeks before your cutoff alone.** They hold one regime, and your
+  champion is scored on the weeks after the cutoff, which may hold another. Validate a change on
+  windows from different regimes across the whole span, and keep it only if it holds on them.
 
 ## Resuming after a crash
 

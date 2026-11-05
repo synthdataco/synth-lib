@@ -11,7 +11,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from synth_lib.backtester.field_store import SCORES_DIR
+from synth_lib.backtester.config import SLUG_TO_COMPETITION
+from synth_lib.backtester.field_store import scores_dir
 from synth_lib.benchmark.manifest import link_partitions, sha256_file, write_manifest
 from synth_lib.preparation.config import STORE_SUBDIR
 from synth_lib.preparation.event_calendar.events import (
@@ -26,6 +27,8 @@ from synth_lib.preparation.event_calendar.events import (
 )
 
 _PARTITION_RE = re.compile(r"^date=(\d{4}-\d{2}-\d{2})\.parquet$")
+# DATA.md lists an asset's fixed prompt start times only when there are at most this many a day.
+MAX_LISTED_SLOTS = 24
 # The clocks DATA.md lists daylight-saving switches for, by the name it gives them.
 _CLOCKS = {"New York": NEW_YORK, "London": ZoneInfo("Europe/London")}
 
@@ -237,27 +240,116 @@ def _timestamp_lines(store: Path) -> list[str]:
     ]
 
 
+def _scored_times(offline: Path) -> dict[str, dict[str, pd.Series]]:
+    """The bundle's scored prompt times: competition slug -> asset -> sorted unique `scored_time`."""
+    found: dict[str, dict[str, pd.Series]] = {}
+    for slug, comp in SLUG_TO_COMPETITION.items():
+        for asset in comp.asset_list:
+            # Day partitions, or the single file of a bundle built before them.
+            legacy = offline / f"miner_scores_{asset}_{slug}.parquet"
+            files = sorted(scores_dir(offline, slug, asset).glob("date=*.parquet")) + (
+                [legacy] if legacy.exists() else []
+            )
+            parts = []
+            for f in files:
+                try:
+                    parts.append(pd.read_parquet(f, columns=["scored_time"])["scored_time"])
+                except Exception:
+                    continue
+            times = pd.concat(parts).drop_duplicates().sort_values(ignore_index=True) if parts else None
+            if times is not None and len(times):
+                found.setdefault(slug, {})[asset] = times
+    return found
+
+
+def _cadence_periods(scored: list[pd.Series]) -> list[tuple[date, date, float]]:
+    """Runs of days with about the same number of scored prompts per asset: (first day, last day,
+    median prompts a day). A day joins the run while its count, the median over the assets, stays
+    within a quarter of the run's median; a run of a single day is dropped."""
+    per_asset = [times.groupby(times.dt.date).size() for times in scored]
+    counts = pd.concat(per_asset, axis=1).median(axis=1)
+    runs: list[list[tuple[date, float]]] = []
+    for day, n in counts.sort_index().items():
+        if runs:
+            median = float(np.median([c for _, c in runs[-1]]))
+            if abs(n - median) <= 0.25 * median:
+                runs[-1].append((day, n))
+                continue
+        runs.append([(day, n)])
+    return [(run[0][0], run[-1][0], float(np.median([c for _, c in run]))) for run in runs if len(run) > 1]
+
+
+def _fixed_slots(starts: pd.Series, per_day: float) -> list[str] | None:
+    """An asset's start times of day, when its prompts start at the same times every day and there are
+    at most `MAX_LISTED_SLOTS` of them."""
+    slots = sorted(starts.dt.strftime("%H:%M").unique())
+    if len(slots) > min(round(per_day), MAX_LISTED_SLOTS) or len(starts) < 2 * len(slots):
+        return None
+    return slots
+
+
+def _competition_lines(scored: dict[str, dict[str, pd.Series]]) -> list[str]:
+    """Per competition: its span, its `window_days` and first ranked round, and its scored cadence."""
+    lines = [
+        "",
+        "Per competition: `backtest()` drops each window's first `window_days` of reward rounds (see",
+        "CAMPAIGN.md), so the first round the bundle can rank is its first scored day plus `window_days`.",
+        "The cadence is the spacing of the prompts the validator SCORED, which is sparser than the",
+        "prompts it issues:",
+        "",
+        "| competition | scored prompts | window_days | first ranked round | scored prompts per asset |",
+        "|---|---|---|---|---|",
+    ]
+    slot_lines: list[str] = []
+    for slug, by_asset in scored.items():
+        comp = SLUG_TO_COMPETITION[slug]
+        lo = min(t.iloc[0] for t in by_asset.values())
+        hi = max(t.iloc[-1] for t in by_asset.values())
+        periods = _cadence_periods(list(by_asset.values()))
+        cadence = "; ".join(
+            f"about {n:.0f} a day (every {1440 / n:.0f} min)" + (f", {a} → {b}" if len(periods) > 1 else "")
+            for a, b, n in periods
+        )
+        first_ranked = lo + pd.Timedelta(days=comp.window_days)
+        lines.append(
+            f"| {slug} | {lo:%Y-%m-%d} → {hi:%Y-%m-%d} | {comp.window_days} | {first_ranked:%Y-%m-%d} | {cadence} |"
+        )
+        if not periods:
+            continue
+        since, _, per_day = periods[-1]
+        rows = []
+        for asset, times in by_asset.items():
+            recent = times[times.dt.date >= since]
+            slots = _fixed_slots(recent - pd.Timedelta(seconds=comp.time_length), per_day)
+            if slots is not None:
+                rows.append(f"| {asset} | {' '.join(slots)} |")
+        if rows:
+            slot_lines += [
+                "",
+                f"{slug}'s prompts scored since {since} start at the same times every day (UTC):",
+                "",
+                "| asset | start times |",
+                "|---|---|",
+                *rows,
+            ]
+    return lines + slot_lines
+
+
 def _offline_bundle_lines(offline: Path) -> list[str]:
     if not offline.is_dir():
         return []
-    spans = []
-    # Day partitions, or the single files of a bundle built before them.
-    for f in sorted([*offline.glob(f"{SCORES_DIR}/*/*/date=*.parquet"), *offline.glob("miner_scores_*.parquet")]):
-        try:
-            scored = pd.read_parquet(f, columns=["scored_time"])["scored_time"]
-        except Exception:
-            continue
-        if len(scored):
-            spans.append((scored.min(), scored.max()))
-    if not spans:
+    scored = _scored_times(offline)
+    times = [t for by_asset in scored.values() for t in by_asset.values()]
+    if not times:
         return []
-    lo = min(s[0] for s in spans)
-    hi = max(s[1] for s in spans)
+    lo = min(t.iloc[0] for t in times)
+    hi = max(t.iloc[-1] for t in times)
     return [
         "",
         "**Offline field-scores bundle** (`SYNTH_BACKTESTER_OFFLINE_DATA_ROOT`): scored",
         f"prompts covered **{lo:%Y-%m-%d} → {hi:%Y-%m-%d}**. Rank backtests outside this",
         "range have no field to compare against — do not query the live API for more.",
+        *_competition_lines(scored),
     ]
 
 
