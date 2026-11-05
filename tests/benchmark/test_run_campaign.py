@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 
 from synth_lib.benchmark.campaign import BaselineSpec, CampaignConfig, ModelSpec
-from synth_lib.benchmark.run_campaign import CampaignState, calendar_env
+from synth_lib.benchmark.monte_carlo import (
+    OFFLINE_ROOT_ENV,
+    calendar_env,
+    offline_bundle_env,
+    require_offline_bundle,
+)
+from synth_lib.benchmark.run_campaign import CampaignState
 from synth_lib.preparation.event_calendar.events import CALENDAR_ENV
 
 
@@ -36,8 +42,6 @@ def test_containerize_url_rewrites_localhost_and_loopback():
 
 def test_offline_bundle_env_absent_when_no_bundle(tmp_path):
     """A campaign without a bundle must behave exactly as before: no env var at all."""
-    from synth_lib.benchmark.run_campaign import offline_bundle_env
-
     (tmp_path / "snapshot").mkdir()
     assert offline_bundle_env(tmp_path / "snapshot") == {}
 
@@ -45,8 +49,6 @@ def test_offline_bundle_env_absent_when_no_bundle(tmp_path):
 def test_offline_bundle_env_points_at_the_container_path(tmp_path):
     """The path must be the CONTAINER's view: the snapshot is mounted at /workspace/market_data,
     so a host path would be meaningless inside the sandbox."""
-    from synth_lib.benchmark.run_campaign import OFFLINE_ROOT_ENV, offline_bundle_env
-
     snapshot = tmp_path / "snapshot"
     (snapshot / "offline_data").mkdir(parents=True)
     assert offline_bundle_env(snapshot) == {OFFLINE_ROOT_ENV: "/workspace/market_data/offline_data"}
@@ -54,8 +56,6 @@ def test_offline_bundle_env_points_at_the_container_path(tmp_path):
 
 def test_require_offline_bundle_wants_scores_and_rewards(tmp_path):
     """An empty folder is not a bundle: the agents would still backtest against the live API."""
-    from synth_lib.benchmark.run_campaign import require_offline_bundle
-
     snapshot = tmp_path / "snapshot"
     with pytest.raises(SystemExit, match="no offline scores bundle"):
         require_offline_bundle(snapshot)
@@ -71,8 +71,6 @@ def test_require_offline_bundle_wants_scores_and_rewards(tmp_path):
 
 
 def test_require_offline_bundle_accepts_day_partitions(tmp_path):
-    from synth_lib.benchmark.run_campaign import require_offline_bundle
-
     bundle = tmp_path / "snapshot" / "offline_data"
     (bundle / "miner_scores" / "crypto-24h" / "BTC").mkdir(parents=True)
     (bundle / "miner_scores" / "crypto-24h" / "BTC" / "date=2026-09-15.parquet").write_bytes(b"")
@@ -97,8 +95,6 @@ def test_run_refuses_to_start_without_a_bundle(tmp_path, monkeypatch):
 
 
 def test_offline_bundle_env_ignores_a_file_of_that_name(tmp_path):
-    from synth_lib.benchmark.run_campaign import offline_bundle_env
-
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
     (snapshot / "offline_data").write_text("not a directory")
@@ -140,7 +136,7 @@ def test_sandboxed_run_exports_the_offline_root_when_a_bundle_exists(tmp_path, m
     rc.run_all(state, admin=None, sandboxed=True, python_exe="python")
 
     argv = " ".join(captured["kwargs"]["cmd_wrapper"](["echo", "hi"]))
-    assert f"{rc.OFFLINE_ROOT_ENV}=/workspace/market_data/offline_data" in argv
+    assert f"{OFFLINE_ROOT_ENV}=/workspace/market_data/offline_data" in argv
 
 
 def test_passthrough_legs_mint_uncapped_keys(tmp_path, monkeypatch):

@@ -1,5 +1,6 @@
 from synth_lib.benchmark.budget import BudgetTracker, Phase
 from synth_lib.benchmark.clock import RunClock
+from synth_lib.benchmark.monte_carlo import LANDING_ORDER
 
 
 class FakeAdmin:
@@ -17,7 +18,14 @@ class FakeAdmin:
 
 def _tracker(admin, t):
     clock = RunClock(deadline_seconds=1000.0, now_fn=lambda: t[0])
-    return BudgetTracker(admin=admin, virtual_key="sk-x", budget_usd=100.0, soft_landing_pct=0.85, clock=clock)
+    return BudgetTracker(
+        admin=admin,
+        virtual_key="sk-x",
+        budget_usd=100.0,
+        soft_landing_pct=0.85,
+        clock=clock,
+        landing_order=LANDING_ORDER,
+    )
 
 
 def test_phases_follow_max_of_usd_and_time():

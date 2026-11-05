@@ -10,7 +10,7 @@ from synth_lib.benchmark.campaign import ModelSpec
 FAKE_CLI_PATH = Path(__file__).parent / "fake_cli.py"
 # The stopping condition a claude-code session is held to, the same rules as the constitution's envelope.
 # Its evaluator sees only the transcript and the hook arguments, so each case names what proves it.
-# "LANDING ORDER" is in the heading of budget.LANDING_ORDER and in driver.LANDING_PROMPT.
+# "LANDING ORDER" is in the heading of every kind's landing_order and in driver.LANDING_PROMPT.
 GOAL_CONDITION = (
     "The agent may stop only in one of three cases. (1) A LANDING ORDER has arrived, printed from "
     "agent/BUDGET.md or sent by the harness, and the agent's command output shows it carried out: "

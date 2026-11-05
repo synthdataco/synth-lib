@@ -18,74 +18,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from synth_lib.backtester.field_store import REWARDS_DIR, SCORES_DIR
 from synth_lib.benchmark.budget import BudgetTracker
 from synth_lib.benchmark.campaign import CampaignConfig, load_campaign
 from synth_lib.benchmark.cli_adapters import build_adapter
 from synth_lib.benchmark.clock import RunClock
 from synth_lib.benchmark.driver import ModelRun, RunResult
+from synth_lib.benchmark.kinds import DEFAULT_KIND, load_kind
 from synth_lib.benchmark.metering.keys import LiteLLMAdmin
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
-from synth_lib.benchmark.snapshot import build_snapshot, render_data_md
 from synth_lib.benchmark.workspace import create_workspace
-from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 
 SANDBOX_IMAGE = DEFAULT_IMAGE
 SANDBOX_NETWORK = "bridge"
 # CLIs that reach the proxy via a passthrough route (URL forwarded verbatim, not /v1): their keys
 # are minted uncapped.
 PASSTHROUGH_CLIS = {"gemini-cli"}
-# Where sandbox_cmd mounts the snapshot, and the bundle subdirectory inside it.
-SANDBOX_MARKET_DATA = "/workspace/market_data"
-OFFLINE_BUNDLE_DIR = "offline_data"
-# synth_lib.backtester.config._OFFLINE_ENV_VAR. Duplicated rather than imported: the orchestrator
-# deliberately does not pull the backtester (and its bittensor chain) in at startup.
-OFFLINE_ROOT_ENV = "SYNTH_BACKTESTER_OFFLINE_DATA_ROOT"
-
-
-def offline_bundle_env(snapshot: Path) -> dict[str, str]:
-    """Point synth-lib's offline mode at a bundle inside the snapshot, when one is present.
-
-    build_snapshot does not link the bundle — the operator builds it straight into
-    <snapshot>/offline_data, for the days the campaign may see. With
-    this set, the agent reads field scores from disk instead of paginating api.synthdata.co one day
-    at a time (three concurrent agents would rate-limit each other). `run` refuses to start without
-    it (`require_offline_bundle`). It is NOT optional for the verdict either, which runs with
-    --network none.
-
-    Absent bundle => empty dict: only a direct run_all() caller with no bundle, such as the fake-CLI
-    tests, gets there.
-    """
-    if not (snapshot / OFFLINE_BUNDLE_DIR).is_dir():
-        return {}
-    return {OFFLINE_ROOT_ENV: f"{SANDBOX_MARKET_DATA}/{OFFLINE_BUNDLE_DIR}"}
-
-
-def calendar_env(snapshot: Path) -> dict[str, str]:
-    """Point a champion at the calendar the snapshot froze, when it froze one."""
-    if not (snapshot / CALENDAR_DIR / VIEW_FILE).exists():
-        return {}
-    return {CALENDAR_ENV: f"{SANDBOX_MARKET_DATA}/{CALENDAR_DIR}/{VIEW_FILE}"}
-
-
-def require_offline_bundle(snapshot: Path) -> Path:
-    """The bundle agents backtest against, or exit. Without it every agent backtest calls the live
-    API, and the backtester's padding past the requested window reaches past the data cutoff."""
-    bundle = snapshot / OFFLINE_BUNDLE_DIR
-    # Day partitions, or the single files of a bundle built before them.
-    has_scores = bundle.is_dir() and any(
-        [*bundle.glob(f"{SCORES_DIR}/*/*/date=*.parquet"), *bundle.glob("miner_scores_*.parquet")]
-    )
-    has_rewards = bundle.is_dir() and any(
-        [*bundle.glob(f"{REWARDS_DIR}/*/date=*.parquet"), *bundle.glob("rewards_history_*.parquet")]
-    )
-    if not (has_scores and has_rewards):
-        raise SystemExit(
-            f"no offline scores bundle in {bundle}: build it before `run`, one call per competition —\n"
-            f"  python -m synth_lib.backtester.scripts.build_offline_bundle --competition <slug> "
-            f"--days 32 --eval-end <data_cutoff> --out {bundle} --no-realized-paths"
-        )
-    return bundle
 
 
 def containerize_url(url: str) -> str:
@@ -167,14 +114,15 @@ def setup_campaign(campaign_file: Path, data_root: Path, campaigns_root: Path | 
     if campaigns_root is not None:
         cfg = replace(cfg, root=campaigns_root)
     state = CampaignState(cfg=cfg, dir=cfg.dir)
+    kind = load_kind(cfg.kind)
     state.dir.mkdir(parents=True, exist_ok=True)
     dest_yaml = state.dir / "campaign.yaml"
     if Path(campaign_file).resolve() != dest_yaml.resolve():
         shutil.copy(campaign_file, dest_yaml)
     # The market_data snapshot always comes from THIS repo (private source) — only the agent's
     # workspace becomes a standalone public repo (spec pivot "public workspace").
-    build_snapshot(data_root / "market_data", state.dir / "snapshot", cutoff=cfg.data_cutoff, start=cfg.data_start)
-    data_md = render_data_md(state.dir / "snapshot")
+    kind.build_snapshot(data_root, state.dir / "snapshot", cfg)
+    data_md = kind.render_data_md(state.dir / "snapshot")
     for model in cfg.models:
         create_workspace(cfg, model, data_md=data_md)
     # The image is built from a Dockerfile in the deployment repo, so its CLI versions are versioned
@@ -197,6 +145,7 @@ def run_all(
     unknown = sorted(set(legs or ()) - {m.id for m in cfg.models})
     if unknown:
         raise SystemExit(f"--legs names no leg of {cfg.name}: {', '.join(unknown)}")
+    kind = load_kind(cfg.kind)
     data = state.load()
     virtual_keys: dict[str, str] = data.setdefault("virtual_keys", {})
     results: list[RunResult] = []
@@ -261,10 +210,9 @@ def run_all(
                 home=home,
                 # IS_SANDBOX=1: otherwise Claude Code refuses --dangerously-skip-permissions as root
                 env={
+                    **kind.sandbox_env(state.dir / "snapshot"),
                     **adapter.env(),
                     "IS_SANDBOX": "1",
-                    **offline_bundle_env(state.dir / "snapshot"),
-                    **calendar_env(state.dir / "snapshot"),
                 },
                 container_name=container_name,
                 memory_gb=cfg.sandbox_memory_gb,
@@ -277,6 +225,7 @@ def run_all(
             budget_usd=cfg.budget_usd_per_model,
             soft_landing_pct=cfg.soft_landing_pct,
             clock=RunClock(deadline_seconds=cfg.deadline_hours_per_model * 3600),
+            landing_order=kind.landing_order,
         )
         run = ModelRun(
             cfg,
@@ -319,12 +268,14 @@ def main() -> None:
     if args.command == "setup":
         setup_campaign(args.campaign, args.data_root)
     elif args.command == "run":
-        require_offline_bundle(state.dir / "snapshot")
+        load_kind(cfg.kind).require_ready(state.dir / "snapshot")
         admin = LiteLLMAdmin(cfg.proxy_url, os.environ[args.master_key_env])
         run_all(state, admin=admin, legs=args.legs)
     elif args.command == "status":
         print(json.dumps(state.load(), indent=2))
     elif args.command == "verdict":
+        if cfg.kind != DEFAULT_KIND:
+            raise SystemExit(f"verdict: run_verdict scores {DEFAULT_KIND} campaigns; kind {cfg.kind} brings its own.")
         raise SystemExit(
             "verdict: run after the forward window with "
             "`python -m synth_lib.benchmark.verdict.run_verdict --campaign <name> "

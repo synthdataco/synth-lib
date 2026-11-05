@@ -15,6 +15,7 @@ from synth_lib.benchmark.clock import RunClock
 from synth_lib.benchmark.driver import GPU_PROMPT, MAX_GPU_RELAUNCHES, SESSIONS_DIR, ModelRun
 from synth_lib.benchmark.fake_cli import FAKE_MODELING
 from synth_lib.benchmark.gpu_usage import GpuUsage
+from synth_lib.benchmark.monte_carlo import LANDING_ORDER
 
 
 class RampAdmin:
@@ -97,6 +98,7 @@ def _run(tmp_path, scenario: str, admin, cfg=None) -> "ModelRun":
         budget_usd=cfg.budget_usd_per_model,
         soft_landing_pct=cfg.soft_landing_pct,
         clock=RunClock(deadline_seconds=cfg.deadline_hours_per_model * 3600),
+        landing_order=LANDING_ORDER,
     )
     run = ModelRun(
         cfg,

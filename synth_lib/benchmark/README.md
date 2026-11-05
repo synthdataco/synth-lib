@@ -79,17 +79,31 @@ zero says "earned nothing" but not *how far* from earning; ranks do. Every verdi
 Read Score for "would this have made money", per-competition mean rank for "how close", per-asset
 mean rank for "where the strength actually is".
 
+## Competition kinds
+
+A campaign names its kind (`kind:` in campaign.yaml, default `monte-carlo`): what the agents build,
+and how the engine prepares and checks it. A kind (`kinds.CompetitionKind`) supplies the constitution
+template, the workspace scaffold and its pins, the snapshot and DATA.md, the sandbox environment and
+the check before `run`, the champion's interface probe, and the texts that hand a nomination back and
+order the landing. `monte-carlo` is the sampled-paths kind this README describes.
+
+Another package adds a kind by registering a `CompetitionKind` under the `synth_lib.benchmark.kinds`
+entry-point group in its own pyproject; a campaign then sets `kind:` and that kind's `primary_metric`.
+The verdict above is monte-carlo's: a kind registered elsewhere brings its own.
+
 ## Layout
 
 | Path | What |
 | --- | --- |
 | `campaign.py` | campaign config (`CampaignConfig`, `ModelSpec`) + validation |
+| `kinds.py`, `monte_carlo.py` | the competition-kind plug-in point, and the built-in `monte-carlo` kind |
 | `run_campaign.py` | `setup` (snapshot + workspaces) and `run` (sequential legs) entrypoints |
 | `driver.py` | one leg's lifecycle: launch → poll → land → kill → collect |
 | `budget.py`, `clock.py` | envelope tracking and the agent-visible `BUDGET.md` |
 | `workspace.py`, `scaffold/` | the standalone agent workspace: starter model, evaluator, pins |
 | `constitution.py`, `constitution/` | the rendered `CAMPAIGN.md` |
-| `snapshot.py` | freezes `market_data` at the cutoff (hard links + manifest) and renders `DATA.md` |
+| `snapshot.py` | freezes `market_data` at the cutoff and renders `DATA.md` |
+| `manifest.py` | the hard links and sha256 manifest of a frozen snapshot, standard library only |
 | `nomination.py` | the `CHAMPION` contract and the `simulate()` interface probe |
 | `cli_adapters.py` | per-CLI argv/env, including a `fake` CLI for zero-cost dry runs |
 | `sandbox/` | `docker run` construction (mounts, caps, network, GPU) |

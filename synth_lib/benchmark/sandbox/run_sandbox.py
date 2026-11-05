@@ -10,6 +10,8 @@ from pathlib import Path
 # One definition of the image name; override with SYNTH_BENCH_SANDBOX_IMAGE so an operator who
 # builds their own image never has to edit code.
 DEFAULT_IMAGE = os.environ.get("SYNTH_BENCH_SANDBOX_IMAGE", "synth-bench-sandbox")
+# Where sandbox_cmd mounts the snapshot, read-only.
+SANDBOX_MARKET_DATA = "/workspace/market_data"
 
 
 def image_identity(image: str = DEFAULT_IMAGE) -> dict[str, str | None]:
@@ -67,7 +69,7 @@ def sandbox_cmd(
         "-v",
         f"{workspace}:/workspace:rw",
         "-v",
-        f"{snapshot}:/workspace/market_data:ro",
+        f"{snapshot}:{SANDBOX_MARKET_DATA}:ro",
         "-v",
         f"{home}:/root:rw",
         "-w",

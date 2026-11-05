@@ -9,6 +9,8 @@ from pathlib import Path
 
 import yaml
 
+from synth_lib.benchmark.kinds import DEFAULT_KIND, load_kind
+
 KNOWN_CLIS = ("claude-code", "codex", "gemini-cli", "kimi-code", "fake")
 # The reasoning-effort levels each CLI accepts, by its own names; a CLI absent here has no effort wired.
 EFFORT_LEVELS = {
@@ -17,6 +19,7 @@ EFFORT_LEVELS = {
 }
 # claude-code's workflowSizeGuideline values: the agent count it tells the model to aim for per workflow.
 WORKFLOW_SIZES = ("unrestricted", "small", "medium", "large")
+# The monte-carlo kind's metric.
 PRIMARY_METRIC = "synth_competition_rank"
 # CampaignConfig fields that must be strictly positive (checked in _validate).
 POSITIVE_FIELDS = (
@@ -99,6 +102,8 @@ class CampaignConfig:
     # least this much, and the constitution tells the agent what it got (`hardware:`).
     sandbox_memory_gb: int = 12
     sandbox_cpus: int = 12
+    # A kinds.load_kind name: what the agents build, and how the engine sets it up and checks it.
+    kind: str = DEFAULT_KIND
     primary_metric: str = PRIMARY_METRIC
     root: Path = field(default=Path("campaign_runs"), compare=False)
 
@@ -145,8 +150,9 @@ def _validate(cfg: CampaignConfig) -> None:
         raise ValueError("min_gpu_minutes must be >= 0, and needs gpu: true")
     if cfg.data_start is not None and cfg.data_start > cfg.data_cutoff:
         raise ValueError(f"data_start ({cfg.data_start}) must be <= data_cutoff ({cfg.data_cutoff})")
-    if cfg.primary_metric != PRIMARY_METRIC:
-        raise ValueError(f"primary_metric is pre-registered: {PRIMARY_METRIC}")
+    kind = load_kind(cfg.kind)
+    if cfg.primary_metric != kind.primary_metric:
+        raise ValueError(f"primary_metric is pre-registered for kind {cfg.kind}: {kind.primary_metric}")
 
 
 def _validate_model(m: ModelSpec) -> None:
