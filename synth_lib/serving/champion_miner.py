@@ -6,7 +6,8 @@ by asset, then keeps them all fresh, and an asset is served as soon as its own w
 request slices the trailing 7-day context — a crypto-1h one topped up with the bars that closed
 since the last refresh — and adapts the champion's output to the live validator contract. A second
 thread refreshes the event calendar at startup and daily, and the champion finds it at
-`$SYNTH_BENCHMARK_CALENDAR`, as in its campaign.
+`$SYNTH_BENCHMARK_CALENDAR`, as in its campaign. A calendar already stored on the volume, no older
+than `CALENDAR_MAX_AGE_SECONDS`, is served until the first refresh replaces it.
 
 No guards: an unservable asset, a data hole, or an exploding path crashes the request so it
 shows up in monitoring instead of silently degrading.
@@ -58,7 +59,9 @@ REFRESH_SECONDS = 60
 # The served calendar reaches this far back, for a champion that measures the time since an event.
 CALENDAR_HISTORY_DAYS = 45
 CALENDAR_REFRESH_SECONDS = 24 * 3600
-# How long after startup the assets wait for the first calendar refresh before they are served.
+# A stored calendar at most this old is served from startup, while the first refresh runs.
+CALENDAR_MAX_AGE_SECONDS = CALENDAR_REFRESH_SECONDS
+# Without one, how long after startup the assets wait for the first calendar refresh.
 CALENDAR_WAIT_SECONDS = 10 * 60
 
 
@@ -81,8 +84,14 @@ class ChampionMiner(Miner):
         # An asset joins once its whole warm-up window is in: a partly warmed store can end days back.
         self._ready: set[str] = set()
         self._calendar_root = MARKET_DATA_DIR
-        os.environ[CALENDAR_ENV] = str((self._calendar_root / CALENDAR_DIR / VIEW_FILE).resolve())
+        view = self._calendar_root / CALENDAR_DIR / VIEW_FILE
+        os.environ[CALENDAR_ENV] = str(view.resolve())
         self._calendar_ready = threading.Event()
+        if view.exists():
+            age = time.time() - view.stat().st_mtime
+            if age <= CALENDAR_MAX_AGE_SECONDS:
+                logger.info("serving the calendar stored %.1f h ago until the first refresh", age / 3600)
+                self._calendar_ready.set()
         threading.Thread(target=self._refresh_calendar_daily, daemon=True).start()
         threading.Thread(target=self._warm_up_then_refresh, daemon=True).start()
         logger.info("warming up %d assets in the background", len(assets))
