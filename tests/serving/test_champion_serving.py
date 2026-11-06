@@ -26,6 +26,7 @@ from synth_lib.serving.serve import (
 )
 from synth_lib.serving.unpack_champion import MINER_TEMPLATE, class_name_for, contract_gate, unpack
 from synth_lib.preparation.binance_client import BinanceClient
+from synth_lib.preparation.config import OHLCV_COLUMNS
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 
@@ -168,6 +169,29 @@ def test_validators_asking_the_same_prompt_share_one_context(tmp_path, monkeypat
     assert len(builds) == 1 and "mine" not in seen[-1].columns
     serve_request(_recording(seen), store, _input(t, time_length=3_600), contexts=contexts)
     assert len(builds) == 2, "a crypto-1h prompt with the same start_time has its own context"
+
+
+def test_a_shared_context_is_built_again_once_the_store_or_the_tail_moves_on(tmp_path):
+    """A store refresh, or a tail holding a newer bar, between two validators asking the same prompt
+    reaches the second one."""
+    series = _series()
+    t = series.index[-1] + pd.Timedelta(minutes=3)
+    early = _store_with(tmp_path / "early", series.iloc[:-5])
+    later = _store_with(tmp_path / "later", series)  # the same BTC store, refreshed
+    seen: list = []
+    contexts = ContextCache()
+    serve_request(_recording(seen), early, _input(t), contexts=contexts)
+    serve_request(_recording(seen), later, _input(t), contexts=contexts)
+    contexts.store_refreshed()
+    serve_request(_recording(seen), later, _input(t), contexts=contexts)
+    assert [c.index[-1] for c in seen] == [t - pd.Timedelta(minutes=8)] * 2 + [t - pd.Timedelta(minutes=3)]
+
+    seen.clear()
+    for minutes in (3, 2, 2):
+        index = pd.date_range(end=t - pd.Timedelta(minutes=minutes), periods=15, freq="1min")
+        tail = pd.DataFrame({"timestamp": index, **{c: 1.0 for c in OHLCV_COLUMNS}})
+        serve_request(_recording(seen), early, _input(t, time_length=3_600), tail=tail, contexts=contexts)
+    assert [c.index[-1] for c in seen] == [t - pd.Timedelta(minutes=m) for m in (3, 2, 2)]
 
 
 def test_the_context_cache_returns_the_same_frame_and_keeps_the_newest():

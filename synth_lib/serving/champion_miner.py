@@ -117,6 +117,7 @@ class ChampionMiner(Miner):
                 store.refresh_recent(days=self.context_days + 1)
             except Exception as exc:
                 logger.warning("refresh failed for %s: %s", asset, exc)
+        self._contexts.store_refreshed()
 
     def _refresh_calendar(self) -> None:
         """One update of the calendar: a source that fails keeps its rows, and the champion keeps the last view."""
