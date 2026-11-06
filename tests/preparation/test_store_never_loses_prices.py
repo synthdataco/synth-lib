@@ -148,6 +148,11 @@ def test_an_interrupted_write_leaves_the_stored_partition_whole(tmp_path, monkey
     assert [p.name for p in path.parent.iterdir()] == [path.name]
 
 
+def test_a_partition_is_readable_by_others(tmp_path):
+    path = _store(tmp_path, _Client(rows=100)).ingest_day(DAY, force_refresh=True)
+    assert path.stat().st_mode & 0o777 == 0o644
+
+
 def test_a_day_of_zero_trade_candles_is_not_replaced_by_a_shorter_refetch(tmp_path):
     """A flat zero-trade candle is a price: it counts on both sides of the comparison."""
     path = _store(tmp_path, _Client(rows=MINUTES_PER_DAY)).ingest_day(DAY, force_refresh=True)
