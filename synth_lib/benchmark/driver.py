@@ -48,6 +48,7 @@ DELIVERABLES = ("report.md", "journal.md", "CHAMPION", "suggestions.md")
 # Routing is then sticky for about an hour, so one declined turn can hand the rest of a leg to a
 # model the campaign never chose — and the transcript is the only place it shows. A leg whose
 # champion came from a substitute model does not measure the model on the panel.
+# The scan covers claude-code transcripts only.
 FALLBACK_MARKER = b"model_refusal_fallback"
 # Under artifacts_dir: each Claude Code session's workflow records and subagent transcripts, copied from
 # the run's HOME, where they are not part of the stream-json transcript.
