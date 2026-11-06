@@ -1,8 +1,8 @@
 # synth_lib.benchmark — an autonomous-agent benchmark harness
 
-This subpackage runs a coding CLI (Claude Code, Codex, Gemini CLI, Kimi Code, …) as an **autonomous
-research agent** whose job is to improve a Synth SN50 miner, and then scores what it produced
-against the real field of miners on the live subnet.
+This subpackage runs a coding CLI (Claude Code, Codex, Gemini CLI, Kimi Code, Antigravity CLI, …) as
+an **autonomous research agent** whose job is to improve a Synth SN50 miner, and then scores what it
+produced against the real field of miners on the live subnet.
 
 One *campaign* runs one or more *legs*, one leg per model, sequentially on the same hardware. A leg
 is: an agent alone in a Docker sandbox with a frozen price snapshot, a fixed credit budget and a

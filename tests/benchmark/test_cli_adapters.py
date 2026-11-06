@@ -155,6 +155,31 @@ def test_kimi_adapter_writes_the_thinking_effort():
     assert tomllib.loads(a.provision_files()["~/.kimi-code/config.toml"]) == {"thinking": {"effort": "max"}}
 
 
+def test_antigravity_adapter_pins_model_and_effort_and_routes_through_the_passthrough():
+    a = build_adapter(
+        ModelSpec(id="g", cli="antigravity-cli", model="gemini-4-argon", effort="high"),
+        proxy_url="http://localhost:4000",
+        virtual_key="sk-v",
+    )
+    cmd = a.launch_cmd("go")
+    assert cmd[:3] == ["agy", "-p", "go"] and "--dangerously-skip-permissions" in cmd
+    assert cmd[cmd.index("--model") + 1] == "gemini-4-argon" and cmd[cmd.index("--effort") + 1] == "high"
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+    resume = a.resume_cmd("again")
+    assert resume[:4] == ["agy", "-c", "-p", "again"] and resume[4:] == cmd[3:]  # same flags on every launch
+    env = a.env()
+    assert env["GOOGLE_GEMINI_BASE_URL"] == "http://localhost:4000/gemini" and env["GEMINI_API_KEY"] == "sk-v"
+    # the SDK would prefer GOOGLE_API_KEY over the virtual key
+    assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "true" and "GOOGLE_API_KEY" not in env
+    settings = json.loads(a.provision_files()["~/.gemini/antigravity-cli/settings.json"])
+    assert settings == {"modelProvider": "gemini"}  # without it GEMINI_API_KEY is ignored
+
+
+def test_antigravity_adapter_without_effort_passes_no_flag():
+    a = build_adapter(ModelSpec(id="g", cli="antigravity-cli", model="gemini-4-argon"), "http://x", "sk-v")
+    assert "--effort" not in a.launch_cmd("go") and "--effort" not in a.resume_cmd("go")
+
+
 def test_fake_adapter_runs_fake_cli(tmp_path):
     a = build_adapter(ModelSpec(id="f", cli="fake", model="none"), proxy_url="http://x", virtual_key="sk-v")
     cmd = a.launch_cmd("go")
