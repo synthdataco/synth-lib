@@ -88,6 +88,8 @@ def write_atomic(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     os.close(fd)
+    # mkstemp creates the file owner-only; the written file is readable like any other.
+    os.chmod(tmp, 0o644)
     try:
         frame.to_parquet(tmp, index=False)
         os.replace(tmp, path)

@@ -267,7 +267,10 @@ def test_predict_fails_clearly_outside_snapshot(tmp_path, monkeypatch):
     ws, predict = _scaffold_and_import(tmp_path, monkeypatch)
     with pytest.raises(SystemExit) as exc:
         predict.check_snapshot_coverage(
-            "BTC", datetime(2026, 7, 10, tzinfo=timezone.utc), datetime(2026, 7, 12, tzinfo=timezone.utc)
+            "BTC",
+            datetime(2026, 7, 10, tzinfo=timezone.utc),
+            datetime(2026, 7, 12, tzinfo=timezone.utc),
+            datetime(2026, 7, 11, tzinfo=timezone.utc),
         )
     msg = str(exc.value)
     assert "outside snapshot" in msg and "2026-07-10" in msg and "data_cutoff" in msg
@@ -282,7 +285,10 @@ def test_predict_coverage_passes_when_partitions_present(tmp_path, monkeypatch):
     for day in ("2026-07-10", "2026-07-11", "2026-07-12"):
         (root / f"date={day}.parquet").write_bytes(b"x")
     predict.check_snapshot_coverage(
-        "BTC", datetime(2026, 7, 10, tzinfo=timezone.utc), datetime(2026, 7, 12, tzinfo=timezone.utc)
+        "BTC",
+        datetime(2026, 7, 10, tzinfo=timezone.utc),
+        datetime(2026, 7, 12, tzinfo=timezone.utc),
+        datetime(2026, 7, 11, tzinfo=timezone.utc),
     )
 
 

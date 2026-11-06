@@ -18,9 +18,11 @@ instead. The model's sole market input is that DataFrame; simulate() takes no da
 
 Predictions land one file per day, under
 `<out>/<asset>/<time_length>_<time_increment>/date=<YYYY-MM-DD>.npy` — float32, shaped
-(prompts, simulations, steps) — beside a `.json` naming the prompt start_times it holds. A day
-whose file already covers every requested start_time is skipped, so pointing --out-dir at a
-directory that survives the run makes a re-score reuse the paths instead of regenerating them.
+(prompts, simulations, steps) — beside a `.json` naming the prompt start_times it holds, the
+champion's CONTEXT_DAYS and `context_head_nan_minutes`, the most minutes one of the day's contexts
+runs before its first real close. A day whose file already covers every requested start_time is
+skipped, so pointing --out-dir at a directory that survives the run makes a re-score reuse the paths
+instead of regenerating them, with the contexts they were generated from.
 
 Usage:
   python generate_predictions.py --modeling agent/modeling.py --asset BTC \\
@@ -35,14 +37,18 @@ import argparse
 import importlib.util
 import json
 import sys
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Callable
 
 import numpy as np
 import pandas as pd
 
-CONTEXT_MINUTES = 7 * 24 * 60
+# The champion's context length: `CONTEXT_DAYS` in its modeling.py, a plain int within these bounds,
+# and this default when the module does not set it.
+DEFAULT_CONTEXT_DAYS = 7
+CONTEXT_DAYS_BOUNDS = (3, 30)
 # Duplicated from synth_lib.preparation.config rather than imported: this file runs inside a
 # champion's own venv, which does not have synth_lib.
 OHLCV_COLUMNS = ["open", "high", "low", "close", "volume", "trade_count"]
@@ -63,6 +69,28 @@ def context_end(start: pd.Timestamp, time_length: int, issuance_lead: int | None
     """Label of the last bar a miner answering the prompt at `start` could have held."""
     lead = ISSUANCE_LEAD_SECONDS.get(time_length, 0) if issuance_lead is None else issuance_lead
     return start - pd.Timedelta(seconds=lead + BAR_SECONDS)
+
+
+def context_slice(
+    frame: pd.DataFrame, start: pd.Timestamp, time_length: int, context_days: int, issuance_lead: int | None = None
+) -> pd.DataFrame:
+    """The context of the prompt at `start`: the bars from `context_days` before it to `context_end`."""
+    return frame.loc[start - pd.Timedelta(days=context_days) : context_end(start, time_length, issuance_lead)]
+
+
+def nan_head_minutes(context: pd.DataFrame) -> int:
+    """How many minutes the context runs before its first real close."""
+    real = context["close"].notna().to_numpy()
+    return int(real.argmax()) if real.any() else len(real)
+
+
+def context_days_of(module: ModuleType) -> int:
+    """The champion's `CONTEXT_DAYS`, or the default when its module does not set it."""
+    value = getattr(module, "CONTEXT_DAYS", DEFAULT_CONTEXT_DAYS)
+    low, high = CONTEXT_DAYS_BOUNDS
+    if type(value) is not int or not low <= value <= high:
+        raise ValueError(f"CONTEXT_DAYS must be a plain int from {low} to {high} in modeling.py, got {value!r}")
+    return value
 
 
 # What simulate() receives as context_prices: the minute OHLCV frame, or the Series of closes (NaN
@@ -95,7 +123,7 @@ def covered_start_times(index_path: Path, paths_path: Path) -> set[str]:
         return set()  # truncated by an interrupted write; regenerate the day
 
 
-def load_simulate(modeling_path: Path) -> Callable:
+def load_module(modeling_path: Path) -> ModuleType:
     # A champion imports the modules beside it by name, as when its folder is the script's own.
     folder = str(modeling_path.resolve().parent)
     if folder not in sys.path:
@@ -104,7 +132,11 @@ def load_simulate(modeling_path: Path) -> Callable:
     assert spec is not None and spec.loader is not None  # always true for a .py file path
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.simulate
+    return module
+
+
+def load_simulate(modeling_path: Path) -> Callable:
+    return load_module(modeling_path).simulate
 
 
 def store_root(data_root: Path, asset: str) -> Path:
@@ -115,11 +147,16 @@ def store_root(data_root: Path, asset: str) -> Path:
 
 
 def load_minute_prices(data_root: Path, asset: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Minute OHLCV over [start, end] from daily partitions. Missing partitions raise: a silent
+    """Minute OHLCV over [start, end] from daily partitions.
+
+    The days before the asset's first partition, before the market's first trade or the store's first
+    day, are NaN on every minute, as in a live context. A missing partition after it raises: a silent
     hole here would shrink every context that spans it without anyone noticing."""
     root = store_root(data_root, asset)
+    stored = (date.fromisoformat(p.stem.removeprefix("date=")) for p in root.glob("date=*.parquet"))
+    first_day = min(stored, default=start.date())
     frames = []
-    day = start.date()
+    day = max(start.date(), first_day)
     while day <= end.date():
         path = root / f"date={day.isoformat()}.parquet"
         if not path.exists():
@@ -132,9 +169,18 @@ def load_minute_prices(data_root: Path, asset: str, start: pd.Timestamp, end: pd
                 f"skips settled partitions that already exist."
             ) from exc
         day += timedelta(days=1)
+    if not frames:
+        raise FileNotFoundError(
+            f"no partition for {asset} from {start.date()} to {end.date()}: its first is {first_day}"
+        )
     frame = pd.concat(frames, ignore_index=True)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     frame = frame.set_index("timestamp").sort_index()
+    if start.date() < first_day:
+        head = pd.date_range(
+            pd.Timestamp(start.date(), tz="UTC"), frame.index[0], freq="1min", inclusive="left", name="timestamp"
+        )
+        frame = pd.concat([pd.DataFrame(np.nan, index=head, columns=OHLCV_COLUMNS), frame])
     return frame.loc[start:end]
 
 
@@ -169,6 +215,7 @@ def generate_day(
     num_simulations: int,
     issuance_lead: int | None = None,
     context_mode: str = "ohlcv",
+    context_days: int = DEFAULT_CONTEXT_DAYS,
 ) -> int:
     """Generate one day's prompts and write the pair. Returns how many were generated, 0 if the
     day was already covered.
@@ -182,12 +229,12 @@ def generate_day(
         return 0
 
     runs = []
+    head = 0
     for t in times:
         # THE no-lookahead line: the context stops at the last bar the prompt's issuance allows,
         # never at t — the bar labelled t closes after the prompt starts.
-        context = price_frame.loc[
-            t - pd.Timedelta(minutes=CONTEXT_MINUTES) : context_end(t, time_length, issuance_lead)
-        ]
+        context = context_slice(price_frame, t, time_length, context_days, issuance_lead)
+        head = max(head, nan_head_minutes(context))
         if context_mode == "close":
             context = context["close"]
         out = simulate_fn(
@@ -212,6 +259,8 @@ def generate_day(
                 "time_length": time_length,
                 "num_simulations": int(stacked.shape[1]),
                 "num_steps": int(stacked.shape[2]),
+                "context_days": context_days,
+                "context_head_nan_minutes": head,
             }
         )
     )
@@ -232,6 +281,7 @@ def generate(
     prompt_times: list[pd.Timestamp] | None = None,
     issuance_lead: int | None = None,
     context_mode: str = "ohlcv",
+    context_days: int = DEFAULT_CONTEXT_DAYS,
 ) -> tuple[int, int]:
     """Returns (generated, reused) prompt counts."""
     by_day: dict[str, list[pd.Timestamp]] = {}
@@ -252,6 +302,7 @@ def generate(
             num_simulations,
             issuance_lead,
             context_mode,
+            context_days,
         )
         generated += made
         reused += 0 if made else len(times)
@@ -301,9 +352,11 @@ def main() -> None:
     prompt_times = None
     if args.prompt_times is not None:
         prompt_times = [_utc(t) for t in json.loads(args.prompt_times.read_text())]
-    prices = load_minute_prices(args.data_root, args.asset, start - pd.Timedelta(minutes=CONTEXT_MINUTES), end)
+    module = load_module(args.modeling)
+    days = context_days_of(module)
+    prices = load_minute_prices(args.data_root, args.asset, start - pd.Timedelta(days=days), end)
     generated, reused = generate(
-        load_simulate(args.modeling),
+        module.simulate,
         args.asset,
         start,
         end,
@@ -316,8 +369,9 @@ def main() -> None:
         prompt_times=prompt_times,
         issuance_lead=args.issuance_lead_seconds,
         context_mode=args.context,
+        context_days=days,
     )
-    print(f"{args.asset} tl={args.time_length}: {generated} predictions ({reused} reused)")
+    print(f"{args.asset} tl={args.time_length}: {generated} predictions ({reused} reused), CONTEXT_DAYS {days}")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
 """Serving wrapper: live-contract adaptation, venue routing (never Pyth), and the unpacker."""
 
+import asyncio
 import os
 import subprocess
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -10,11 +13,20 @@ import pytest
 from synth.simulation_input import SimulationInput  # type: ignore[import-untyped]
 from synth.validator import response_validation_v2  # type: ignore[import-untyped]
 
+import synth_lib.serving.serve as serve
 from synth_lib.benchmark.generate_predictions import load_simulate
 from synth_lib.benchmark.verdict.run_verdict import DEFAULT_SEED, HASH_SEED_ENV, SEED_ENV, generation_env
-from synth_lib.serving.serve import build_context, serve_request, servable_assets, venue_store, wrap_output
-from synth_lib.serving.unpack_champion import class_name_for, unpack
+from synth_lib.serving.serve import (
+    ContextCache,
+    build_context,
+    serve_request,
+    servable_assets,
+    venue_store,
+    wrap_output,
+)
+from synth_lib.serving.unpack_champion import MINER_TEMPLATE, class_name_for, contract_gate, unpack
 from synth_lib.preparation.binance_client import BinanceClient
+from synth_lib.preparation.config import OHLCV_COLUMNS
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.preparation.hyperliquid_client import HyperliquidClient
 
@@ -46,9 +58,7 @@ def _store_with(tmp_path, series: pd.Series, asset: str = "BTC"):
                 "volume": 1.0,
                 "trade_count": 1.0,
             }
-        ).to_parquet(
-            root / f"date={day.isoformat()}.parquet"
-        )
+        ).to_parquet(root / f"date={day.isoformat()}.parquet")
     return MinutePriceStore(asset, root=root)
 
 
@@ -56,8 +66,7 @@ def _context(series: pd.Series) -> pd.DataFrame:
     """The OHLCV frame simulate() is handed, from a close series."""
     closes = series.to_numpy()
     return pd.DataFrame(
-        {"open": closes, "high": closes, "low": closes, "close": closes,
-         "volume": 1.0, "trade_count": 1.0},
+        {"open": closes, "high": closes, "low": closes, "close": closes, "volume": 1.0, "trade_count": 1.0},
         index=series.index,
     )
 
@@ -118,6 +127,141 @@ def test_serve_request_end_to_end_on_a_context_with_holes(tmp_path):
     assert response_validation_v2.validate_responses(out, sim_input, process_time_str="1.0") == "CORRECT"
 
 
+def _recording(seen: list):
+    """A simulate() that records each context it is handed, then mutates it."""
+
+    def simulate(asset, start_time, time_increment, time_length, num_simulations, context_prices):
+        seen.append(context_prices.copy())
+        context_prices["mine"] = 1.0
+        last = float(context_prices["close"].iloc[-1])
+        return (start_time, time_increment, *[[last] * (time_length // time_increment + 1)] * num_simulations)
+
+    return simulate
+
+
+def _input(t: pd.Timestamp, time_length: int = 86_400) -> SimulationInput:
+    increment = 300 if time_length == 86_400 else 60
+    return SimulationInput(
+        asset="BTC", start_time=t.isoformat(), time_increment=increment, time_length=time_length, num_simulations=2
+    )
+
+
+@pytest.mark.parametrize("days", [14, 7])
+def test_serve_request_hands_the_champion_its_context_days(tmp_path, days):
+    series = _series(16)
+    t = series.index[-1]
+    seen: list = []
+    serve_request(_recording(seen), _store_with(tmp_path, series), _input(t), context_days=days)
+    assert seen[0].index[0] == t - pd.Timedelta(days=days)
+
+
+def test_validators_asking_the_same_prompt_share_one_context(tmp_path, monkeypatch):
+    """Built once per (asset, format, start_time), and each call gets its own copy to change."""
+    series = _series()
+    t = series.index[-1]
+    store = _store_with(tmp_path, series)
+    builds: list = []
+    monkeypatch.setattr(serve, "build_context", lambda *a: builds.append(a) or build_context(*a))
+    seen: list = []
+    contexts = ContextCache()
+    for _ in range(3):
+        serve_request(_recording(seen), store, _input(t), contexts=contexts)
+    assert len(builds) == 1 and "mine" not in seen[-1].columns
+    serve_request(_recording(seen), store, _input(t, time_length=3_600), contexts=contexts)
+    assert len(builds) == 2, "a crypto-1h prompt with the same start_time has its own context"
+
+
+def test_a_shared_context_is_built_again_once_the_store_or_the_tail_moves_on(tmp_path):
+    """A store refresh, or a tail holding a newer bar, between two validators asking the same prompt
+    reaches the second one."""
+    series = _series()
+    t = series.index[-1] + pd.Timedelta(minutes=3)
+    early = _store_with(tmp_path / "early", series.iloc[:-5])
+    later = _store_with(tmp_path / "later", series)  # the same BTC store, refreshed
+    seen: list = []
+    contexts = ContextCache()
+    serve_request(_recording(seen), early, _input(t), contexts=contexts)
+    serve_request(_recording(seen), later, _input(t), contexts=contexts)
+    contexts.store_refreshed()
+    serve_request(_recording(seen), later, _input(t), contexts=contexts)
+    assert [c.index[-1] for c in seen] == [t - pd.Timedelta(minutes=8)] * 2 + [t - pd.Timedelta(minutes=3)]
+
+    seen.clear()
+    for minutes in (3, 2, 2):
+        index = pd.date_range(end=t - pd.Timedelta(minutes=minutes), periods=15, freq="1min")
+        tail = pd.DataFrame({"timestamp": index, **{c: 1.0 for c in OHLCV_COLUMNS}})
+        serve_request(_recording(seen), early, _input(t, time_length=3_600), tail=tail, contexts=contexts)
+    assert [c.index[-1] for c in seen] == [t - pd.Timedelta(minutes=m) for m in (3, 2, 2)]
+
+
+def test_the_context_cache_returns_the_same_frame_and_keeps_the_newest():
+    t = pd.Timestamp("2026-09-30 12:00", tz="UTC").to_pydatetime()
+    cache = ContextCache(size=2)
+    frame = cache.get(("BTC", 3_600, t), pd.DataFrame)
+    assert cache.get(("BTC", 3_600, t), lambda: pytest.fail("built twice")) is frame
+    for minutes in (1, 2):
+        cache.get(("BTC", 3_600, t + pd.Timedelta(minutes=minutes)), pd.DataFrame)
+    assert cache.get(("BTC", 3_600, t), pd.DataFrame) is not frame, "the oldest key is evicted"
+
+
+def _generated_miner(monkeypatch, **attributes) -> type:
+    """The miner class unpack_champion generates, over a stand-in modeling module."""
+    seen: list = []
+    modeling = ModuleType("modeling")
+    modeling.simulate = _recording(seen)
+    modeling.seen = seen
+    for name, value in attributes.items():
+        setattr(modeling, name, value)
+    monkeypatch.setitem(sys.modules, "modeling", modeling)
+    source = MINER_TEMPLATE.substitute(name="test", campaign="c", leg="l", class_name="TestMiner")
+    namespace: dict = {"__name__": "generated_miner"}
+    exec(compile(source, "miner.py", "exec"), namespace)
+    return namespace["TestMiner"]
+
+
+@pytest.mark.parametrize("attributes, days", [({"CONTEXT_DAYS": 14}, 14), ({}, 7)])
+def test_the_generated_miner_serves_the_champions_context_days(tmp_path, monkeypatch, attributes, days):
+    miner_class = _generated_miner(monkeypatch, **attributes)
+    assert miner_class.context_days == days
+    series = _series(16)
+    t = series.index[-1]
+    miner = object.__new__(miner_class)  # Miner.__init__ needs a wallet, a subtensor and a chain
+    miner._stores, miner._tails, miner._ready = {"BTC": _store_with(tmp_path, series)}, {}, {"BTC"}
+    miner._contexts = ContextCache()
+    asyncio.run(miner.forward_miner(SimpleNamespace(simulation_input=_input(t), simulation_output=None)))
+    assert sys.modules["modeling"].seen[0].index[0] == t - pd.Timedelta(days=days)
+
+
+@pytest.mark.parametrize("value", [2, 31, True, 14.0])
+def test_the_generated_miner_refuses_context_days_outside_the_bounds(monkeypatch, value):
+    with pytest.raises(ValueError, match="from 3 to 30"):
+        _generated_miner(monkeypatch, CONTEXT_DAYS=value)
+
+
+# Passes only on a synthetic context of exactly `days` days.
+GATED_MODELING = """
+{constant}
+
+def simulate(asset, start_time, time_increment, time_length, num_simulations, context_prices=None):
+    assert len(context_prices) == {days} * 24 * 60, len(context_prices)
+    last = float(context_prices["close"].iloc[-1])
+    return (start_time, time_increment, *[[last] * (time_length // time_increment + 1)] * num_simulations)
+"""
+
+
+@pytest.mark.parametrize("constant, days", [("CONTEXT_DAYS = 14", 14), ("", 7)])
+def test_the_contract_gate_runs_on_context_days_plus_one(tmp_path, constant, days):
+    (tmp_path / "modeling.py").write_text(GATED_MODELING.format(constant=constant, days=days + 1))
+    assert contract_gate(tmp_path / "modeling.py", ("low", "high")) == days
+
+
+@pytest.mark.parametrize("value", ["2", "31", "True", "14.0"])
+def test_the_contract_gate_refuses_context_days_outside_the_bounds(tmp_path, value):
+    (tmp_path / "modeling.py").write_text(GATED_MODELING.format(constant=f"CONTEXT_DAYS = {value}", days=8))
+    with pytest.raises(ValueError, match="from 3 to 30"):
+        contract_gate(tmp_path / "modeling.py", ("low", "high"))
+
+
 def test_venue_routing_never_pyth():
     assert isinstance(venue_store("BTC").client, BinanceClient)
     assert isinstance(venue_store("XAU").client, HyperliquidClient)
@@ -172,12 +316,13 @@ def test_unpack_generates_a_servable_agent(tmp_path):
     assert (dest / "modeling.py").read_text() == SCAFFOLD_MODELING.read_text()
     miner = (dest / "miner.py").read_text()
     # Absolute: entrypoint.sh runs miner.py as a script, so there is no package for a relative import.
-    assert "from modeling import simulate" in miner
+    assert "\nimport modeling\n" in miner and "context_days = context_days_of(modeling)" in miner
     assert not any(line.startswith("from .") for line in miner.splitlines())
     assert "class TestCampFakeMiner(ChampionMiner):" in miner
     assert (dest / "entrypoint.sh").stat().st_mode & 0o111, "entrypoint must be executable"
     provenance = (dest / "PROVENANCE.md").read_text()
     assert "test-camp" in provenance and "sha" in provenance
+    assert "- CONTEXT_DAYS: 7 " in provenance
     # unpack() gates through validate_responses before writing; existing dest must refuse
     with pytest.raises(FileExistsError):
         unpack("test-camp", "fake", None, results_dir, dest_root)

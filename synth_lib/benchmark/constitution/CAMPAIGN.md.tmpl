@@ -64,8 +64,9 @@ are deployed as miners on the subnet, and emission rewards two things a mean CRP
 
 - **Every prompt answered.** A request that times out, raises, or returns a wrong path count is a
   miss, and a miss is scored like the field's 95th percentile on that prompt.
-- **Contexts rougher than the snapshot.** A live context can hold longer gaps, and a shorter real
-  history after the miner restarts.
+- **Contexts rougher than the snapshot.** A live context can hold longer gaps, and fewer real days
+  than your `CONTEXT_DAYS`: some venues serve only their last 3 days of minutes, so on a new miner
+  the oldest days of a longer context can be NaN.
 
 None of this makes position a target: emission is earned by a low CRPS on every prompt, with no
 exceptions.
@@ -124,8 +125,8 @@ horizon before the window and yours is never treated as late.
   **Read `DATA.md` at the workspace root FIRST**: it is generated from this exact snapshot at
   setup and carries the measured truth — the partition schema, the minute semantics (a minute
   without a trade is a flat candle with `trade_count` 0, NOT market hours; NaN close = no price
-  at all; missing file = before the market's first trade), and a
-  per-asset coverage table with density by era. Two caveats it quantifies that will bite if
+  at all; missing file = before the market's first trade, or before the snapshot's first day),
+  and a per-asset coverage table with density by era. Two caveats it quantifies that will bite if
   ignored: the early months of the newer Hyperliquid listings are genuinely THIN (low realized
   volatility there is real, not smoothing), and these are venue-specific perpetual prices with
   their own basis (xyz:SP500 trades around 7,500 — not the cash index).
@@ -264,11 +265,19 @@ horizon before the window and yours is never treated as late.
    `simulate(asset, start_time, time_increment, time_length, num_simulations, context_prices)`
    -> tuple `(start_timestamp, time_increment, *paths)` — each path: a list of
    `time_length//time_increment + 1` floats starting at the last price in the context.
-   **The `context_prices` contract, exactly**: a minute-indexed pd.DataFrame over the 7 days
-   preceding `start_time`, with columns `open, high, low, close, volume, trade_count`. `close`
-   is the series you are scored against; the rest are context. It MAY CONTAIN NaN in every
-   column — your `simulate()` must tolerate them (drop, never interpolate). Evaluation passes
-   the raw frame: handle gaps inside your model, not in a loader you hope evaluation shares.
+   **The `context_prices` contract, exactly**: a minute-indexed pd.DataFrame over the
+   `CONTEXT_DAYS` days preceding `start_time`, with columns `open, high, low, close, volume,
+   trade_count`. `close` is the series you are scored against; the rest are context. It MAY
+   CONTAIN NaN in every column, on whole days before an asset's first trade or before the
+   snapshot's first day too — your `simulate()` must tolerate them (drop, never interpolate).
+   Evaluation passes the raw frame: handle gaps inside your model, not in a loader you hope
+   evaluation shares.
+   **`CONTEXT_DAYS` is yours to choose**, and to measure like any other parameter: a plain
+   integer at module level in `agent/modeling.py`, from 3 to 30, not computed (a module without
+   it gets 7). `agent/predict.py`, the interface check, the scoring and the live miner all read
+   it, and any other value fails every one of them. One value serves every competition: slice a
+   shorter context inside `simulate()` where you want one. The interface check reports the wall
+   time of one call at your length.
    Runnable OFFLINE (weights/artifacts committed or included in the workspace).
 8. **If your model uses randomness at all, seed it from `SYNTH_BENCHMARK_SEED`.** Nothing
    here asks you to introduce randomness — a deterministic champion ignores this rule. If you
@@ -321,10 +330,10 @@ by the snapshot. Lessons earlier agents paid for:
 - **Test a feature by what it adds to a fast EWMA of realized volatility**, not by its own
   predictive power. Range estimators, volume, trade counts and the leverage effect act on future
   volatility through realized volatility, which the EWMA has already priced. What it cannot hold
-  is information outside the context: the calendar, and anything older than the 7 days
+  is information outside the context: the calendar, and anything older than the `CONTEXT_DAYS`
   `simulate()` receives.$calendar_method
-- **Check what `simulate()` can see before building on it**: one asset's 7-day context per
-  call, nothing else. A feature that needs another asset's current prices cannot be served.
+- **Check what `simulate()` can see before building on it**: one asset's `CONTEXT_DAYS` context
+  per call, nothing else. A feature that needs another asset's current prices cannot be served.
 - **Count the asset-window cells where a change helps**, across disjoint windows, not only its
   average: a small gain signed the same way in most cells survives; a larger one that flips sign
   between windows is noise.

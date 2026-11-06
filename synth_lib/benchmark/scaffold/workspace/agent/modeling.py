@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import numpy as np
 
+# Days of minute history simulate() receives as context_prices: a plain int from 3 to 30.
+CONTEXT_DAYS = 7
+
 
 def simulate(
     asset: str,

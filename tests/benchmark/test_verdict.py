@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -1092,3 +1093,76 @@ def test_the_verdict_records_the_calendar(tmp_path):
     assert rv.verdict_payload(result, "abc1234", window, 7, None, True)["calendar"] is None
     calendar = {"sha256": "f" * 64, "events": 120}
     assert rv.verdict_payload(result, "abc1234", window, 7, None, True, calendar=calendar)["calendar"] == calendar
+
+
+def _day_index(root, asset: str, prompt_format: str, day: str = "2026-08-30", **fields) -> None:
+    path = root / asset / prompt_format / f"date={day}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"start_times": [], **fields}))
+
+
+def test_the_verdict_records_the_context_days_every_run_reported(tmp_path):
+    _day_index(tmp_path, "BTC", "86400_300", context_days=14)
+    _day_index(tmp_path, "BTC", "3600_60", context_days=14)
+    assert rv.reported_context_days(tmp_path) == 14
+    result = {
+        "score": 12.3,
+        "mean_competition_rank": 40,
+        "mean_reward_vs_top": 0.123,
+        "mean_competition_percentile": 0.8,
+        "per_competition": {},
+    }
+    payload = rv.verdict_payload(result, "abc1234", ("2026-08-30", "2026-09-09"), 7, None, True, context_days=14)
+    assert payload["context_days"] == 14
+
+
+def test_runs_reporting_different_context_days_stop_the_verdict(tmp_path):
+    _day_index(tmp_path, "BTC", "86400_300", context_days=14)
+    _day_index(tmp_path, "XAU", "86400_300", context_days=7)
+    with pytest.raises(RuntimeError, match=r"\[7, 14\]"):
+        rv.reported_context_days(tmp_path)
+
+
+def test_an_index_written_before_the_field_reads_as_the_default(tmp_path):
+    _day_index(tmp_path, "BTC", "86400_300")
+    assert rv.reported_context_days(tmp_path) == 7
+    assert rv.reported_context_days(tmp_path / "nothing generated") is None
+
+
+def test_the_verdict_records_each_assets_nan_context_head(tmp_path):
+    _day_index(tmp_path, "BTC", "86400_300", context_head_nan_minutes=0)
+    _day_index(tmp_path, "XAU", "86400_300", context_head_nan_minutes=2880)
+    _day_index(tmp_path, "SOL", "86400_300", context_head_nan_minutes=1440)
+    _day_index(tmp_path, "SOL", "3600_60", context_head_nan_minutes=1500)
+    _day_index(tmp_path, "ETH", "86400_300")  # written before the field
+    _day_index(tmp_path, "ETH", "86400_300", day="2026-08-10", context_head_nan_minutes=60)  # another window
+    _day_index(tmp_path, "ETH", "86400_300", day="2026-09-09", context_head_nan_minutes=60)
+    window = ("2026-08-30", "2026-09-09")
+    heads = rv.context_heads(tmp_path, window, lead_in=True)
+    assert heads == {"SOL": 1500, "XAU": 2880}
+    result = {
+        "score": 12.3,
+        "mean_competition_rank": 40,
+        "mean_reward_vs_top": 0.123,
+        "mean_competition_percentile": 0.8,
+        "per_competition": {},
+    }
+    payload = rv.verdict_payload(result, "abc1234", window, 7, None, True, context_head_nan_minutes=heads)
+    assert payload["context_head_nan_minutes"] == heads
+
+
+def _partitions_from(data_root, asset: str, first: str) -> None:
+    root = data_root / "prices" / asset / "1m"
+    root.mkdir(parents=True)
+    (root / f"date={first}.parquet").touch()
+    (root / "date=2026-09-09.parquet").touch()
+
+
+def test_a_store_starting_after_the_first_context_is_reported(tmp_path):
+    """BTC's 24h generation starts on 08-29, so a 14-day context begins on 08-15; XAU's store covers it,
+    and an asset without a store is the generator's to report."""
+    _partitions_from(tmp_path, "BTC", "2026-08-20")
+    _partitions_from(tmp_path, "XAU", "2026-08-15")
+    late = rv.stores_starting_late(tmp_path, "2026-08-30", 14, lead_in=True)
+    assert late == {"BTC": (date(2026, 8, 15), date(2026, 8, 20))}
+    assert rv.stores_starting_late(tmp_path, "2026-08-30", 7, lead_in=True) == {}
