@@ -1092,3 +1092,37 @@ def test_the_verdict_records_the_calendar(tmp_path):
     assert rv.verdict_payload(result, "abc1234", window, 7, None, True)["calendar"] is None
     calendar = {"sha256": "f" * 64, "events": 120}
     assert rv.verdict_payload(result, "abc1234", window, 7, None, True, calendar=calendar)["calendar"] == calendar
+
+
+def _day_index(root, asset: str, prompt_format: str, **fields) -> None:
+    path = root / asset / prompt_format / "date=2026-08-30.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"start_times": [], **fields}))
+
+
+def test_the_verdict_records_the_context_days_every_run_reported(tmp_path):
+    _day_index(tmp_path, "BTC", "86400_300", context_days=14)
+    _day_index(tmp_path, "BTC", "3600_60", context_days=14)
+    assert rv.reported_context_days(tmp_path) == 14
+    result = {
+        "score": 12.3,
+        "mean_competition_rank": 40,
+        "mean_reward_vs_top": 0.123,
+        "mean_competition_percentile": 0.8,
+        "per_competition": {},
+    }
+    payload = rv.verdict_payload(result, "abc1234", ("2026-08-30", "2026-09-09"), 7, None, True, context_days=14)
+    assert payload["context_days"] == 14
+
+
+def test_runs_reporting_different_context_days_stop_the_verdict(tmp_path):
+    _day_index(tmp_path, "BTC", "86400_300", context_days=14)
+    _day_index(tmp_path, "XAU", "86400_300", context_days=7)
+    with pytest.raises(RuntimeError, match=r"\[7, 14\]"):
+        rv.reported_context_days(tmp_path)
+
+
+def test_an_index_written_before_the_field_reads_as_the_default(tmp_path):
+    _day_index(tmp_path, "BTC", "86400_300")
+    assert rv.reported_context_days(tmp_path) == 7
+    assert rv.reported_context_days(tmp_path / "nothing generated") is None

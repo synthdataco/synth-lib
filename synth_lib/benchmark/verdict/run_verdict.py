@@ -51,7 +51,7 @@ import pandas as pd
 from synth_lib.backtester.loading import get_miner_scores, get_registrations, get_scores_save_order
 from synth_lib.backtester.scoring import Registrations, SaveOrder
 from synth_lib.benchmark import workspace
-from synth_lib.benchmark.generate_predictions import CONTEXT_MODES
+from synth_lib.benchmark.generate_predictions import CONTEXT_MODES, DEFAULT_CONTEXT_DAYS
 from synth_lib.benchmark.nomination import parse_champion
 from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_path
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
@@ -296,6 +296,18 @@ def generate_all(
             print(f"  generated {asset} tl={comp.time_length}", flush=True)
 
 
+def reported_context_days(predictions: Path) -> int | None:
+    """The CONTEXT_DAYS every (competition, asset) run reported in its day indexes, None when there is
+    no index. An index written before the field reads as the default."""
+    reported = {
+        json.loads(index.read_text()).get("context_days", DEFAULT_CONTEXT_DAYS)
+        for index in predictions.glob("*/*/date=*.json")
+    }
+    if len(reported) > 1:
+        raise RuntimeError(f"the generation runs under {predictions} report different CONTEXT_DAYS: {sorted(reported)}")
+    return reported.pop() if reported else None
+
+
 def generate_baseline(
     modeling: Path,
     data_root: Path,
@@ -466,6 +478,7 @@ def verdict_payload(
     engine: str | None = None,
     context_mode: str = "ohlcv",
     calendar: dict | None = None,
+    context_days: int | None = None,
 ) -> dict:
     return {
         "score": result["score"],
@@ -504,6 +517,8 @@ def verdict_payload(
         "engine_rev": engine,
         # What simulate() received as context_prices (generate_predictions.CONTEXT_MODES).
         "context_prices": context_mode,
+        # How many days of it: the champion's CONTEXT_DAYS, as its generation runs reported it.
+        "context_days": context_days,
         # The event calendar the champion was handed: the one its campaign's agents saw, or None.
         "calendar": calendar,
     }
@@ -661,7 +676,8 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             context_mode=args.context,
             calendar=calendar if calendar_sha is not None else None,
         )
-        print(f"[{leg}] scoring", flush=True)
+        context_days = reported_context_days(cache)
+        print(f"[{leg}] scoring (CONTEXT_DAYS {context_days})", flush=True)
         result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg, registrations, save_order)
         payload = verdict_payload(
             result,
@@ -674,6 +690,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             engine,
             args.context,
             calendar_record,
+            context_days,
         )
         verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n")
@@ -703,7 +720,17 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
         result = score(
             "synth_default", predictions, window_end, window_days, baseline_dir, sim_reg, registrations, save_order
         )
-        payload = verdict_payload(result, None, window, args.seed, sim_reg, args.live_prompts, record, engine)
+        payload = verdict_payload(
+            result,
+            None,
+            window,
+            args.seed,
+            sim_reg,
+            args.live_prompts,
+            record,
+            engine,
+            context_days=reported_context_days(predictions),
+        )
         baseline_dir.mkdir(parents=True, exist_ok=True)
         baseline_out.write_text(json.dumps(payload, indent=2) + "\n")
         print(

@@ -9,12 +9,13 @@ import importlib.util
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from synth_lib.benchmark.verdict.run_verdict import CADENCE_MINUTES
+from synth_lib.preparation.config import OHLCV_COLUMNS
 from synth_lib.preparation.event_calendar.events import CALENDAR_ENV, event_frame, write_atomic
 
 SCAFFOLD_PREDICT = (
@@ -23,9 +24,7 @@ SCAFFOLD_PREDICT = (
 END = datetime(2026, 9, 14, tzinfo=timezone.utc)
 
 
-@pytest.fixture
-def predict(tmp_path, monkeypatch):
-    """The scaffold's predict.py, its workspace in tmp_path, the offline bundle set."""
+def _load_predict(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("scaffold_predict", SCAFFOLD_PREDICT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -33,6 +32,69 @@ def predict(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "PREDICTIONS_ROOT", tmp_path / "miner_outputs" / "campaign")
     monkeypatch.setenv(module.OFFLINE_ROOT_ENV, str(tmp_path / "offline_data"))
     return module
+
+
+@pytest.fixture
+def predict(tmp_path, monkeypatch):
+    """The scaffold's predict.py, its workspace in tmp_path, the offline bundle set."""
+    return _load_predict(tmp_path, monkeypatch)
+
+
+def _with_modeling(monkeypatch, **attributes) -> list:
+    """Stands in for agent/modeling.py: a simulate() recording each context, plus `attributes`."""
+    seen: list = []
+
+    def simulate(asset, start_time, time_increment, time_length, num_simulations, context_prices):
+        seen.append(context_prices)
+        return (start_time, time_increment, *[[1.0] * (time_length // time_increment + 1)] * num_simulations)
+
+    modeling = ModuleType("modeling")
+    modeling.simulate = simulate
+    for name, value in attributes.items():
+        setattr(modeling, name, value)
+    monkeypatch.setitem(sys.modules, "modeling", modeling)
+    return seen
+
+
+def _snapshot(tmp_path, asset: str, first: str, last: str) -> Path:
+    root = tmp_path / "market_data" / "prices" / asset / "1m"
+    root.mkdir(parents=True)
+    for day in pd.date_range(first, last, freq="D", tz="UTC"):
+        idx = pd.date_range(day, periods=1440, freq="1min", tz="UTC")
+        pd.DataFrame({"timestamp": idx, **{c: 1.0 for c in OHLCV_COLUMNS}}).to_parquet(
+            root / f"date={day.date()}.parquet"
+        )
+    return root
+
+
+@pytest.mark.parametrize("attributes, days", [({"CONTEXT_DAYS": 14}, 14), ({}, 7)])
+def test_backtests_hand_the_champion_its_context_days(tmp_path, monkeypatch, attributes, days):
+    seen = _with_modeling(monkeypatch, **attributes)
+    predict = _load_predict(tmp_path, monkeypatch)
+    assert predict.CONTEXT_DAYS == days
+    _snapshot(tmp_path, "BTC", "2026-08-01", "2026-08-20")
+    t = pd.Timestamp("2026-08-20", tz="UTC")
+    predict.generate("BTC", [t], tmp_path / "out", num_simulations=2)
+    assert seen[0].index[0] == t - pd.Timedelta(days=days)
+    assert len(seen[0]) == days * 1440 - 2  # the verdict's slice: up to the bar labelled t - 3 min
+
+
+@pytest.mark.parametrize("value", [2, 31, True, 14.0])
+def test_backtests_refuse_context_days_outside_the_bounds(tmp_path, monkeypatch, value):
+    _with_modeling(monkeypatch, CONTEXT_DAYS=value)
+    with pytest.raises(ValueError, match="from 3 to 30"):
+        _load_predict(tmp_path, monkeypatch)
+
+
+def test_a_listing_inside_the_context_is_not_missing_but_a_hole_is(predict, tmp_path):
+    """The days before an asset's first partition are the context's NaN head; a missing day after it
+    is a hole the run must not paper over."""
+    root = _snapshot(tmp_path, "SPCX", "2026-08-10", "2026-08-20")
+    start, end = datetime(2026, 8, 5, tzinfo=timezone.utc), datetime(2026, 8, 20, tzinfo=timezone.utc)
+    predict.check_snapshot_coverage("SPCX", start, end)
+    (root / "date=2026-08-12.parquet").unlink()
+    with pytest.raises(SystemExit, match=r"for SPCX: missing partitions \['2026-08-12'\]"):
+        predict.check_snapshot_coverage("SPCX", start, end)
 
 
 def test_refuses_to_run_without_the_offline_bundle(predict, monkeypatch):
