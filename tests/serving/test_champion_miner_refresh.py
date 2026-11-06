@@ -6,9 +6,9 @@ store's staleness scored worse than one cut at the issuance instant, and the gap
 refresh interval. This pins the cadence and what each pass asks the venue for.
 """
 
-from datetime import datetime, timedelta, timezone
-
 import logging
+import threading
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
@@ -95,6 +95,28 @@ def test_one_venue_outage_does_not_stop_the_others():
     ok = _Store()
     _miner({"HYPE": _Broken(), "BTC": ok})._refresh_once()
     assert ok.refreshed == [DEFAULT_CONTEXT_DAYS + 1]
+
+
+def test_the_assets_already_served_are_refreshed_while_the_others_warm_up(monkeypatch):
+    """Each asset's warm-up is followed by a refresh of today's partition of the assets ready before it,
+    never of one still warming up."""
+    warmed: list[str] = []
+    monkeypatch.setattr("synth_lib.serving.champion_miner.warm_up", lambda assets, context_days: warmed.extend(assets))
+    monkeypatch.setattr(ChampionMiner, "_background_refresh", lambda self: None)
+
+    class _Broken(_Store):
+        def refresh_recent(self, days):
+            raise RuntimeError("venue down")
+
+    stores = {"XAU": _Broken(), "NVDAX": _Store(), "BTC": _Store(), "HYPE": _Store()}
+    miner = _miner(stores)
+    miner._ready = set()
+    miner._calendar_ready = threading.Event()
+    miner._calendar_ready.set()
+    miner._warm_up_then_refresh()
+    assert warmed == ["XAU", "NVDAX", "BTC", "HYPE"]
+    assert (stores["NVDAX"].refreshed, stores["BTC"].refreshed, stores["HYPE"].refreshed) == ([1, 1], [1], [])
+    assert miner._ready == set(stores)
 
 
 def test_after_the_warm_up_a_pass_fetches_only_today(tmp_path, midday):
