@@ -82,6 +82,7 @@ def test_effort_ultracode_and_goal_load_per_model(tmp_path):
         "{id: claude, cli: claude-code, model: claude-model, effort: ultra}",  # a codex level
         "{id: claude, cli: gemini-cli, model: gemini-2.5-pro, effort: high}",  # no effort wired for gemini
         "{id: claude, cli: kimi-code, model: kimi-k3.1-pro, effort: ultra}",  # a codex level
+        "{id: claude, cli: kimi-code, model: kimi-k3.1-pro, effort: medium}",  # not a K3 level
     ],
 )
 def test_effort_outside_the_cli_levels_rejected(tmp_path, model):
