@@ -90,15 +90,23 @@ class MinutePriceStore:
         return paths
 
     def ingest_day(self, day: date, force_refresh: bool = False) -> Path:
-        """Fetch and persist one day of minute prices."""
+        """Fetch and persist one day of minute prices.
+
+        A past day that starts before the client's retention comes back partial: it is stored unsettled,
+        for an archive ingest to complete, and not fetched again once stored."""
         self.ensure_root()
         path = self.day_path(day)
-        today = datetime.now(tz=UTC).date()
+        now = datetime.now(tz=UTC)
+        today = now.date()
         is_final = day < today
         if path.exists() and is_final and not force_refresh and _settled(path):
             return path
 
         day_start = datetime.combine(day, time.min, tzinfo=UTC)
+        retention = getattr(self.client, "retention_minutes", None)
+        partly_retained = is_final and retention is not None and day_start < now - timedelta(minutes=retention)
+        if partly_retained and path.exists() and not force_refresh:
+            return path
         day_end = datetime.combine(day, time.max, tzinfo=UTC).replace(second=0, microsecond=0)
         if not is_final:
             # The current day is still running: clamp the window to the last settled minute rather
@@ -127,7 +135,7 @@ class MinutePriceStore:
         frame["source"] = getattr(self.client, "source_name", "unknown")
         frame["ingested_at"] = datetime.now(tz=UTC).replace(microsecond=0)
         # An empty fetch of a past day stays unsettled, so the next ingest asks again.
-        frame["is_final"] = bool(is_final) and not fetched.empty
+        frame["is_final"] = bool(is_final) and not fetched.empty and not partly_retained
         frame = frame.reset_index(names="timestamp")
         # A force-refresh must never trade real prices for nothing. Venues serve a limited window
         # of history — Hyperliquid about 5000 minutes — so re-fetching a day that has aged out

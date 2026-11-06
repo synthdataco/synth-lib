@@ -101,6 +101,29 @@ def test_a_day_written_while_it_was_today_is_completed_once_it_ends(tmp_path, mo
     assert client.calls == [DAY, DAY], "a settled day was fetched again"
 
 
+@pytest.mark.parametrize("retention_minutes, settled", [(5000, False), (None, True)])
+def test_a_day_the_venue_holds_only_in_part_is_stored_unsettled_and_fetched_once(
+    tmp_path, monkeypatch, retention_minutes, settled
+):
+    """At 15:00 Hyperliquid's ~5000 minutes start at 03:40 three days back: that day comes back partial
+    and stays unsettled, without a refetch on every refresh. Binance keeps everything and settles it."""
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr("synth_lib.preparation.minute_price_store.datetime", Clock)
+    client = _Client(rows=1220)
+    client.retention_minutes = retention_minutes
+    store = _store(tmp_path, client)
+    store.refresh_recent(days=3)
+    assert bool(pd.read_parquet(store.day_path(DAY))["is_final"].all()) is settled
+    assert bool(pd.read_parquet(store.day_path(DAY + timedelta(days=1)))["is_final"].all())
+    store.refresh_recent(days=3)
+    assert client.calls.count(DAY) == 1
+
+
 def test_an_empty_fetch_of_a_past_day_is_asked_again(tmp_path):
     client = _Client(rows=0)
     store = _store(tmp_path, client)
