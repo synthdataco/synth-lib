@@ -113,7 +113,8 @@ class ChampionMiner(Miner):
         self._background_refresh()
 
     def _refresh_once(self) -> None:
-        """One pass over every store, over the context's date partitions."""
+        """One pass over every store: refresh_recent(days=context_days + 1) covers today-(context_days + 1)
+        through today, and fetches only today and the days not yet settled."""
         self._refresh(list(self._stores), self.context_days + 1)
 
     def _refresh(self, assets: list[str], days: int) -> None:

@@ -64,9 +64,9 @@ def _miner(stores, miner_class=ChampionMiner):
     return miner
 
 
-def test_each_pass_refreshes_the_contexts_date_partitions():
-    """A D-day context touches D + 1 date partitions; a miner.py that does not set context_days
-    serves the default."""
+def test_each_pass_covers_today_and_the_d_plus_one_days_before_it():
+    """refresh_recent(days=D + 1) covers today-(D + 1) through today; a miner.py that does not set
+    context_days serves the default."""
     store = _Store()
     _miner({"BTC": store})._refresh_once()
     assert store.refreshed == [DEFAULT_CONTEXT_DAYS + 1]
