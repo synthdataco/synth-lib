@@ -57,6 +57,7 @@ from synth_lib.benchmark.campaign import PACKAGED_BASELINE, baseline_modeling_pa
 from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
 from synth_lib.benchmark.manifest import sha256_file
 from synth_lib.benchmark.verdict.evaluate import COMPETITIONS, evaluate_candidate, prepare_offline_bundle
+from synth_lib.preparation.config import STORE_SUBDIR
 from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 
 GENERATE_SCRIPT = Path(__file__).resolve().parents[1] / "generate_predictions.py"
@@ -308,6 +309,44 @@ def reported_context_days(predictions: Path) -> int | None:
     return reported.pop() if reported else None
 
 
+def context_heads(predictions: Path, window: tuple[str, str], lead_in: bool) -> dict[str, int]:
+    """Per asset with a context of the window that did not start on a real close, the most minutes one
+    ran before its first, from the day indexes of the window's generation days. An index written
+    before the field reads as 0."""
+    first = min(pd.Timestamp(generation_start(window[0], c.time_length, lead_in)) for c in COMPETITIONS)
+    end = pd.Timestamp(window[1], tz="UTC")
+    heads: dict[str, int] = {}
+    for index in predictions.glob("*/*/date=*.json"):
+        day = pd.Timestamp(index.stem.removeprefix("date="), tz="UTC")
+        if day < first.normalize() or day >= end:
+            continue
+        minutes = json.loads(index.read_text()).get("context_head_nan_minutes", 0)
+        asset = index.parent.parent.name
+        if minutes:
+            heads[asset] = max(heads.get(asset, 0), minutes)
+    return dict(sorted(heads.items()))
+
+
+def stores_starting_late(
+    data_root: Path, window_start: str, context_days: int, lead_in: bool
+) -> dict[str, tuple[date, date]]:
+    """Per asset whose first partition in `data_root` is after the day its first context begins: that
+    day, and the first partition's."""
+    begins: dict[str, date] = {}
+    for comp in COMPETITIONS:
+        start = pd.Timestamp(generation_start(window_start, comp.time_length, lead_in))
+        day = (start - pd.Timedelta(days=context_days)).date()
+        for asset in comp.asset_list:
+            begins[asset] = min(begins.get(asset, day), day)
+    late = {}
+    for asset, day in begins.items():
+        stored = (data_root / STORE_SUBDIR / asset / "1m").glob("date=*.parquet")
+        first = min((date.fromisoformat(p.stem.removeprefix("date=")) for p in stored), default=None)
+        if first is not None and first > day:
+            late[asset] = (day, first)
+    return late
+
+
 def generate_baseline(
     modeling: Path,
     data_root: Path,
@@ -479,6 +518,7 @@ def verdict_payload(
     context_mode: str = "ohlcv",
     calendar: dict | None = None,
     context_days: int | None = None,
+    context_head_nan_minutes: dict[str, int] | None = None,
 ) -> dict:
     return {
         "score": result["score"],
@@ -519,6 +559,8 @@ def verdict_payload(
         "context_prices": context_mode,
         # How many days of it: the champion's CONTEXT_DAYS, as its generation runs reported it.
         "context_days": context_days,
+        # Per asset whose contexts did not all start on a real close, the most minutes one ran before it.
+        "context_head_nan_minutes": context_head_nan_minutes,
         # The event calendar the champion was handed: the one its campaign's agents saw, or None.
         "calendar": calendar,
     }
@@ -677,6 +719,21 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             calendar=calendar if calendar_sha is not None else None,
         )
         context_days = reported_context_days(cache)
+        heads = context_heads(cache, window, not args.no_lead_in)
+        for asset, minutes in heads.items():
+            print(
+                f"[{leg}] {asset}: contexts start with up to {minutes} NaN minutes ({minutes / 1440:.1f} days)",
+                flush=True,
+            )
+        if context_days is not None:
+            late = stores_starting_late(data_root, args.window_start, context_days, not args.no_lead_in)
+            for asset, (begins, first) in late.items():
+                print(
+                    f"[{leg}] WARNING: {asset}'s first partition in {data_root} is {first}, after {begins}, where "
+                    f"its first context begins. If the market traded before {first}, ingest those days and delete "
+                    f"{cache / asset}, whose day files keep the truncated contexts they were generated with.",
+                    flush=True,
+                )
         print(f"[{leg}] scoring (CONTEXT_DAYS {context_days})", flush=True)
         result = score(leg, cache, window_end, window_days, verdict_dir, sim_reg, registrations, save_order)
         payload = verdict_payload(
@@ -691,6 +748,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             args.context,
             calendar_record,
             context_days,
+            heads,
         )
         verdict_dir.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, indent=2) + "\n")
@@ -730,6 +788,7 @@ def main() -> None:  # noqa: C901 — a linear operator script; splitting it wou
             record,
             engine,
             context_days=reported_context_days(predictions),
+            context_head_nan_minutes=context_heads(predictions, window, not args.no_lead_in),
         )
         baseline_dir.mkdir(parents=True, exist_ok=True)
         baseline_out.write_text(json.dumps(payload, indent=2) + "\n")

@@ -296,6 +296,15 @@ def test_the_generator_hands_the_champion_its_context_days(tmp_path, monkeypatch
     assert rows == days * 1440 - 2  # up to the bar labelled t - 3 min (issuance lead + bar width)
     index = json.loads((tmp_path / "out" / "BTC" / "86400_300" / "date=2026-08-20.json").read_text())
     assert index["context_days"] == days
+    assert index["context_head_nan_minutes"] == 0
+
+
+def test_the_generator_records_how_long_a_context_runs_before_the_stores_first_day(tmp_path, monkeypatch):
+    """A 25-day context of 08-20 reaches back to 07-26; the store starts on 08-01."""
+    seen = _run_generator(tmp_path, monkeypatch, "CONTEXT_DAYS = 25")
+    assert json.loads(seen.read_text())[1] == 25 * 1440 - 2
+    index = json.loads((tmp_path / "out" / "BTC" / "86400_300" / "date=2026-08-20.json").read_text())
+    assert index["context_head_nan_minutes"] == 6 * 1440
 
 
 @pytest.mark.parametrize("value", ["2", "31", "True", "14.0"])

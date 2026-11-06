@@ -18,10 +18,11 @@ instead. The model's sole market input is that DataFrame; simulate() takes no da
 
 Predictions land one file per day, under
 `<out>/<asset>/<time_length>_<time_increment>/date=<YYYY-MM-DD>.npy` — float32, shaped
-(prompts, simulations, steps) — beside a `.json` naming the prompt start_times it holds and the
-champion's CONTEXT_DAYS. A day whose file already covers every requested start_time is skipped, so
-pointing --out-dir at a directory that survives the run makes a re-score reuse the paths instead of
-regenerating them.
+(prompts, simulations, steps) — beside a `.json` naming the prompt start_times it holds, the
+champion's CONTEXT_DAYS and `context_head_nan_minutes`, the most minutes one of the day's contexts
+runs before its first real close. A day whose file already covers every requested start_time is
+skipped, so pointing --out-dir at a directory that survives the run makes a re-score reuse the paths
+instead of regenerating them, with the contexts they were generated from.
 
 Usage:
   python generate_predictions.py --modeling agent/modeling.py --asset BTC \\
@@ -75,6 +76,12 @@ def context_slice(
 ) -> pd.DataFrame:
     """The context of the prompt at `start`: the bars from `context_days` before it to `context_end`."""
     return frame.loc[start - pd.Timedelta(days=context_days) : context_end(start, time_length, issuance_lead)]
+
+
+def nan_head_minutes(context: pd.DataFrame) -> int:
+    """How many minutes the context runs before its first real close."""
+    real = context["close"].notna().to_numpy()
+    return int(real.argmax()) if real.any() else len(real)
 
 
 def context_days_of(module: ModuleType) -> int:
@@ -142,9 +149,9 @@ def store_root(data_root: Path, asset: str) -> Path:
 def load_minute_prices(data_root: Path, asset: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """Minute OHLCV over [start, end] from daily partitions.
 
-    The days before the asset's first partition, which the store does not have before a market's
-    first trade, are NaN on every minute, as in a live context. A missing partition after it raises:
-    a silent hole here would shrink every context that spans it without anyone noticing."""
+    The days before the asset's first partition, before the market's first trade or the store's first
+    day, are NaN on every minute, as in a live context. A missing partition after it raises: a silent
+    hole here would shrink every context that spans it without anyone noticing."""
     root = store_root(data_root, asset)
     stored = (date.fromisoformat(p.stem.removeprefix("date=")) for p in root.glob("date=*.parquet"))
     first_day = min(stored, default=start.date())
@@ -222,10 +229,12 @@ def generate_day(
         return 0
 
     runs = []
+    head = 0
     for t in times:
         # THE no-lookahead line: the context stops at the last bar the prompt's issuance allows,
         # never at t — the bar labelled t closes after the prompt starts.
         context = context_slice(price_frame, t, time_length, context_days, issuance_lead)
+        head = max(head, nan_head_minutes(context))
         if context_mode == "close":
             context = context["close"]
         out = simulate_fn(
@@ -251,6 +260,7 @@ def generate_day(
                 "num_simulations": int(stacked.shape[1]),
                 "num_steps": int(stacked.shape[2]),
                 "context_days": context_days,
+                "context_head_nan_minutes": head,
             }
         )
     )
