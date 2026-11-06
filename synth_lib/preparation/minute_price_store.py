@@ -18,6 +18,7 @@ from synth_lib.preparation.config import (
     legacy_partition_error,
     utc_datetime,
 )
+from synth_lib.preparation.event_calendar.events import write_atomic
 from synth_lib.preparation.price_client import PriceClient, build_price_client
 
 logger = logging.getLogger(__name__)
@@ -152,7 +153,7 @@ class MinutePriceStore:
                 fresh,
             )
             return path
-        frame.to_parquet(path, index=False)
+        write_atomic(frame, path)
         return path
 
     def refresh_recent(self, days: int = 8) -> list[Path]:

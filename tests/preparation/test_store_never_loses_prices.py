@@ -10,6 +10,7 @@ fetch, is fetched again; one fetched complete after it ended never is.
 """
 
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -130,6 +131,21 @@ def test_an_empty_fetch_of_a_past_day_is_asked_again(tmp_path):
     store.ingest_day(DAY)
     client.rows = MINUTES_PER_DAY
     assert _closes(store.ingest_day(DAY)) == MINUTES_PER_DAY
+
+
+def test_an_interrupted_write_leaves_the_stored_partition_whole(tmp_path, monkeypatch):
+    store = _store(tmp_path, _Client(rows=100))
+    path = store.ingest_day(DAY, force_refresh=True)
+
+    def cut_short(self, target, **kwargs):
+        Path(target).write_bytes(b"PAR1")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", cut_short)
+    with pytest.raises(KeyboardInterrupt):
+        _store(tmp_path, _Client(rows=MINUTES_PER_DAY)).ingest_day(DAY, force_refresh=True)
+    assert _closes(path) == 100
+    assert [p.name for p in path.parent.iterdir()] == [path.name]
 
 
 def test_a_day_of_zero_trade_candles_is_not_replaced_by_a_shorter_refetch(tmp_path):
