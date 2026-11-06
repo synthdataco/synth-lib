@@ -33,7 +33,7 @@ def miner(monkeypatch, tmp_path):
     """A miner whose first calendar refresh is held until the test releases it."""
     release = threading.Event()
     monkeypatch.setattr(cm, "MARKET_DATA_DIR", tmp_path / "market_data")
-    monkeypatch.setattr(cm, "warm_up", lambda assets: None)
+    monkeypatch.setattr(cm, "warm_up", lambda assets, context_days: None)
     monkeypatch.setattr(cm, "venue_store", lambda asset: f"store:{asset}")
     monkeypatch.setattr(cm, "FreshTail", lambda asset: None)
     monkeypatch.setattr(ChampionMiner, "_background_refresh", lambda self: None)

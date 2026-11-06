@@ -8,13 +8,16 @@ refresh interval. This pins the cadence and what each pass asks the venue for.
 
 from datetime import datetime, timedelta, timezone
 
+import logging
+
 import pandas as pd
 import pytest
 
+import synth_lib.serving.serve as serve
+from synth_lib.benchmark.generate_predictions import DEFAULT_CONTEXT_DAYS
 from synth_lib.preparation.config import OHLCV_COLUMNS
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.serving.champion_miner import REFRESH_SECONDS, ChampionMiner
-from synth_lib.serving.serve import WARMUP_DAYS
 
 
 class _Store:
@@ -27,9 +30,9 @@ class _Store:
 
 class _Venue:
     source_name = "test"
-    retention_minutes = None
 
-    def __init__(self):
+    def __init__(self, retention_minutes=None):
+        self.retention_minutes = retention_minutes
         self.days: list = []
 
     def fetch_range(self, asset, start_time, end_time):
@@ -49,19 +52,29 @@ def midday(monkeypatch):
             return now
 
     monkeypatch.setattr("synth_lib.preparation.minute_price_store.datetime", FrozenDatetime)
+    monkeypatch.setattr("synth_lib.serving.serve.datetime", FrozenDatetime)
     return now
 
 
-def _miner(stores):
-    miner = object.__new__(ChampionMiner)  # Miner.__init__ needs a wallet, a subtensor and a chain
+def _miner(stores, miner_class=ChampionMiner):
+    miner = object.__new__(miner_class)  # Miner.__init__ needs a wallet, a subtensor and a chain
     miner._stores = stores
     return miner
 
 
-def test_each_pass_refreshes_the_warm_up_window():
+def test_each_pass_refreshes_the_contexts_date_partitions():
+    """A D-day context touches D + 1 date partitions; a miner.py that does not set context_days
+    serves the default."""
     store = _Store()
     _miner({"BTC": store})._refresh_once()
-    assert store.refreshed == [WARMUP_DAYS]
+    assert store.refreshed == [DEFAULT_CONTEXT_DAYS + 1]
+
+    class FourteenDays(ChampionMiner):
+        context_days = 14
+
+    store = _Store()
+    _miner({"BTC": store}, FourteenDays)._refresh_once()
+    assert store.refreshed == [15]
 
 
 def test_one_venue_outage_does_not_stop_the_others():
@@ -71,7 +84,7 @@ def test_one_venue_outage_does_not_stop_the_others():
 
     ok = _Store()
     _miner({"HYPE": _Broken(), "BTC": ok})._refresh_once()
-    assert ok.refreshed == [WARMUP_DAYS]
+    assert ok.refreshed == [DEFAULT_CONTEXT_DAYS + 1]
 
 
 def test_after_the_warm_up_a_pass_fetches_only_today(tmp_path, midday):
@@ -79,11 +92,22 @@ def test_after_the_warm_up_a_pass_fetches_only_today(tmp_path, midday):
     venue = _Venue()
     store = MinutePriceStore("BTC", root=tmp_path, client=venue)
     today = midday.date()
-    store.ingest_range(today - timedelta(days=WARMUP_DAYS), today, verbose=False)
+    store.ingest_range(today - timedelta(days=DEFAULT_CONTEXT_DAYS + 1), today, verbose=False)
     venue.days.clear()
 
     _miner({"BTC": store})._refresh_once()
     assert venue.days == [today]
+
+
+@pytest.mark.parametrize("retention_minutes, oldest", [(5_000, 3), (None, 31)])
+def test_the_warm_up_stops_at_the_venues_retention(tmp_path, midday, monkeypatch, caplog, retention_minutes, oldest):
+    """A 30-day context on a venue keeping ~5000 minutes: asking past them would only be told nothing."""
+    venue = _Venue(retention_minutes)
+    monkeypatch.setattr(serve, "venue_store", lambda asset: MinutePriceStore(asset, root=tmp_path, client=venue))
+    with caplog.at_level(logging.INFO, logger=serve.__name__):
+        serve.warm_up(["XAU"], 30)
+    assert min(venue.days) == midday.date() - timedelta(days=oldest)
+    assert "XAU" in caplog.text and "of its 30-day context holds a real close" in caplog.text
 
 
 def test_the_store_is_topped_up_every_minute():
