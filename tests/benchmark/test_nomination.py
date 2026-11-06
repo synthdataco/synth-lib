@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from synth_lib.benchmark.generate_predictions import load_module
 from synth_lib.benchmark.nomination import (
     Champion,
     parse_champion,
@@ -16,6 +17,14 @@ def simulate(asset, start_time, time_increment=300, time_length=86400, num_simul
     steps = time_length // time_increment + 1
     return (start_time, time_increment, *[[100.0] * steps for _ in range(num_simulations)])
 """
+
+# Writes one "x" per import.
+COUNTING_MODELING = """
+from pathlib import Path
+
+with open(Path(__file__).with_name("imports.log"), "a") as log:
+    log.write("x")
+""" + TOY_MODELING
 
 BROKEN_MODELING = "def simulate(*a, **k):\n    return (0,)\n"
 
@@ -42,13 +51,14 @@ def simulate(asset, start_time, time_increment=300, time_length=86400, num_simul
 
 SIBLING_MODULE = "def flat_paths(steps, n):\n    return [[100.0] * steps for _ in range(n)]\n"
 
-# Passes only on a synthetic context of exactly `days` days.
+# Passes only on the context the verdict hands at `days` days: up to the bar labelled start_time - 3 min
+# for 24h, - 2 min for 1h.
 LENGTH_MODELING = """
 {constant}
 
 def simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100,
              context_prices=None):
-    assert len(context_prices) == {days} * 24 * 60, len(context_prices)
+    assert len(context_prices) == {days} * 24 * 60 - (2 if time_length == 86400 else 1), len(context_prices)
     steps = time_length // time_increment + 1
     return (start_time, time_increment, *[[100.0] * steps for _ in range(num_simulations)])
 """
@@ -108,13 +118,13 @@ def test_parse_champion_lenient_handles_block_profiles(tmp_path):
 
 def test_probe_accepts_conforming_simulate(tmp_path):
     (tmp_path / "modeling.py").write_text(TOY_MODELING)
-    ok, msg = probe_simulate(tmp_path / "modeling.py", num_simulations=5)
+    ok, msg = probe_simulate(load_module(tmp_path / "modeling.py"), num_simulations=5)
     assert ok is True, msg
 
 
 def test_probe_rejects_bad_shape(tmp_path):
     (tmp_path / "modeling.py").write_text(BROKEN_MODELING)
-    ok, msg = probe_simulate(tmp_path / "modeling.py", num_simulations=5)
+    ok, msg = probe_simulate(load_module(tmp_path / "modeling.py"), num_simulations=5)
     assert ok is False and "tuple" in msg
 
 
@@ -122,13 +132,13 @@ def test_probe_rejects_unsized_paths(tmp_path):
     # tuple of the right length (2 + num_simulations) but whose "paths" are ints:
     # len(path) must raise a TypeError that stays internal to the probe (no driver crash).
     (tmp_path / "modeling.py").write_text(UNSIZED_MODELING)
-    ok, msg = probe_simulate(tmp_path / "modeling.py", num_simulations=5)
+    ok, msg = probe_simulate(load_module(tmp_path / "modeling.py"), num_simulations=5)
     assert ok is False, msg
 
 
 def test_starter_modeling_passes_probe():
     starter = Path(__file__).resolve().parents[2] / "synth_lib" / "benchmark" / "scaffold" / "modeling_starter.py"
-    ok, msg = probe_simulate(starter, num_simulations=5)
+    ok, msg = probe_simulate(load_module(starter), num_simulations=5)
     assert ok is True, msg
 
 
@@ -200,6 +210,13 @@ def test_the_probe_hands_the_champion_its_context_days(tmp_path, constant, days)
     ok, msg = probe_all_shapes(tmp_path / "modeling.py")
     assert ok is True, msg
     assert f"CONTEXT_DAYS {days}," in msg and "(24h) and" in msg
+
+
+def test_the_probe_imports_the_champion_once(tmp_path):
+    (tmp_path / "modeling.py").write_text(COUNTING_MODELING)
+    ok, msg = probe_all_shapes(tmp_path / "modeling.py")
+    assert ok is True, msg
+    assert (tmp_path / "imports.log").read_text() == "x"
 
 
 @pytest.mark.parametrize("value", ["2", "31", "True", "14.0"])
