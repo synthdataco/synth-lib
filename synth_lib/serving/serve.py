@@ -94,10 +94,11 @@ def warm_up(assets: Sequence[str], context_days: int) -> None:
     """Fill the local minute store from each asset's own venue before serving, and log how much of
     the champion's context holds a real close.
 
-    A `context_days` context touches context_days + 1 date partitions. Like the background refresh,
-    the fetch stops at the venue's retention: Hyperliquid's ~3.5 days cap how far back HL-routed
-    assets reach, and their older days accumulate forward (see the module docstring). Idempotent
-    across restarts: settled partitions are not fetched again.
+    refresh_recent(days=context_days + 1) covers today-(context_days + 1) through today: the context's
+    context_days + 1 date partitions and the day before them. Like the background refresh, the fetch
+    stops at the venue's retention: Hyperliquid's ~3.5 days cap how far back HL-routed assets reach,
+    the oldest day it holds in part is stored unsettled, and their older days accumulate forward (see
+    the module docstring). Idempotent across restarts: settled partitions are not fetched again.
     """
     for asset in assets:
         try:
