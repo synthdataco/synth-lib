@@ -10,11 +10,12 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 import pandas as pd
 import yaml
 
-from synth_lib.benchmark.generate_predictions import context_days_of, load_module
+from synth_lib.benchmark.generate_predictions import context_days_of, context_slice, load_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -87,15 +88,16 @@ def load_simulate(modeling_path: Path):
 
 
 def probe_simulate(
-    modeling_path: Path,
+    module: ModuleType,
     *,
     asset: str = "BTC",
     time_increment: int = 300,
     time_length: int = 86_400,
     num_simulations: int = 1000,
 ) -> tuple[bool, str]:
-    """Checks the shape of the contract's return value. Synthetic context => no network needed here;
-    real network isolation is provided by the calling sandbox (--network none).
+    """Checks the shape of the contract's return value, for the champion's loaded modeling module.
+    Synthetic context => no network needed here; real network isolation is provided by the calling
+    sandbox (--network none).
 
     num_simulations defaults to the validator's real serving size
     (synth.validator.prompt_config.PromptConfig.num_simulations = 1000) rather than a smaller
@@ -103,15 +105,17 @@ def probe_simulate(
     fail here, at nomination time, instead of later at verdict/live time where
     synth.validator.response_validation_v2 rejects any response with a different path count.
 
-    The context spans the champion's CONTEXT_DAYS. On success the message is the call's wall time."""
+    The context has the shape the verdict hands: the champion's CONTEXT_DAYS, cut by context_slice. On
+    success the message is the call's wall time."""
     try:
-        module = load_module(modeling_path)
+        days = context_days_of(module)
         start = pd.Timestamp("2026-01-05T00:00:00Z")
-        idx = pd.date_range(end=start, periods=context_days_of(module) * 24 * 60, freq="1min", tz="UTC")
-        context = pd.DataFrame(
+        idx = pd.date_range(start - pd.Timedelta(days=days), start, freq="1min")
+        frame = pd.DataFrame(
             {c: 100.0 for c in ("open", "high", "low", "close")} | {"volume": 1.0, "trade_count": 1.0},
             index=idx,
         )
+        context = context_slice(frame, start, time_length, days)
         began = time.monotonic()
         out = module.simulate(
             asset=asset,
@@ -192,12 +196,13 @@ def probe_all_shapes(modeling_path: Path) -> tuple[bool, str]:
     crypto-1h — the check must therefore cover both, otherwise the failure only shows up at
     verdict time, too late for the agent to fix it."""
     try:
-        days = context_days_of(load_module(modeling_path))
+        module = load_module(modeling_path)
+        days = context_days_of(module)
     except Exception as exc:  # an import that fails, or a CONTEXT_DAYS out of bounds
         return False, f"{type(exc).__name__}: {exc}"
     seconds = {}
     for label, ti, tl in (("24h", 300, 86_400), ("1h", 60, 3_600)):
-        ok, msg = probe_simulate(modeling_path, time_increment=ti, time_length=tl)
+        ok, msg = probe_simulate(module, time_increment=ti, time_length=tl)
         if not ok:
             return False, f"[{label}] {msg}"
         seconds[label] = msg
