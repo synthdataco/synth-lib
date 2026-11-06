@@ -16,6 +16,8 @@ grid with it; it is not an absolute calibration level. crypto-1h is scored with 
 Works on every asset. A minute without a trade is a flat candle with trade_count 0. Prices load
 through the same lenient path the scored evaluation uses, so a NaN close (no price at all) reaches
 simulate() rather than stopping the run — your model must tolerate them (drop, never interpolate).
+The context spans the CONTEXT_DAYS your modeling.py sets (7 without it), and the days before an
+asset's first trade are NaN.
 
 When the snapshot carries an event calendar ($SYNTH_BENCHMARK_CALENDAR), the summary is followed by
 your gap to each prompt's best miner, over the prompts whose horizon holds an event of each type and
@@ -50,7 +52,7 @@ import pandas as pd
 from synth_lib.backtester.config import PREDICTION_MATCH_TOLERANCE_MINUTES
 from synth_lib.backtester.loading import get_miner_scores
 from synth_lib.backtester.orchestration import backtest, score_crps
-from synth_lib.benchmark.generate_predictions import context_end, load_minute_prices
+from synth_lib.benchmark.generate_predictions import context_days_of, context_slice, load_minute_prices
 from synth_lib.preparation.config import STORE_SUBDIR
 from synth_lib.preparation.event_calendar.events import CALENDAR_ENV, concerns
 
@@ -61,9 +63,10 @@ AGENT_DIR = Path(__file__).resolve().parent
 WORKSPACE = AGENT_DIR.parent
 sys.path.insert(0, str(AGENT_DIR))
 
-from modeling import simulate  # noqa: E402  (import after adding AGENT_DIR to sys.path)
+import modeling  # noqa: E402  (import after adding AGENT_DIR to sys.path)
 
-CONTEXT_MINUTES = 7 * 24 * 60
+# Your modeling.py's CONTEXT_DAYS, read as the verdict and the live miner read it.
+CONTEXT_DAYS = context_days_of(modeling)
 # Each run writes its predictions to its own directory under this one.
 PREDICTIONS_ROOT = WORKSPACE / "miner_outputs" / "campaign"
 # Must match synth_lib.backtester.config._OFFLINE_ENV_VAR.
@@ -110,21 +113,25 @@ def store_root(asset: str) -> Path:
 def check_snapshot_coverage(asset: str, start: datetime, end: datetime) -> None:
     """Fails EARLY and clearly if the requested window falls outside the frozen snapshot.
 
+    The days before the asset's first partition are not missing: the context holds them as NaN.
     Without this guard, synth-lib would try to ingest the missing days (network + write) and
     the error would surface in an unreadable form."""
     root = store_root(asset)
+    first = min((p.name for p in root.glob("date=*.parquet")), default="")
     missing = []
     cursor = start.date()
     while cursor <= end.date():
-        if not (root / f"date={cursor.isoformat()}.parquet").exists():
+        name = f"date={cursor.isoformat()}.parquet"
+        if name > first and not (root / name).exists():
             missing.append(cursor.isoformat())
         cursor += timedelta(days=1)
     if missing:
         raise SystemExit(
             f"window outside snapshot for {asset}: missing partitions {missing[:5]}"
             f"{' …' if len(missing) > 5 else ''}\n"
-            f"The snapshot is frozen (read-only) and stops at the campaign's data_cutoff. "
-            f"Reduce --eval-end / --days to stay within the available coverage ({root})."
+            f"The snapshot is frozen (read-only): it ends at the campaign's data_cutoff, and DATA.md gives "
+            f"each asset's first and last day. Choose --eval-end / --days so that the window and its "
+            f"CONTEXT_DAYS stay on days {root} holds."
         )
 
 
@@ -163,14 +170,12 @@ def generate(
     # The same loader the scored evaluation uses. NOT MinutePriceStore.load_range, which raises
     # on a single NaN close. NaN reaches simulate() untouched, which is the contract — never
     # interpolate it away.
-    prices = load_minute_prices(
-        WORKSPACE / "market_data", asset, times[0] - pd.Timedelta(minutes=CONTEXT_MINUTES), times[-1]
-    )
+    prices = load_minute_prices(WORKSPACE / "market_data", asset, times[0] - pd.Timedelta(days=CONTEXT_DAYS), times[-1])
     out_dir.mkdir(parents=True, exist_ok=True)
     for t in times:
         # Never `prices.loc[:t]` — see the module docstring. Same cut the scored evaluation uses.
-        context = prices.loc[: context_end(t, time_length)][-CONTEXT_MINUTES:]
-        out = simulate(
+        context = context_slice(prices, t, time_length, CONTEXT_DAYS)
+        out = modeling.simulate(
             asset=asset,
             start_time=t.isoformat(),
             time_increment=time_increment,
@@ -270,8 +275,8 @@ def main() -> None:
     if args.crps_only:
         cadence = cadence or CRPS_ONLY_CADENCE_MINUTES[args.time_length]
     times = prompt_times(args.asset, end, args.days, args.time_length, args.time_increment, cadence_minutes=cadence)
-    # the context reaches back 7 days before the first prompt: coverage must extend that far
-    check_snapshot_coverage(args.asset, times[0] - timedelta(minutes=CONTEXT_MINUTES), end)
+    # the context reaches back CONTEXT_DAYS before the first prompt: coverage must extend that far
+    check_snapshot_coverage(args.asset, times[0] - timedelta(days=CONTEXT_DAYS), end)
     PREDICTIONS_ROOT.mkdir(parents=True, exist_ok=True)
     out_dir = Path(tempfile.mkdtemp(prefix="run-", dir=PREDICTIONS_ROOT))
     try:
@@ -292,7 +297,7 @@ def main() -> None:
                 time_increment=args.time_increment,
                 predictions_dir=out_dir,
             )
-            print("summary:", result.summary)
+            print(f"summary (CONTEXT_DAYS {CONTEXT_DAYS}):", result.summary)
             return
         result = backtest(
             miner_name="campaign",
@@ -305,7 +310,7 @@ def main() -> None:
             latest_formula=args.latest_formula,
             match_tolerance_minutes=args.cadence_minutes or PREDICTION_MATCH_TOLERANCE_MINUTES,
         )
-        print("summary:", result.summary)
+        print(f"summary (CONTEXT_DAYS {CONTEXT_DAYS}):", result.summary)
         if os.environ.get(CALENDAR_ENV):
             print_event_split(result.prompt_df, args.asset, args.time_length)
     finally:

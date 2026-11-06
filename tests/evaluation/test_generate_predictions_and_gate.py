@@ -7,8 +7,10 @@ context, no data files, no network. It is deliberately strict: it enforces the L
 produce, not what the campaign backtester tolerates.
 """
 
+import sys
 from datetime import timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import json
 
@@ -18,9 +20,11 @@ import pytest
 from synth.simulation_input import SimulationInput  # type: ignore[import-untyped]
 from synth.validator import response_validation_v2  # type: ignore[import-untyped]
 
+import synth_lib.benchmark.generate_predictions as gp
 from synth_lib.benchmark.generate_predictions import (
+    context_days_of,
     context_end,
-    CONTEXT_MINUTES,
+    DEFAULT_CONTEXT_DAYS,
     generate,
     load_minute_prices,
     load_simulate,
@@ -81,7 +85,7 @@ def test_context_never_reaches_past_the_prompt(tmp_path):
         # The bar labelled t closes at t + 60s and its close is the prompt's first scored point, so
         # "up to t" would already be a leak. A 24h prompt is issued 120s early, plus the bar width.
         assert hi <= t - pd.Timedelta(seconds=180), f"context leaked past the issuance: {hi} vs {t}"
-        assert lo >= t - pd.Timedelta(minutes=CONTEXT_MINUTES)
+        assert lo >= t - pd.Timedelta(days=DEFAULT_CONTEXT_DAYS)
 
 
 def test_the_close_context_is_the_series_of_closes_with_its_gaps(tmp_path):
@@ -139,6 +143,7 @@ def test_prediction_file_format(tmp_path):
     index = json.loads((root / "date=2026-07-30.json").read_text())
     assert index["start_times"] == ["2026-07-30T00:00:00+00:00"]
     assert index["num_simulations"] == 5 and index["num_steps"] == 289
+    assert index["context_days"] == DEFAULT_CONTEXT_DAYS
 
 
 def test_a_day_already_generated_is_not_generated_again(tmp_path):
@@ -193,6 +198,117 @@ def test_load_minute_prices_raises_on_missing_partition(tmp_path):
         load_minute_prices(
             tmp_path, "BTC", pd.Timestamp("2026-07-30", tz="UTC"), pd.Timestamp("2026-07-31 04:00", tz="UTC")
         )
+
+
+def _partitions(root: Path, first: str, last: str) -> None:
+    for day in pd.date_range(first, last, freq="D", tz="UTC"):
+        idx = pd.date_range(day, periods=1440, freq="1min", tz="UTC")
+        pd.DataFrame({"timestamp": idx, **{c: 1.0 for c in gp.OHLCV_COLUMNS}}).to_parquet(
+            root / f"date={day.date()}.parquet"
+        )
+
+
+def test_days_before_the_first_partition_are_a_nan_head(tmp_path):
+    """A listing inside the context: the days before the asset's first trade are NaN on every
+    minute, as a live context holds them, and the context keeps its full length."""
+    root = tmp_path / "prices" / "SPCX" / "1m"
+    root.mkdir(parents=True)
+    _partitions(root, "2026-07-30", "2026-08-02")
+    t = pd.Timestamp("2026-08-02 12:00", tz="UTC")
+    prices = load_minute_prices(tmp_path, "SPCX", t - pd.Timedelta(days=7), t)
+    context = gp.context_slice(prices, t, 86_400, 7)
+    assert context.index[0] == t - pd.Timedelta(days=7)
+    assert context.loc[:"2026-07-29 23:59"].isna().all().all()
+    assert context.loc["2026-07-30":].notna().all().all()
+    assert len(context) == 7 * 1440 - 2
+
+
+def test_a_hole_after_the_first_partition_still_raises(tmp_path):
+    root = tmp_path / "prices" / "SPCX" / "1m"
+    root.mkdir(parents=True)
+    _partitions(root, "2026-07-28", "2026-08-02")
+    (root / "date=2026-07-30.parquet").unlink()
+    with pytest.raises(FileNotFoundError, match="2026-07-30"):
+        load_minute_prices(tmp_path, "SPCX", pd.Timestamp("2026-07-26", tz="UTC"), pd.Timestamp("2026-08-02", tz="UTC"))
+
+
+def test_a_range_before_the_first_partition_raises(tmp_path):
+    root = tmp_path / "prices" / "SPCX" / "1m"
+    root.mkdir(parents=True)
+    _partitions(root, "2026-07-30", "2026-08-02")
+    with pytest.raises(FileNotFoundError, match="no partition for SPCX"):
+        load_minute_prices(tmp_path, "SPCX", pd.Timestamp("2026-07-20", tz="UTC"), pd.Timestamp("2026-07-25", tz="UTC"))
+
+
+# -- CONTEXT_DAYS -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [3, 14, 30])
+def test_context_days_within_the_bounds(value):
+    assert context_days_of(SimpleNamespace(CONTEXT_DAYS=value)) == value
+
+
+def test_a_champion_without_context_days_gets_the_default():
+    assert context_days_of(SimpleNamespace()) == DEFAULT_CONTEXT_DAYS == 7
+
+
+@pytest.mark.parametrize("value", [2, 31, True, 14.0])
+def test_context_days_outside_the_bounds_raise(value):
+    with pytest.raises(ValueError, match="from 3 to 30"):
+        context_days_of(SimpleNamespace(CONTEXT_DAYS=value))
+
+
+RECORDING_MODELING = """
+import json
+from pathlib import Path
+{constant}
+
+def simulate(asset, start_time, time_increment, time_length, num_simulations, context_prices):
+    with open(Path(__file__).with_name("seen.jsonl"), "a") as seen:
+        seen.write(json.dumps([str(context_prices.index[0]), len(context_prices)]) + "\\n")
+    steps = time_length // time_increment + 1
+    return (start_time, time_increment, *[[1.0] * steps] * num_simulations)
+"""
+
+
+def _run_generator(tmp_path, monkeypatch, constant: str) -> Path:
+    """generate_predictions.py's main over a store holding 20 days, one 24h prompt on 08-20."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "modeling.py").write_text(RECORDING_MODELING.format(constant=constant))
+    root = tmp_path / "market_data" / "prices" / "BTC" / "1m"
+    root.mkdir(parents=True)
+    _partitions(root, "2026-08-01", "2026-08-20")
+    argv = ["generate_predictions.py", "--modeling", str(agent / "modeling.py"), "--asset", "BTC"]
+    argv += ["--window-start", "2026-08-20", "--window-end", "2026-08-20T01:00", "--cadence-minutes", "60"]
+    argv += ["--data-root", str(tmp_path / "market_data"), "--out-dir", str(tmp_path / "out"), "--num-simulations", "2"]
+    monkeypatch.setattr(sys, "argv", argv)
+    gp.main()
+    return agent / "seen.jsonl"
+
+
+@pytest.mark.parametrize("constant, days", [("CONTEXT_DAYS = 14", 14), ("", 7)])
+def test_the_generator_hands_the_champion_its_context_days(tmp_path, monkeypatch, constant, days):
+    seen = _run_generator(tmp_path, monkeypatch, constant)
+    first, rows = json.loads(seen.read_text())
+    t = pd.Timestamp("2026-08-20", tz="UTC")
+    assert pd.Timestamp(first) == t - pd.Timedelta(days=days)
+    assert rows == days * 1440 - 2  # up to the bar labelled t - 3 min (issuance lead + bar width)
+    index = json.loads((tmp_path / "out" / "BTC" / "86400_300" / "date=2026-08-20.json").read_text())
+    assert index["context_days"] == days
+
+
+@pytest.mark.parametrize("value", ["2", "31", "True", "14.0"])
+def test_the_generator_refuses_context_days_outside_the_bounds_before_reading_prices(tmp_path, monkeypatch, value):
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "modeling.py").write_text(RECORDING_MODELING.format(constant=f"CONTEXT_DAYS = {value}"))
+    argv = ["generate_predictions.py", "--modeling", str(agent / "modeling.py"), "--asset", "BTC"]
+    argv += ["--window-start", "2026-08-20", "--window-end", "2026-08-21", "--cadence-minutes", "60"]
+    argv += ["--data-root", str(tmp_path / "no-store"), "--out-dir", str(tmp_path / "out")]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(ValueError, match="CONTEXT_DAYS"):
+        gp.main()
 
 
 def test_load_simulate_resolves_a_sibling_import(tmp_path):
