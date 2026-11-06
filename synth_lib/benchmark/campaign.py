@@ -11,12 +11,14 @@ import yaml
 
 from synth_lib.benchmark.kinds import DEFAULT_KIND, load_kind
 
-KNOWN_CLIS = ("claude-code", "codex", "gemini-cli", "kimi-code", "fake")
+KNOWN_CLIS = ("claude-code", "codex", "gemini-cli", "kimi-code", "antigravity-cli", "fake")
 # The reasoning-effort levels a leg may set, per CLI and by its own names; a CLI absent here has no effort wired.
 EFFORT_LEVELS = {
     "claude-code": ("low", "medium", "high", "xhigh", "max"),
     "codex": ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
     "kimi-code": ("low", "high", "max"),  # the levels Kimi's K3 models take
+    # agy rejects a level the model lacks at launch: Gemini 4 Argon tops out at high.
+    "antigravity-cli": ("low", "medium", "high", "xhigh", "max"),
 }
 # claude-code's workflowSizeGuideline values: the agent count it tells the model to aim for per workflow.
 WORKFLOW_SIZES = ("unrestricted", "small", "medium", "large")
