@@ -1,11 +1,12 @@
 """ChampionMiner: a generic Bittensor SN50 miner that serves one benchmark champion.
 
-Subclasses set `simulate_fn` and nothing else — `unpack_champion.py` generates that subclass.
+Subclasses set `simulate_fn` and `context_days`, the champion's CONTEXT_DAYS — `unpack_champion.py`
+generates that subclass, and one that leaves `context_days` unset serves the default.
 Startup does not wait for data: a background thread warms each venue-routed minute store up, asset
 by asset, then keeps them all fresh, and an asset is served as soon as its own warm-up is done. Each
-request slices the trailing 7-day context — a crypto-1h one topped up with the bars that closed
-since the last refresh — and adapts the champion's output to the live validator contract. A second
-thread refreshes the event calendar at startup and daily, and the champion finds it at
+request slices the trailing `context_days` context — a crypto-1h one topped up with the bars that
+closed since the last refresh — and adapts the champion's output to the live validator contract. A
+second thread refreshes the event calendar at startup and daily, and the champion finds it at
 `$SYNTH_BENCHMARK_CALENDAR`, as in its campaign. A calendar already stored on the volume, no older
 than `CALENDAR_MAX_AGE_SECONDS`, is served until the first refresh replaces it.
 
@@ -32,13 +33,14 @@ import pandas as pd
 from neurons.miner import Miner  # type: ignore[import-untyped]
 from synth.protocol import Simulation  # type: ignore[import-untyped]
 
+from synth_lib.benchmark.generate_predictions import DEFAULT_CONTEXT_DAYS
 from synth_lib.preparation.config import MARKET_DATA_DIR
 from synth_lib.preparation.event_calendar import build as calendar_build
 from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.serving.serve import (
     FRESH_TAIL_TIME_LENGTH,
-    WARMUP_DAYS,
+    ContextCache,
     FreshTail,
     serve_request,
     servable_assets,
@@ -69,6 +71,7 @@ class ChampionMiner(Miner):
     """Serves one champion's simulate() over all venue-routed competition assets."""
 
     simulate_fn: Callable | None = None
+    context_days: int = DEFAULT_CONTEXT_DAYS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -81,6 +84,7 @@ class ChampionMiner(Miner):
         axon comes up while the data is still being fetched."""
         self._stores: dict[str, MinutePriceStore] = {asset: venue_store(asset) for asset in assets}
         self._tails: dict[str, FreshTail] = {asset: FreshTail(asset) for asset in assets}
+        self._contexts = ContextCache()
         # An asset joins once its whole warm-up window is in: a partly warmed store can end days back.
         self._ready: set[str] = set()
         self._calendar_root = MARKET_DATA_DIR
@@ -94,22 +98,23 @@ class ChampionMiner(Miner):
                 self._calendar_ready.set()
         threading.Thread(target=self._refresh_calendar_daily, daemon=True).start()
         threading.Thread(target=self._warm_up_then_refresh, daemon=True).start()
-        logger.info("warming up %d assets in the background", len(assets))
+        logger.info("CONTEXT_DAYS %d; warming up %d assets in the background", self.context_days, len(assets))
 
     def _warm_up_then_refresh(self) -> None:
         calendar_deadline = time.monotonic() + CALENDAR_WAIT_SECONDS
         for asset in self._stores:
-            warm_up([asset])
+            warm_up([asset], self.context_days)
             self._calendar_ready.wait(max(0.0, calendar_deadline - time.monotonic()))
             self._ready.add(asset)
         logger.info("warm-up complete; refreshing every %d s", REFRESH_SECONDS)
         self._background_refresh()
 
     def _refresh_once(self) -> None:
-        """One pass over every store. A venue outage must not stop the others being refreshed."""
+        """One pass over every store, over the context's date partitions. A venue outage must not stop
+        the others being refreshed."""
         for asset, store in self._stores.items():
             try:
-                store.refresh_recent(days=WARMUP_DAYS)
+                store.refresh_recent(days=self.context_days + 1)
             except Exception as exc:
                 logger.warning("refresh failed for %s: %s", asset, exc)
 
@@ -149,5 +154,12 @@ class ChampionMiner(Miner):
             # must not run on two threads at once.
             fresh_tail = self._tails[simulation_input.asset]
             tail = await asyncio.to_thread(fresh_tail.bars, start_time_of(simulation_input))
-        synapse.simulation_output = serve_request(type(self).simulate_fn, store, simulation_input, tail=tail)
+        synapse.simulation_output = serve_request(
+            type(self).simulate_fn,
+            store,
+            simulation_input,
+            tail=tail,
+            context_days=self.context_days,
+            contexts=self._contexts,
+        )
         return synapse

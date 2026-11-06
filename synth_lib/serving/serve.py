@@ -17,16 +17,18 @@ the request, not be papered over silently.
 Warm-up: `warm_up(...)` fills the local minute store from each asset's own venue before it is served.
 Be aware of the retention asymmetry — Binance serves deep minute history, while Hyperliquid's
 candle endpoint keeps roughly the last 5000 minutes (~3.5 days). A freshly-started miner therefore
-has a full 7-day context for the cryptos and a shorter one for the HL-routed assets, which fills
-in as the background refresh accumulates days. Run the miner a few days before you care about its
-com-equ scores, or pre-populate the store from your own archive.
+has a full context for the cryptos, and for the HL-routed assets the last 3 days of it, which fills
+in as the background refresh accumulates days. Run the miner as long as the champion's context
+before you care about its com-equ scores, or pre-populate the store from your own archive.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from typing import Callable, Sequence
 
 import pandas as pd
@@ -34,7 +36,7 @@ import requests
 from synth.simulation_input import SimulationInput  # type: ignore[import-untyped]
 from synth.validator.competition_config import ALL_COMPETITIONS  # type: ignore[import-untyped]
 
-from synth_lib.benchmark.generate_predictions import context_end
+from synth_lib.benchmark.generate_predictions import DEFAULT_CONTEXT_DAYS, context_end
 from synth_lib.preparation.config import (
     BINANCE_SYMBOLS,
     HYPERLIQUID_SYMBOLS,
@@ -46,8 +48,6 @@ from synth_lib.preparation.price_client import build_price_client
 
 logger = logging.getLogger(__name__)
 
-WARMUP_DAYS = 8  # 7-day context + 1 day of slack
-CONTEXT_MINUTES = 7 * 24 * 60
 MIN_REAL_BARS = 60  # below this a trimmed context is worse than a slightly stale one
 # Prompts whose context is topped up at request time (crypto-1h); the 24 h formats are not.
 FRESH_TAIL_TIME_LENGTH = 3_600
@@ -55,6 +55,9 @@ FRESH_TAIL_MINUTES = 15
 # The request path's venue call: no retries, and far inside the response deadline.
 FRESH_TAIL_TIMEOUT_SECONDS = 1.5
 EMPTY_TAIL = pd.DataFrame(columns=["timestamp", *OHLCV_COLUMNS])
+# Built contexts kept for the other validators asking the same prompt: at least one minute's
+# prompts across every competition.
+CONTEXT_CACHE_SIZE = 32
 
 
 def wrap_output(raw: Sequence, start_time: datetime, time_increment: int) -> tuple:
@@ -87,18 +90,26 @@ def servable_assets() -> list[str]:
     return assets
 
 
-def warm_up(assets: Sequence[str], days: int = WARMUP_DAYS) -> None:
-    """Fill the local minute store from each asset's own venue before serving.
+def warm_up(assets: Sequence[str], context_days: int) -> None:
+    """Fill the local minute store from each asset's own venue before serving, and log how much of
+    the champion's context holds a real close.
 
-    Idempotent across restarts: `ingest_range` skips complete final partitions, so only genuinely
-    missing days are fetched. Hyperliquid's ~3.5-day retention caps how far back HL-routed assets
-    can reach (see the module docstring); those days simply come back empty and accumulate forward.
+    A `context_days` context touches context_days + 1 date partitions. Like the background refresh,
+    the fetch stops at the venue's retention: Hyperliquid's ~3.5 days cap how far back HL-routed
+    assets reach, and their older days accumulate forward (see the module docstring). Idempotent
+    across restarts: settled partitions are not fetched again.
     """
-    today = datetime.now(tz=UTC).date()
     for asset in assets:
         try:
-            venue_store(asset).ingest_range(today - timedelta(days=days), today, verbose=False)
-            logger.info("warm-up complete for %s", asset)
+            store = venue_store(asset)
+            store.refresh_recent(days=context_days + 1)
+            context = build_context(store, datetime.now(tz=UTC).replace(second=0, microsecond=0), context_days)
+            logger.info(
+                "warm-up complete for %s: %.1f%% of its %d-day context holds a real close",
+                asset,
+                100 * context["close"].notna().mean(),
+                context_days,
+            )
         except Exception as exc:  # a venue outage must not stop the miner from starting
             logger.warning("warm-up incomplete for %s: %s", asset, exc)
 
@@ -139,10 +150,10 @@ class FreshTail:
 def build_context(
     store: MinutePriceStore,
     start_time: datetime,
-    window_minutes: int = CONTEXT_MINUTES,
+    context_days: int = DEFAULT_CONTEXT_DAYS,
     tail: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """The 7-day minute OHLCV context ending at `start_time`, lenient enough to serve from.
+    """The `context_days` minute OHLCV context ending at `start_time`, lenient enough to serve from.
 
     Deliberately not `MinutePriceStore.get_context_window`, which is strict (it raises on a missing
     day or a short window) — correct for backtesting, fatal on the request path, where a single
@@ -154,7 +165,7 @@ def build_context(
     `tail` (FreshTail's bars) wins over the store for the same minute: today's partition holds a
     NaN row for every minute its last refresh had not settled yet.
     """
-    context_start = start_time - timedelta(minutes=window_minutes)
+    context_start = start_time - timedelta(days=context_days)
     frames = []
     day = context_start.date()
     while day <= start_time.date():
@@ -187,6 +198,22 @@ def build_context(
     return raw if len(trimmed) < MIN_REAL_BARS else trimmed
 
 
+class ContextCache:
+    """Built contexts by (asset, time_length, start_time), so that the validators sending the same
+    prompt share one. Keeps the newest CONTEXT_CACHE_SIZE."""
+
+    def __init__(self, size: int = CONTEXT_CACHE_SIZE):
+        self._size = size
+        self._contexts: OrderedDict[tuple[str, int, datetime], pd.DataFrame] = OrderedDict()
+
+    def get(self, key: tuple[str, int, datetime], build: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+        if key not in self._contexts:
+            self._contexts[key] = build()
+            if len(self._contexts) > self._size:
+                self._contexts.popitem(last=False)
+        return self._contexts[key]
+
+
 def start_time_of(simulation_input: SimulationInput) -> datetime:
     start_time = datetime.fromisoformat(simulation_input.start_time)
     return start_time if start_time.tzinfo is not None else start_time.replace(tzinfo=UTC)
@@ -197,16 +224,23 @@ def serve_request(
     store: MinutePriceStore,
     simulation_input: SimulationInput,
     tail: pd.DataFrame | None = None,
+    context_days: int = DEFAULT_CONTEXT_DAYS,
+    contexts: ContextCache | None = None,
 ) -> tuple:
     """Build the live context, run the champion, adapt the output to the live contract."""
     start_time = start_time_of(simulation_input)
-    context = build_context(store, start_time, tail=tail)
+    build = partial(build_context, store, start_time, context_days, tail)
+    if contexts is None:
+        context = build()
+    else:
+        context = contexts.get((store.asset, simulation_input.time_length, start_time), build)
     raw = simulate_fn(
         asset=simulation_input.asset,
         start_time=simulation_input.start_time,
         time_increment=simulation_input.time_increment,
         time_length=simulation_input.time_length,
         num_simulations=simulation_input.num_simulations,
-        context_prices=context,
+        # A copy: the cached frame serves every validator asking this prompt.
+        context_prices=context.copy(),
     )
     return wrap_output(raw, start_time, simulation_input.time_increment)

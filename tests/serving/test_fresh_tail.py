@@ -109,9 +109,9 @@ def test_only_crypto_1h_prompts_fetch_a_tail(monkeypatch):
             return EMPTY_TAIL
 
     served = []
-    monkeypatch.setattr(cm, "serve_request", lambda fn, store, sim_input, tail: served.append(tail) or ("ok",))
+    monkeypatch.setattr(cm, "serve_request", lambda fn, store, sim_input, tail, **kw: served.append(tail) or ("ok",))
     miner = object.__new__(ChampionMiner)  # Miner.__init__ needs a wallet, a subtensor and a chain
-    miner._stores, miner._tails, miner._ready = {"BTC": None}, {"BTC": _Tail()}, {"BTC"}
+    miner._stores, miner._tails, miner._ready, miner._contexts = {"BTC": None}, {"BTC": _Tail()}, {"BTC"}, None
 
     asyncio.run(miner.forward_miner(_synapse(86_400)))
     assert miner._tails["BTC"].calls == 0 and served == [None]
