@@ -199,14 +199,21 @@ def build_context(
 
 
 class ContextCache:
-    """Built contexts by (asset, time_length, start_time), so that the validators sending the same
-    prompt share one. Keeps the newest CONTEXT_CACHE_SIZE."""
+    """Built contexts, so that the validators sending the same prompt share one while the data under it
+    stays the same: keyed by the caller's key and the store refreshes marked before the build. Keeps
+    the newest CONTEXT_CACHE_SIZE."""
 
     def __init__(self, size: int = CONTEXT_CACHE_SIZE):
         self._size = size
-        self._contexts: OrderedDict[tuple[str, int, datetime], pd.DataFrame] = OrderedDict()
+        self._refreshes = 0
+        self._contexts: OrderedDict[tuple, pd.DataFrame] = OrderedDict()
 
-    def get(self, key: tuple[str, int, datetime], build: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+    def store_refreshed(self) -> None:
+        """Marks a refresh of the stores: a context built before it is built again."""
+        self._refreshes += 1
+
+    def get(self, key: tuple, build: Callable[[], pd.DataFrame]) -> pd.DataFrame:
+        key = (*key, self._refreshes)
         if key not in self._contexts:
             self._contexts[key] = build()
             if len(self._contexts) > self._size:
@@ -227,13 +234,16 @@ def serve_request(
     context_days: int = DEFAULT_CONTEXT_DAYS,
     contexts: ContextCache | None = None,
 ) -> tuple:
-    """Build the live context, run the champion, adapt the output to the live contract."""
+    """Build the live context, run the champion, adapt the output to the live contract. With `contexts`,
+    the validators asking the same prompt share its context while the store and the tail's newest bar
+    stay the same."""
     start_time = start_time_of(simulation_input)
     build = partial(build_context, store, start_time, context_days, tail)
     if contexts is None:
         context = build()
     else:
-        context = contexts.get((store.asset, simulation_input.time_length, start_time), build)
+        tail_end = None if tail is None or tail.empty else tail["timestamp"].max()
+        context = contexts.get((store.asset, simulation_input.time_length, start_time, tail_end), build)
     raw = simulate_fn(
         asset=simulation_input.asset,
         start_time=simulation_input.start_time,

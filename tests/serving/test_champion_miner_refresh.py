@@ -18,6 +18,7 @@ from synth_lib.benchmark.generate_predictions import DEFAULT_CONTEXT_DAYS
 from synth_lib.preparation.config import OHLCV_COLUMNS
 from synth_lib.preparation.minute_price_store import MinutePriceStore
 from synth_lib.serving.champion_miner import REFRESH_SECONDS, ChampionMiner
+from synth_lib.serving.serve import ContextCache
 
 
 class _Store:
@@ -59,6 +60,7 @@ def midday(monkeypatch):
 def _miner(stores, miner_class=ChampionMiner):
     miner = object.__new__(miner_class)  # Miner.__init__ needs a wallet, a subtensor and a chain
     miner._stores = stores
+    miner._contexts = ContextCache()
     return miner
 
 
@@ -75,6 +77,14 @@ def test_each_pass_refreshes_the_contexts_date_partitions():
     store = _Store()
     _miner({"BTC": store}, FourteenDays)._refresh_once()
     assert store.refreshed == [15]
+
+
+def test_each_pass_rebuilds_the_cached_contexts():
+    miner = _miner({"BTC": _Store()})
+    t = datetime(2026, 10, 29, 9, 30, tzinfo=timezone.utc)
+    frame = miner._contexts.get(("BTC", 3_600, t), pd.DataFrame)
+    miner._refresh_once()
+    assert miner._contexts.get(("BTC", 3_600, t), pd.DataFrame) is not frame
 
 
 def test_one_venue_outage_does_not_stop_the_others():
