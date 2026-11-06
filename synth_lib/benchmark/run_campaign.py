@@ -32,7 +32,7 @@ SANDBOX_IMAGE = DEFAULT_IMAGE
 SANDBOX_NETWORK = "bridge"
 # CLIs that reach the proxy via a passthrough route (URL forwarded verbatim, not /v1): their keys
 # are minted uncapped.
-PASSTHROUGH_CLIS = {"gemini-cli"}
+PASSTHROUGH_CLIS = {"gemini-cli", "antigravity-cli"}
 
 
 def containerize_url(url: str) -> str:

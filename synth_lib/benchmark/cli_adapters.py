@@ -176,6 +176,37 @@ class GeminiAdapter(CLIAdapter):
         }
 
 
+class AntigravityAdapter(CLIAdapter):
+    """Google's Antigravity CLI (`agy`) on the Gemini API: the proxy's /gemini passthrough, the virtual key as
+    GEMINI_API_KEY."""
+
+    def launch_cmd(self, prompt: str) -> list[str]:
+        return ["agy", "-p", prompt, *self._flags()]
+
+    def resume_cmd(self, prompt: str) -> list[str] | None:
+        # -c: continues the most recent conversation in the current directory (the workspace)
+        return ["agy", "-c", "-p", prompt, *self._flags()]
+
+    def _flags(self) -> list[str]:
+        # In print mode an unknown --model exits non-zero instead of falling back to another model.
+        flags = ["--model", self.spec.model, "--output-format", "stream-json", "--dangerously-skip-permissions"]
+        if self.spec.effort:
+            flags += ["--effort", self.spec.effort]
+        return flags
+
+    def env(self) -> dict[str, str]:
+        # No GOOGLE_API_KEY: the Gemini SDK prefers it over GEMINI_API_KEY.
+        return {
+            "GOOGLE_GEMINI_BASE_URL": f"{self.proxy_url}/gemini",
+            "GEMINI_API_KEY": self.virtual_key,
+            "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
+        }
+
+    def provision_files(self) -> dict[str, str]:
+        # GEMINI_API_KEY is read only with modelProvider "gemini".
+        return {"~/.gemini/antigravity-cli/settings.json": json.dumps({"modelProvider": "gemini"}) + "\n"}
+
+
 class KimiCodeAdapter(CLIAdapter):
     """Moonshot's Kimi Code CLI (npm `@moonshot-ai/kimi-code`)."""
 
@@ -226,6 +257,7 @@ _ADAPTERS = {
     "codex": CodexAdapter,
     "gemini-cli": GeminiAdapter,
     "kimi-code": KimiCodeAdapter,
+    "antigravity-cli": AntigravityAdapter,
     "fake": FakeAdapter,
 }
 

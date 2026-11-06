@@ -83,6 +83,9 @@ def test_effort_ultracode_and_goal_load_per_model(tmp_path):
         "{id: claude, cli: gemini-cli, model: gemini-2.5-pro, effort: high}",  # no effort wired for gemini
         "{id: claude, cli: kimi-code, model: kimi-k3.1-pro, effort: ultra}",  # a codex level
         "{id: claude, cli: kimi-code, model: kimi-k3.1-pro, effort: medium}",  # not a K3 level
+        "{id: claude, cli: antigravity-cli, model: gemini-4-argon, effort: ultra}",  # a codex level
+        "{id: claude, cli: antigravity-cli, model: gemini-4-argon, effort: max}",  # no Gemini model takes it
+        "{id: claude, cli: antigravity-cli, model: gemini-4-argon, effort: xhigh}",  # no Gemini model takes it
     ],
 )
 def test_effort_outside_the_cli_levels_rejected(tmp_path, model):
@@ -97,6 +100,14 @@ def test_kimi_code_effort_loads(tmp_path):
         "{id: kimi, cli: kimi-code, model: kimi-k3.1-pro, effort: max}",
     )
     assert load_campaign(_write(tmp_path, text)).models[0].effort == "max"
+
+
+def test_antigravity_cli_effort_loads(tmp_path):
+    text = VALID_YAML.replace(
+        "{id: claude, cli: claude-code, model: claude-model}",
+        "{id: argon, cli: antigravity-cli, model: gemini-4-argon, effort: high}",
+    )
+    assert load_campaign(_write(tmp_path, text)).models[0].effort == "high"
 
 
 def test_workflow_size_and_agents_load_with_ultracode(tmp_path):
@@ -127,6 +138,11 @@ def test_workflow_keys_rejected_without_ultracode_or_out_of_range(tmp_path, mode
 @pytest.mark.parametrize("flag", ["ultracode", "goal"])
 def test_claude_code_settings_rejected_on_other_clis(tmp_path, flag):
     bad = VALID_YAML.replace("wire_api: responses}", f"wire_api: responses, {flag}: true}}")
+    with pytest.raises(ValueError, match=flag):
+        load_campaign(_write(tmp_path, bad))
+    bad = VALID_YAML.replace(
+        "cli: gemini-cli, model: gemini/gemini-2.5-pro}", f"cli: antigravity-cli, model: gemini-4-argon, {flag}: true}}"
+    )
     with pytest.raises(ValueError, match=flag):
         load_campaign(_write(tmp_path, bad))
 

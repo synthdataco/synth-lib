@@ -1,8 +1,8 @@
 # synth_lib.benchmark — an autonomous-agent benchmark harness
 
-This subpackage runs a coding CLI (Claude Code, Codex, Gemini CLI, Kimi Code, …) as an **autonomous
-research agent** whose job is to improve a Synth SN50 miner, and then scores what it produced
-against the real field of miners on the live subnet.
+This subpackage runs a coding CLI (Claude Code, Codex, Gemini CLI, Kimi Code, Antigravity CLI, …) as
+an **autonomous research agent** whose job is to improve a Synth SN50 miner, and then scores what it
+produced against the real field of miners on the live subnet.
 
 One *campaign* runs one or more *legs*, one leg per model, sequentially on the same hardware. A leg
 is: an agent alone in a Docker sandbox with a frozen price snapshot, a fixed credit budget and a
@@ -32,10 +32,12 @@ a grace period the leg is killed and relaunched once with the landing order carr
 already finished cannot argue with "no such file"). At 100% it is killed. Nominating is final: a leg
 that stops with `agent/CHAMPION` present is done and forfeits the rest of its envelope.
 
-**Metering.** All model traffic goes through a LiteLLM proxy (`metering/`), one budget-capped
-virtual key per leg, so every model is measured with the same instrument and the ledger is the
-single source of truth for spend. Probe any new provider or CLI before it carries a real leg (the
-deployment repo has the runbook) and keep the answers: the adapters are written from them.
+**Metering.** All model traffic goes through a LiteLLM proxy (`metering/`), one virtual key per
+leg, so every model is measured with the same instrument and the ledger is the single source of
+truth for spend. Each key is budget-capped, except for the passthrough CLIs (gemini-cli,
+antigravity-cli): their keys are uncapped, and the driver enforces their budget from the key's
+spend. Probe any new provider or CLI before it carries a real leg (the deployment repo has the
+runbook) and keep the answers: the adapters are written from them.
 
 **Sandbox.** `sandbox/` builds one image with the pinned CLIs; each leg runs in a container with its
 workspace, a read-only price snapshot at `/workspace/market_data`, a per-run HOME, capped CPU/RAM,
@@ -107,7 +109,7 @@ The verdict above is monte-carlo's: a kind registered elsewhere brings its own.
 | `nomination.py` | the `CHAMPION` contract and the `simulate()` interface probe |
 | `cli_adapters.py` | per-CLI argv/env, including a `fake` CLI for zero-cost dry runs |
 | `sandbox/` | `docker run` construction (mounts, caps, network, GPU) |
-| `metering/` | the LiteLLM admin client: one budget-capped virtual key per leg |
+| `metering/` | the LiteLLM admin client: one virtual key per leg, budget-capped except for the passthrough CLIs |
 | `verdict/` | prediction generation and scoring of an archived champion |
 | `generate_predictions.py` | the generation core; copied into champion clones, so numpy/pandas/stdlib only |
 
