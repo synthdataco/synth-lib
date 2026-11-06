@@ -177,14 +177,11 @@ class GeminiAdapter(CLIAdapter):
 
 
 class KimiCodeAdapter(CLIAdapter):
-    """Moonshot's Kimi Code CLI (kimi.com/code). Not an npm package: installed in the sandbox
-    image via its install.sh with KIMI_INSTALL_DIR=/usr/local — the default is $HOME/.kimi-code,
-    which the per-run HOME mount over /root would hide at runtime."""
+    """Moonshot's Kimi Code CLI (npm `@moonshot-ai/kimi-code`)."""
 
     def launch_cmd(self, prompt: str) -> list[str]:
-        # NO permission flag: kimi 0.32.0 rejects combining --prompt with --yolo AND with --auto
-        # ("error: Cannot combine ..."), so the leg dies at argv parsing before reaching a model
-        # call. Print mode is non-interactive by construction and handles approvals itself.
+        # No permission flag: kimi rejects --prompt combined with --yolo or --auto ("Cannot combine ..."),
+        # and print mode runs every tool call in auto mode.
         return ["kimi", "-p", prompt, "--output-format", "stream-json"]
 
     def resume_cmd(self, prompt: str) -> list[str] | None:
@@ -204,7 +201,17 @@ class KimiCodeAdapter(CLIAdapter):
             # A CLI that self-updates mid-campaign changes the subject of the experiment.
             "KIMI_CODE_NO_AUTO_UPDATE": "1",
             "KIMI_DISABLE_TELEMETRY": "1",
+            # Each sandbox run has a new hostname, so a session lock left by a killed run counts as held
+            # and `-c` exits 4. A leg runs one kimi process at a time.
+            "KIMI_CODE_SESSION_LOCK": "0",
         }
+
+    def provision_files(self) -> dict[str, str]:
+        # Sent unchanged as reasoning_effort for the openai provider type; KIMI_MODEL_THINKING_EFFORT
+        # applies to the kimi type only.
+        if not self.spec.effort:
+            return {}
+        return {"~/.kimi-code/config.toml": f'[thinking]\neffort = "{self.spec.effort}"\n'}
 
 
 class FakeAdapter(CLIAdapter):
