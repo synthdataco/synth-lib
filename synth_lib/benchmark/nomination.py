@@ -7,11 +7,14 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 import yaml
+
+from synth_lib.benchmark.generate_predictions import context_days_of, load_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -98,16 +101,19 @@ def probe_simulate(
     (synth.validator.prompt_config.PromptConfig.num_simulations = 1000) rather than a smaller
     convenience value: a champion that breaks at 1000 paths (memory, a hardcoded shape) must
     fail here, at nomination time, instead of later at verdict/live time where
-    synth.validator.response_validation_v2 rejects any response with a different path count."""
+    synth.validator.response_validation_v2 rejects any response with a different path count.
+
+    The context spans the champion's CONTEXT_DAYS. On success the message is the call's wall time."""
     try:
-        simulate = load_simulate(modeling_path)
+        module = load_module(modeling_path)
         start = pd.Timestamp("2026-01-05T00:00:00Z")
-        idx = pd.date_range(end=start, periods=7 * 24 * 60, freq="1min", tz="UTC")
+        idx = pd.date_range(end=start, periods=context_days_of(module) * 24 * 60, freq="1min", tz="UTC")
         context = pd.DataFrame(
             {c: 100.0 for c in ("open", "high", "low", "close")} | {"volume": 1.0, "trade_count": 1.0},
             index=idx,
         )
-        out = simulate(
+        began = time.monotonic()
+        out = module.simulate(
             asset=asset,
             start_time=start.isoformat(),
             time_increment=time_increment,
@@ -115,6 +121,7 @@ def probe_simulate(
             num_simulations=num_simulations,
             context_prices=context,
         )
+        seconds = time.monotonic() - began
         if not isinstance(out, tuple) or len(out) != 2 + num_simulations:
             got = f"tuple of length {len(out)}" if isinstance(out, tuple) else type(out).__name__
             return False, f"expected return: tuple(start, increment, *{num_simulations} paths) — got {got}"
@@ -124,7 +131,7 @@ def probe_simulate(
                 return False, f"path {i}: length {len(path)} != {expected_steps} or non-numeric values"
     except Exception as exc:  # any champion failure (including a malformed shape) is a probe failure
         return False, f"simulate() raised: {type(exc).__name__}: {exc}"
-    return True, "ok"
+    return True, f"{seconds:.1f} s"
 
 
 def probe_simulate_subprocess(
@@ -178,16 +185,23 @@ def probe_simulate_subprocess(
 
 
 def probe_all_shapes(modeling_path: Path) -> tuple[bool, str]:
-    """Probes BOTH competition formats: 24h (86400/300) and 1h (3600/60).
+    """Probes BOTH competition formats: 24h (86400/300) and 1h (3600/60), and reports the champion's
+    CONTEXT_DAYS with the wall time of one call of each.
 
     A champion that ignores time_increment/time_length passes the 24h format and breaks on
     crypto-1h — the check must therefore cover both, otherwise the failure only shows up at
     verdict time, too late for the agent to fix it."""
+    try:
+        days = context_days_of(load_module(modeling_path))
+    except Exception as exc:  # an import that fails, or a CONTEXT_DAYS out of bounds
+        return False, f"{type(exc).__name__}: {exc}"
+    seconds = {}
     for label, ti, tl in (("24h", 300, 86_400), ("1h", 60, 3_600)):
         ok, msg = probe_simulate(modeling_path, time_increment=ti, time_length=tl)
         if not ok:
             return False, f"[{label}] {msg}"
-    return True, "ok (24h + 1h)"
+        seconds[label] = msg
+    return True, f"ok (24h + 1h), CONTEXT_DAYS {days}, one call {seconds['24h']} (24h) and {seconds['1h']} (1h)"
 
 
 def _main() -> None:
