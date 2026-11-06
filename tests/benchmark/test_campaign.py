@@ -81,12 +81,21 @@ def test_effort_ultracode_and_goal_load_per_model(tmp_path):
         "{id: claude, cli: claude-code, model: claude-model, effort: maximum}",  # claude would run at its default
         "{id: claude, cli: claude-code, model: claude-model, effort: ultra}",  # a codex level
         "{id: claude, cli: gemini-cli, model: gemini-2.5-pro, effort: high}",  # no effort wired for gemini
+        "{id: claude, cli: kimi-code, model: kimi-k3.1-pro, effort: ultra}",  # a codex level
     ],
 )
 def test_effort_outside_the_cli_levels_rejected(tmp_path, model):
     bad = VALID_YAML.replace("{id: claude, cli: claude-code, model: claude-model}", model)
     with pytest.raises(ValueError, match="effort"):
         load_campaign(_write(tmp_path, bad))
+
+
+def test_kimi_code_effort_loads(tmp_path):
+    text = VALID_YAML.replace(
+        "{id: claude, cli: claude-code, model: claude-model}",
+        "{id: kimi, cli: kimi-code, model: kimi-k3.1-pro, effort: max}",
+    )
+    assert load_campaign(_write(tmp_path, text)).models[0].effort == "max"
 
 
 def test_workflow_size_and_agents_load_with_ultracode(tmp_path):

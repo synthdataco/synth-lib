@@ -129,7 +129,7 @@ def test_kimi_adapter_routes_through_the_proxy_env_family():
     cmd = a.launch_cmd("Read CAMPAIGN.md and start.")
     assert cmd[:2] == ["kimi", "-p"]
     assert "--output-format" in cmd and "stream-json" in cmd
-    # kimi 0.32.0 rejects --prompt combined with ANY permission flag (smoke-2 argv deaths)
+    # kimi rejects --prompt combined with a permission flag
     assert "--yolo" not in cmd and "--auto" not in cmd
     assert "-m" not in cmd  # the model comes from KIMI_MODEL_NAME, not a flag
     env = a.env()
@@ -139,9 +139,20 @@ def test_kimi_adapter_routes_through_the_proxy_env_family():
     assert env["KIMI_MODEL_BASE_URL"] == "http://localhost:4000/v1"
     # a CLI that self-updates mid-campaign changes the subject of the experiment
     assert env["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
+    assert env["KIMI_CODE_SESSION_LOCK"] == "0"  # a lock left by a killed sandbox run would block -c
+    assert a.provision_files() == {}  # no effort: the CLI's own
     resume = a.resume_cmd("continue")
     assert resume[:2] == ["kimi", "-c"]
     assert "--yolo" not in resume and "--auto" not in resume
+
+
+def test_kimi_adapter_writes_the_thinking_effort():
+    a = build_adapter(
+        ModelSpec(id="k", cli="kimi-code", model="kimi-k3.1-pro", effort="max"),
+        proxy_url="http://localhost:4000",
+        virtual_key="sk-v",
+    )
+    assert tomllib.loads(a.provision_files()["~/.kimi-code/config.toml"]) == {"thinking": {"effort": "max"}}
 
 
 def test_fake_adapter_runs_fake_cli(tmp_path):

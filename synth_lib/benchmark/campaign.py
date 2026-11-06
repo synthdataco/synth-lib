@@ -16,6 +16,7 @@ KNOWN_CLIS = ("claude-code", "codex", "gemini-cli", "kimi-code", "fake")
 EFFORT_LEVELS = {
     "claude-code": ("low", "medium", "high", "xhigh", "max"),
     "codex": ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+    "kimi-code": ("low", "medium", "high", "xhigh", "max"),
 }
 # claude-code's workflowSizeGuideline values: the agent count it tells the model to aim for per workflow.
 WORKFLOW_SIZES = ("unrestricted", "small", "medium", "large")
