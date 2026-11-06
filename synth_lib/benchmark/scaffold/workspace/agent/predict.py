@@ -17,7 +17,7 @@ Works on every asset. A minute without a trade is a flat candle with trade_count
 through the same lenient path the scored evaluation uses, so a NaN close (no price at all) reaches
 simulate() rather than stopping the run — your model must tolerate them (drop, never interpolate).
 The context spans the CONTEXT_DAYS your modeling.py sets (7 without it), and the days before an
-asset's first trade are NaN.
+asset's first trade, or before the snapshot's first day, are NaN.
 
 When the snapshot carries an event calendar ($SYNTH_BENCHMARK_CALENDAR), the summary is followed by
 your gap to each prompt's best miner, over the prompts whose horizon holds an event of each type and
@@ -52,7 +52,12 @@ import pandas as pd
 from synth_lib.backtester.config import PREDICTION_MATCH_TOLERANCE_MINUTES
 from synth_lib.backtester.loading import get_miner_scores
 from synth_lib.backtester.orchestration import backtest, score_crps
-from synth_lib.benchmark.generate_predictions import context_days_of, context_slice, load_minute_prices
+from synth_lib.benchmark.generate_predictions import (
+    context_days_of,
+    context_slice,
+    load_minute_prices,
+    nan_head_minutes,
+)
 from synth_lib.preparation.config import STORE_SUBDIR
 from synth_lib.preparation.event_calendar.events import CALENDAR_ENV, concerns
 
@@ -174,9 +179,11 @@ def generate(
     # interpolate it away.
     prices = load_minute_prices(WORKSPACE / "market_data", asset, times[0] - pd.Timedelta(days=CONTEXT_DAYS), times[-1])
     out_dir.mkdir(parents=True, exist_ok=True)
+    head = 0
     for t in times:
         # Never `prices.loc[:t]` — see the module docstring. Same cut the scored evaluation uses.
         context = context_slice(prices, t, time_length, CONTEXT_DAYS)
+        head = max(head, nan_head_minutes(context))
         out = modeling.simulate(
             asset=asset,
             start_time=t.isoformat(),
@@ -197,6 +204,11 @@ def generate(
         }
         name = t.strftime("%Y-%m-%d_%H:%M:%SZ") + f"_{asset}_{time_length}.json"
         (out_dir / name).write_text(json.dumps(record))
+    if head:
+        print(
+            f"warning: {asset} contexts start with up to {head / 1440:.1f} days of NaN, before its first price "
+            f"in the snapshot"
+        )
     return len(times)
 
 

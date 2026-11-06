@@ -79,6 +79,16 @@ def test_backtests_hand_the_champion_its_context_days(tmp_path, monkeypatch, att
     assert len(seen[0]) == days * 1440 - 2  # the verdict's slice: up to the bar labelled t - 3 min
 
 
+def test_a_context_reaching_before_the_snapshot_is_reported(tmp_path, monkeypatch, capsys):
+    seen = _with_modeling(monkeypatch)
+    predict = _load_predict(tmp_path, monkeypatch)
+    _snapshot(tmp_path, "SPCX", "2026-08-10", "2026-08-20")
+    times = [pd.Timestamp("2026-08-12", tz="UTC"), pd.Timestamp("2026-08-20", tz="UTC")]
+    predict.generate("SPCX", times, tmp_path / "out", num_simulations=2)
+    assert seen[0].loc[:"2026-08-09 23:59", "close"].isna().all()
+    assert "warning: SPCX contexts start with up to 5.0 days of NaN" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("value", [2, 31, True, 14.0])
 def test_backtests_refuse_context_days_outside_the_bounds(tmp_path, monkeypatch, value):
     _with_modeling(monkeypatch, CONTEXT_DAYS=value)

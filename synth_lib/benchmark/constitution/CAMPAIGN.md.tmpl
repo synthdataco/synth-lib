@@ -125,8 +125,8 @@ horizon before the window and yours is never treated as late.
   **Read `DATA.md` at the workspace root FIRST**: it is generated from this exact snapshot at
   setup and carries the measured truth — the partition schema, the minute semantics (a minute
   without a trade is a flat candle with `trade_count` 0, NOT market hours; NaN close = no price
-  at all; missing file = before the market's first trade), and a
-  per-asset coverage table with density by era. Two caveats it quantifies that will bite if
+  at all; missing file = before the market's first trade, or before the snapshot's first day),
+  and a per-asset coverage table with density by era. Two caveats it quantifies that will bite if
   ignored: the early months of the newer Hyperliquid listings are genuinely THIN (low realized
   volatility there is real, not smoothing), and these are venue-specific perpetual prices with
   their own basis (xyz:SP500 trades around 7,500 — not the cash index).
@@ -268,9 +268,10 @@ horizon before the window and yours is never treated as late.
    **The `context_prices` contract, exactly**: a minute-indexed pd.DataFrame over the
    `CONTEXT_DAYS` days preceding `start_time`, with columns `open, high, low, close, volume,
    trade_count`. `close` is the series you are scored against; the rest are context. It MAY
-   CONTAIN NaN in every column, on whole days before an asset's first trade too — your
-   `simulate()` must tolerate them (drop, never interpolate). Evaluation passes the raw frame:
-   handle gaps inside your model, not in a loader you hope evaluation shares.
+   CONTAIN NaN in every column, on whole days before an asset's first trade or before the
+   snapshot's first day too — your `simulate()` must tolerate them (drop, never interpolate).
+   Evaluation passes the raw frame: handle gaps inside your model, not in a loader you hope
+   evaluation shares.
    **`CONTEXT_DAYS` is yours to choose**, and to measure like any other parameter: a plain
    integer at module level in `agent/modeling.py`, from 3 to 30, not computed (a module without
    it gets 7). `agent/predict.py`, the interface check, the scoring and the live miner all read
