@@ -3,12 +3,13 @@
 Subclasses set `simulate_fn` and `context_days`, the champion's CONTEXT_DAYS — `unpack_champion.py`
 generates that subclass, and one that leaves `context_days` unset serves the default.
 Startup does not wait for data: a background thread warms each venue-routed minute store up, asset
-by asset, then keeps them all fresh, and an asset is served as soon as its own warm-up is done. Each
-request slices the trailing `context_days` context — a crypto-1h one topped up with the bars that
-closed since the last refresh — and adapts the champion's output to the live validator contract. A
-second thread refreshes the event calendar at startup and daily, and the champion finds it at
-`$SYNTH_BENCHMARK_CALENDAR`, as in its campaign. A calendar already stored on the volume, no older
-than `CALENDAR_MAX_AGE_SECONDS`, is served until the first refresh replaces it.
+by asset, then keeps them all fresh, and an asset is served as soon as its own warm-up is done; its
+today's partition is refreshed after each later asset's warm-up. Each request slices the trailing
+`context_days` context — a crypto-1h one topped up with the bars that closed since the last refresh —
+and adapts the champion's output to the live validator contract. A second thread refreshes the event
+calendar at startup and daily, and the champion finds it at `$SYNTH_BENCHMARK_CALENDAR`, as in its
+campaign. A calendar already stored on the volume, no older than `CALENDAR_MAX_AGE_SECONDS`, is
+served until the first refresh replaces it.
 
 No guards: an unservable asset, a data hole, or an exploding path crashes the request so it
 shows up in monitoring instead of silently degrading.
@@ -105,16 +106,22 @@ class ChampionMiner(Miner):
         for asset in self._stores:
             warm_up([asset], self.context_days)
             self._calendar_ready.wait(max(0.0, calendar_deadline - time.monotonic()))
+            # The assets already served stay fresh while the others warm up.
+            self._refresh(list(self._ready), days=1)
             self._ready.add(asset)
         logger.info("warm-up complete; refreshing every %d s", REFRESH_SECONDS)
         self._background_refresh()
 
     def _refresh_once(self) -> None:
-        """One pass over every store, over the context's date partitions. A venue outage must not stop
-        the others being refreshed."""
-        for asset, store in self._stores.items():
+        """One pass over every store, over the context's date partitions."""
+        self._refresh(list(self._stores), self.context_days + 1)
+
+    def _refresh(self, assets: list[str], days: int) -> None:
+        """refresh_recent(days) on each asset's store, then marks the refresh for the cached contexts. A
+        venue outage must not stop the others being refreshed."""
+        for asset in assets:
             try:
-                store.refresh_recent(days=self.context_days + 1)
+                self._stores[asset].refresh_recent(days=days)
             except Exception as exc:
                 logger.warning("refresh failed for %s: %s", asset, exc)
         self._contexts.store_refreshed()
