@@ -91,10 +91,19 @@ def test_a_listing_inside_the_context_is_not_missing_but_a_hole_is(predict, tmp_
     is a hole the run must not paper over."""
     root = _snapshot(tmp_path, "SPCX", "2026-08-10", "2026-08-20")
     start, end = datetime(2026, 8, 5, tzinfo=timezone.utc), datetime(2026, 8, 20, tzinfo=timezone.utc)
-    predict.check_snapshot_coverage("SPCX", start, end)
+    first_prompt = start + timedelta(days=7)
+    predict.check_snapshot_coverage("SPCX", start, end, first_prompt)
     (root / "date=2026-08-12.parquet").unlink()
     with pytest.raises(SystemExit, match=r"for SPCX: missing partitions \['2026-08-12'\]"):
-        predict.check_snapshot_coverage("SPCX", start, end)
+        predict.check_snapshot_coverage("SPCX", start, end, first_prompt)
+
+
+def test_prompts_before_the_first_partition_are_missing(predict, tmp_path):
+    """Only the context's head is exempt: a prompt on a day the snapshot does not hold stops the run."""
+    _snapshot(tmp_path, "SPCX", "2026-08-10", "2026-08-20")
+    first_prompt, end = datetime(2026, 8, 4, tzinfo=timezone.utc), datetime(2026, 8, 20, tzinfo=timezone.utc)
+    with pytest.raises(SystemExit, match=r"for SPCX: missing partitions \['2026-08-04', '2026-08-05'"):
+        predict.check_snapshot_coverage("SPCX", first_prompt - timedelta(days=30), end, first_prompt)
 
 
 def test_refuses_to_run_without_the_offline_bundle(predict, monkeypatch):

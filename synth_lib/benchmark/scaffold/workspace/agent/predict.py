@@ -110,19 +110,21 @@ def store_root(asset: str) -> Path:
     return WORKSPACE / "market_data" / STORE_SUBDIR / asset / "1m"
 
 
-def check_snapshot_coverage(asset: str, start: datetime, end: datetime) -> None:
+def check_snapshot_coverage(asset: str, start: datetime, end: datetime, first_prompt: datetime) -> None:
     """Fails EARLY and clearly if the requested window falls outside the frozen snapshot.
 
-    The days before the asset's first partition are not missing: the context holds them as NaN.
+    The context's days before the asset's first partition are not missing: the context holds them
+    as NaN. The days from the first prompt on are never exempt.
     Without this guard, synth-lib would try to ingest the missing days (network + write) and
     the error would surface in an unreadable form."""
     root = store_root(asset)
     first = min((p.name for p in root.glob("date=*.parquet")), default="")
+    holes_from = min(first, f"date={first_prompt.date().isoformat()}.parquet")
     missing = []
     cursor = start.date()
     while cursor <= end.date():
         name = f"date={cursor.isoformat()}.parquet"
-        if name > first and not (root / name).exists():
+        if name >= holes_from and not (root / name).exists():
             missing.append(cursor.isoformat())
         cursor += timedelta(days=1)
     if missing:
@@ -276,7 +278,7 @@ def main() -> None:
         cadence = cadence or CRPS_ONLY_CADENCE_MINUTES[args.time_length]
     times = prompt_times(args.asset, end, args.days, args.time_length, args.time_increment, cadence_minutes=cadence)
     # the context reaches back CONTEXT_DAYS before the first prompt: coverage must extend that far
-    check_snapshot_coverage(args.asset, times[0] - timedelta(days=CONTEXT_DAYS), end)
+    check_snapshot_coverage(args.asset, times[0] - timedelta(days=CONTEXT_DAYS), end, times[0])
     PREDICTIONS_ROOT.mkdir(parents=True, exist_ok=True)
     out_dir = Path(tempfile.mkdtemp(prefix="run-", dir=PREDICTIONS_ROOT))
     try:
