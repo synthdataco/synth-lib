@@ -140,6 +140,7 @@ def test_kimi_adapter_routes_through_the_proxy_env_family():
     # a CLI that self-updates mid-campaign changes the subject of the experiment
     assert env["KIMI_CODE_NO_AUTO_UPDATE"] == "1"
     assert env["KIMI_CODE_SESSION_LOCK"] == "0"  # a lock left by a killed sandbox run would block -c
+    assert env["KIMI_MODEL_MAX_CONTEXT_SIZE"] == "1048576"
     assert a.provision_files() == {}  # no effort: the CLI's own
     resume = a.resume_cmd("continue")
     assert resume[:2] == ["kimi", "-c"]
