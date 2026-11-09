@@ -27,6 +27,8 @@ from synth_lib.preparation.event_calendar.events import (
 )
 
 _PARTITION_RE = re.compile(r"^date=(\d{4}-\d{2}-\d{2})\.parquet$")
+# RealizedPathStore's directory under market_data.
+REALIZED_SUBDIR = "realized"
 # DATA.md lists an asset's fixed prompt start times only when there are at most this many a day.
 MAX_LISTED_SLOTS = 24
 # The clocks DATA.md lists daylight-saving switches for, by the name it gives them.
@@ -38,14 +40,27 @@ def _partition_day(path: Path) -> date | None:
     return date.fromisoformat(m.group(1)) if m else None
 
 
+def _last_day(path: Path) -> date | None:
+    """The last day a partition's data reaches: its own day, or the next for a realized-path partition,
+    whose paths run on from the prompts that start on its day."""
+    day = _partition_day(path)
+    # realized/<asset>/<time_length>_<time_increment>/date=*.parquet
+    if day is None or len(path.parents) < 3 or path.parents[2].name != REALIZED_SUBDIR:
+        return day
+    return day + timedelta(days=1)
+
+
 def build_snapshot(source_root: Path, dest_root: Path, cutoff: date, start: date | None = None) -> dict[str, str]:
-    """Hard-links every partition in [start, cutoff] (all assets) and writes manifest.json.
+    """Hard-links every partition whose data ends in [start, cutoff] (all assets) and writes manifest.json.
+
+    A realized-path partition holds paths that run into the next day, so the one dated on the cutoff
+    stays out.
 
     `start` decouples what is on disk from what a campaign sees: keep 9 months of ingested
     market_data and snapshot only the 2 months a campaign should train on. None = no lower
     bound, i.e. everything up to the cutoff. A rebuilt snapshot keeps its partitions and its frozen
     calendar."""
-    manifest = link_partitions(source_root, dest_root, "date=*.parquet", _partition_day, cutoff, start)
+    manifest = link_partitions(source_root, dest_root, "date=*.parquet", _last_day, cutoff, start)
     if not manifest:
         window = f"in [{start}, {cutoff}]" if start is not None else f"<= {cutoff}"
         raise ValueError(f"no partition {window} under {source_root}")
@@ -102,7 +117,7 @@ def render_data_md(snapshot_root: Path) -> str:
             lines.append(row)
     lines += _timestamp_lines(store)
     lines += _offline_bundle_lines(snapshot_root / "offline_data")
-    lines += _realized_lines(snapshot_root / "realized")
+    lines += _realized_lines(snapshot_root / REALIZED_SUBDIR)
     lines += _daylight_saving_lines(store)
     lines += _calendar_lines(snapshot_root / CALENDAR_DIR / VIEW_FILE, store)
     return "\n".join(lines) + "\n"

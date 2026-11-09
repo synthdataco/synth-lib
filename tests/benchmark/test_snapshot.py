@@ -39,6 +39,20 @@ def test_snapshot_stops_at_cutoff_and_writes_manifest(tmp_path):
     assert manifest == entries
 
 
+def test_snapshot_leaves_out_realized_paths_that_start_on_the_cutoff(tmp_path):
+    """A 24h path starting on the cutoff day runs into the forward window."""
+    src = _make_source(tmp_path)
+    realized = src / "realized" / "BTC" / "86400_300"
+    realized.mkdir(parents=True)
+    for day in ["2026-07-14", "2026-07-15"]:
+        (realized / f"date={day}.parquet").write_bytes(day.encode())
+    dest = tmp_path / "snapshot"
+    manifest = build_snapshot(src, dest, cutoff=date(2026, 7, 15))
+    assert sorted(p.name for p in (dest / "realized" / "BTC" / "86400_300").iterdir()) == ["date=2026-07-14.parquet"]
+    assert "pyth/BTC/1m/date=2026-07-15.parquet" in manifest
+    assert "realized/BTC/86400_300/date=2026-07-15.parquet" not in manifest
+
+
 def test_snapshot_start_bound_excludes_earlier_partitions(tmp_path):
     """The disk may hold months; a campaign gets only its window (e.g. post-competition-split)."""
     src = _make_source(tmp_path)
