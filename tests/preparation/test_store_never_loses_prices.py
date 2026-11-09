@@ -10,6 +10,7 @@ fetch, is fetched again; one fetched complete after it ended never is.
 """
 
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -101,12 +102,55 @@ def test_a_day_written_while_it_was_today_is_completed_once_it_ends(tmp_path, mo
     assert client.calls == [DAY, DAY], "a settled day was fetched again"
 
 
+@pytest.mark.parametrize("retention_minutes, settled", [(5000, False), (None, True)])
+def test_a_day_the_venue_holds_only_in_part_is_stored_unsettled_and_fetched_once(
+    tmp_path, monkeypatch, retention_minutes, settled
+):
+    """At 15:00 Hyperliquid's ~5000 minutes start at 03:40 three days back: that day comes back partial
+    and stays unsettled, without a refetch on every refresh. Binance keeps everything and settles it."""
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr("synth_lib.preparation.minute_price_store.datetime", Clock)
+    client = _Client(rows=1220)
+    client.retention_minutes = retention_minutes
+    store = _store(tmp_path, client)
+    store.refresh_recent(days=3)
+    assert bool(pd.read_parquet(store.day_path(DAY))["is_final"].all()) is settled
+    assert bool(pd.read_parquet(store.day_path(DAY + timedelta(days=1)))["is_final"].all())
+    store.refresh_recent(days=3)
+    assert client.calls.count(DAY) == 1
+
+
 def test_an_empty_fetch_of_a_past_day_is_asked_again(tmp_path):
     client = _Client(rows=0)
     store = _store(tmp_path, client)
     store.ingest_day(DAY)
     client.rows = MINUTES_PER_DAY
     assert _closes(store.ingest_day(DAY)) == MINUTES_PER_DAY
+
+
+def test_an_interrupted_write_leaves_the_stored_partition_whole(tmp_path, monkeypatch):
+    store = _store(tmp_path, _Client(rows=100))
+    path = store.ingest_day(DAY, force_refresh=True)
+
+    def cut_short(self, target, **kwargs):
+        Path(target).write_bytes(b"PAR1")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", cut_short)
+    with pytest.raises(KeyboardInterrupt):
+        _store(tmp_path, _Client(rows=MINUTES_PER_DAY)).ingest_day(DAY, force_refresh=True)
+    assert _closes(path) == 100
+    assert [p.name for p in path.parent.iterdir()] == [path.name]
+
+
+def test_a_partition_is_readable_by_others(tmp_path):
+    path = _store(tmp_path, _Client(rows=100)).ingest_day(DAY, force_refresh=True)
+    assert path.stat().st_mode & 0o777 == 0o644
 
 
 def test_a_day_of_zero_trade_candles_is_not_replaced_by_a_shorter_refetch(tmp_path):

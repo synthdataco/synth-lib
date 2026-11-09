@@ -24,7 +24,7 @@ def miner(monkeypatch):
     release_xau = threading.Event()
     warmed: list[str] = []
 
-    def warm_up(assets):
+    def warm_up(assets, context_days):
         if assets == ["XAU"]:
             release_xau.wait(timeout=10)
         warmed.extend(assets)
@@ -35,7 +35,7 @@ def miner(monkeypatch):
     monkeypatch.setattr(ChampionMiner, "_background_refresh", lambda self: None)
     monkeypatch.setattr(ChampionMiner, "_refresh_calendar", lambda self: None)
     monkeypatch.setenv(cm.CALENDAR_ENV, "")  # _start sets it; monkeypatch removes it after the test
-    monkeypatch.setattr(cm, "serve_request", lambda fn, store, sim_input, tail: (store,))
+    monkeypatch.setattr(cm, "serve_request", lambda fn, store, sim_input, **kw: (store,))
     miner = object.__new__(ChampionMiner)  # Miner.__init__ needs a wallet, a subtensor and a chain
     miner.release_xau, miner.warmed = release_xau, warmed
     return miner

@@ -1,6 +1,15 @@
 from pathlib import Path
 
-from synth_lib.benchmark.nomination import Champion, parse_champion, probe_simulate, probe_simulate_subprocess
+import pytest
+
+from synth_lib.benchmark.generate_predictions import load_module
+from synth_lib.benchmark.nomination import (
+    Champion,
+    parse_champion,
+    probe_all_shapes,
+    probe_simulate,
+    probe_simulate_subprocess,
+)
 
 TOY_MODELING = """
 def simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100,
@@ -8,6 +17,14 @@ def simulate(asset, start_time, time_increment=300, time_length=86400, num_simul
     steps = time_length // time_increment + 1
     return (start_time, time_increment, *[[100.0] * steps for _ in range(num_simulations)])
 """
+
+# Writes one "x" per import.
+COUNTING_MODELING = """
+from pathlib import Path
+
+with open(Path(__file__).with_name("imports.log"), "a") as log:
+    log.write("x")
+""" + TOY_MODELING
 
 BROKEN_MODELING = "def simulate(*a, **k):\n    return (0,)\n"
 
@@ -33,6 +50,18 @@ def simulate(asset, start_time, time_increment=300, time_length=86400, num_simul
 """
 
 SIBLING_MODULE = "def flat_paths(steps, n):\n    return [[100.0] * steps for _ in range(n)]\n"
+
+# Passes only on the context the verdict hands at `days` days: up to the bar labelled start_time - 3 min
+# for 24h, - 2 min for 1h.
+LENGTH_MODELING = """
+{constant}
+
+def simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100,
+             context_prices=None):
+    assert len(context_prices) == {days} * 24 * 60 - (2 if time_length == 86400 else 1), len(context_prices)
+    steps = time_length // time_increment + 1
+    return (start_time, time_increment, *[[100.0] * steps for _ in range(num_simulations)])
+"""
 
 SLEEPY_MODELING = """
 import time
@@ -89,13 +118,13 @@ def test_parse_champion_lenient_handles_block_profiles(tmp_path):
 
 def test_probe_accepts_conforming_simulate(tmp_path):
     (tmp_path / "modeling.py").write_text(TOY_MODELING)
-    ok, msg = probe_simulate(tmp_path / "modeling.py", num_simulations=5)
+    ok, msg = probe_simulate(load_module(tmp_path / "modeling.py"), num_simulations=5)
     assert ok is True, msg
 
 
 def test_probe_rejects_bad_shape(tmp_path):
     (tmp_path / "modeling.py").write_text(BROKEN_MODELING)
-    ok, msg = probe_simulate(tmp_path / "modeling.py", num_simulations=5)
+    ok, msg = probe_simulate(load_module(tmp_path / "modeling.py"), num_simulations=5)
     assert ok is False and "tuple" in msg
 
 
@@ -103,13 +132,13 @@ def test_probe_rejects_unsized_paths(tmp_path):
     # tuple of the right length (2 + num_simulations) but whose "paths" are ints:
     # len(path) must raise a TypeError that stays internal to the probe (no driver crash).
     (tmp_path / "modeling.py").write_text(UNSIZED_MODELING)
-    ok, msg = probe_simulate(tmp_path / "modeling.py", num_simulations=5)
+    ok, msg = probe_simulate(load_module(tmp_path / "modeling.py"), num_simulations=5)
     assert ok is False, msg
 
 
 def test_starter_modeling_passes_probe():
     starter = Path(__file__).resolve().parents[2] / "synth_lib" / "benchmark" / "scaffold" / "modeling_starter.py"
-    ok, msg = probe_simulate(starter, num_simulations=5)
+    ok, msg = probe_simulate(load_module(starter), num_simulations=5)
     assert ok is True, msg
 
 
@@ -117,7 +146,8 @@ def test_probe_subprocess_ok(tmp_path):
     (tmp_path / "modeling.py").write_text(TOY_MODELING)
     ok, msg = probe_simulate_subprocess(tmp_path / "modeling.py")
     assert ok is True, msg
-    assert msg == "ok (24h + 1h)"  # the probe covers both competition formats
+    assert msg.startswith("ok (24h + 1h), CONTEXT_DAYS 7, one call ")  # both competition formats
+    assert msg.endswith(" s (1h)")
 
 
 def test_probe_subprocess_imports_a_sibling_module(tmp_path):
@@ -137,8 +167,6 @@ def test_probe_subprocess_times_out(tmp_path):
 
 def test_probe_all_shapes_rejects_hardcoded_24h_model(tmp_path):
     """A simulate() that hardcodes 289 points passes the 24h probe but must fail on the 1h one."""
-    from synth_lib.benchmark.nomination import probe_all_shapes
-
     (tmp_path / "modeling.py").write_text(
         "def simulate(asset, start_time, time_increment=300, time_length=86400,\n"
         "             num_simulations=100, context_prices=None):\n"
@@ -149,8 +177,6 @@ def test_probe_all_shapes_rejects_hardcoded_24h_model(tmp_path):
 
 
 def test_probe_all_shapes_accepts_generic_model(tmp_path):
-    from synth_lib.benchmark.nomination import probe_all_shapes
-
     (tmp_path / "modeling.py").write_text(
         "def simulate(asset, start_time, time_increment=300, time_length=86400,\n"
         "             num_simulations=100, context_prices=None):\n"
@@ -167,8 +193,6 @@ def test_probe_all_shapes_rejects_model_hardcoded_to_100_paths(tmp_path):
     for 1000 paths and response_validation_v2 rejects anything else, so probing at the real
     serving size (1000, the new default) must catch this — probing at 100 would have let it
     through, only to break at verdict/live time."""
-    from synth_lib.benchmark.nomination import probe_all_shapes
-
     (tmp_path / "modeling.py").write_text(
         "def simulate(asset, start_time, time_increment=300, time_length=86400,\n"
         "             num_simulations=100, context_prices=None):\n"
@@ -178,6 +202,29 @@ def test_probe_all_shapes_rejects_model_hardcoded_to_100_paths(tmp_path):
     ok, msg = probe_all_shapes(tmp_path / "modeling.py")
     assert ok is False
     assert "1000" in msg and "102" in msg, msg  # names both the expected and actual path counts
+
+
+@pytest.mark.parametrize("constant, days", [("CONTEXT_DAYS = 14", 14), ("", 7)])
+def test_the_probe_hands_the_champion_its_context_days(tmp_path, constant, days):
+    (tmp_path / "modeling.py").write_text(LENGTH_MODELING.format(constant=constant, days=days))
+    ok, msg = probe_all_shapes(tmp_path / "modeling.py")
+    assert ok is True, msg
+    assert f"CONTEXT_DAYS {days}," in msg and "(24h) and" in msg
+
+
+def test_the_probe_imports_the_champion_once(tmp_path):
+    (tmp_path / "modeling.py").write_text(COUNTING_MODELING)
+    ok, msg = probe_all_shapes(tmp_path / "modeling.py")
+    assert ok is True, msg
+    assert (tmp_path / "imports.log").read_text() == "x"
+
+
+@pytest.mark.parametrize("value", ["2", "31", "True", "14.0"])
+def test_the_probe_fails_context_days_outside_the_bounds(tmp_path, value):
+    (tmp_path / "modeling.py").write_text(LENGTH_MODELING.format(constant=f"CONTEXT_DAYS = {value}", days=7))
+    ok, msg = probe_all_shapes(tmp_path / "modeling.py")
+    assert ok is False
+    assert msg == f"ValueError: CONTEXT_DAYS must be a plain int from 3 to 30 in modeling.py, got {value}"
 
 
 def test_probe_subprocess_hands_the_champion_its_calendar(tmp_path):

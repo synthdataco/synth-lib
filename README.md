@@ -70,7 +70,9 @@ uv run synth_lib/preparation/market_data.py --days 7
 
 `--days N` downloads today and the N days before it (N + 1 daily partitions).
 Today's partition is marked `is_final=False` and is re-downloaded on every
-subsequent run.
+subsequent run. A past day that starts before the venue's retention (Hyperliquid
+keeps its last 5000 minutes) comes back partial: it is stored once with
+`is_final=False`, for an archive ingest to complete, and not downloaded again.
 
 ### Re-download existing partitions
 
