@@ -235,6 +235,9 @@ class KimiCodeAdapter(CLIAdapter):
             # Each sandbox run has a new hostname, so a session lock left by a killed run counts as held
             # and `-c` exits 4. A leg runs one kimi process at a time.
             "KIMI_CODE_SESSION_LOCK": "0",
+            # The window kimi-code compacts against; it assumes 262144 for an env-defined model.
+            # 1048576 is Kimi K3.1 Pro's.
+            "KIMI_MODEL_MAX_CONTEXT_SIZE": "1048576",
         }
 
     def provision_files(self) -> dict[str, str]:
