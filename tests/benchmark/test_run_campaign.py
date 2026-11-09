@@ -140,10 +140,10 @@ def test_sandboxed_run_exports_the_offline_root_when_a_bundle_exists(tmp_path, m
 
 
 def test_passthrough_legs_mint_uncapped_keys(tmp_path, monkeypatch):
-    """gemini-cli reaches the proxy via the passthrough, where LiteLLM's budget reservation leaks
-    exactly max_budget and any cap self-trips (PROXY_COMPAT "Phantom budget 429"). Its key must be
-    minted with cap=None; /v1-routed legs keep the real cap. The driver enforces the budget either
-    way, from cfg.budget_usd_per_model and true spend."""
+    """gemini-cli and antigravity-cli reach the proxy via the passthrough, where LiteLLM's budget
+    reservation leaks exactly max_budget and any cap self-trips (PROXY_COMPAT "Phantom budget 429").
+    Their keys must be minted with cap=None; /v1-routed legs keep the real cap. The driver enforces
+    the budget either way, from cfg.budget_usd_per_model and true spend."""
     import synth_lib.benchmark.run_campaign as rc
     from synth_lib.benchmark.campaign import BaselineSpec, CampaignConfig, ModelSpec
 
@@ -153,6 +153,7 @@ def test_passthrough_legs_mint_uncapped_keys(tmp_path, monkeypatch):
         models=(
             ModelSpec(id="c", cli="claude-code", model="claude-model"),
             ModelSpec(id="g", cli="gemini-cli", model="gemini-3.1-pro-preview"),
+            ModelSpec(id="a", cli="antigravity-cli", model="gemini-4-argon"),
         ),
         budget_usd_per_model=10.0,
         deadline_hours_per_model=1.0,
@@ -186,6 +187,7 @@ def test_passthrough_legs_mint_uncapped_keys(tmp_path, monkeypatch):
 
     assert minted["camp-c"] == 10.0  # /v1 leg: real cap
     assert minted["camp-g"] is None  # passthrough leg: uncapped, driver-only enforcement
+    assert minted["camp-a"] is None
 
 
 def _two_leg_state(root: Path) -> CampaignState:

@@ -11,12 +11,13 @@ import yaml
 
 from synth_lib.benchmark.kinds import DEFAULT_KIND, load_kind
 
-KNOWN_CLIS = ("claude-code", "codex", "gemini-cli", "kimi-code", "fake")
+KNOWN_CLIS = ("claude-code", "codex", "gemini-cli", "kimi-code", "antigravity-cli", "fake")
 # The reasoning-effort levels a leg may set, per CLI and by its own names; a CLI absent here has no effort wired.
 EFFORT_LEVELS = {
     "claude-code": ("low", "medium", "high", "xhigh", "max"),
     "codex": ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
     "kimi-code": ("low", "high", "max"),  # the levels Kimi's K3 models take
+    "antigravity-cli": ("low", "medium", "high"),  # the levels agy's Gemini models take
 }
 # claude-code's workflowSizeGuideline values: the agent count it tells the model to aim for per workflow.
 WORKFLOW_SIZES = ("unrestricted", "small", "medium", "large")
@@ -159,7 +160,7 @@ def _validate(cfg: CampaignConfig) -> None:
 def _validate_model(m: ModelSpec) -> None:
     if m.cli not in KNOWN_CLIS:
         raise ValueError(f"unknown cli: {m.cli!r} (expected: {KNOWN_CLIS})")
-    # An unknown level does not fail the launch: claude warns and runs at its default effort.
+    # An unknown level would not fail a claude-code launch: claude warns and runs at its default effort.
     levels = EFFORT_LEVELS.get(m.cli, ())
     if m.effort is not None and m.effort not in levels:
         raise ValueError(f"{m.id}: effort {m.effort!r} is not a {m.cli} level (expected one of: {levels})")
