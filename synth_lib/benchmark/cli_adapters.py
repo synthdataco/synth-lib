@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from synth_lib.benchmark import agy_gateway
 from synth_lib.benchmark.campaign import ModelSpec
 
 FAKE_CLI_PATH = Path(__file__).parent / "fake_cli.py"
+# Where an antigravity-cli gateway leg's relay is written, relative to the run's HOME.
+GATEWAY_SCRIPT = ".agy-gateway.py"
 # The stopping condition a claude-code session is held to, the same rules as the constitution's envelope.
 # Its evaluator sees only the transcript and the hook arguments, so each case names what proves it.
 # "LANDING ORDER" is in the heading of every kind's landing_order and in driver.LANDING_PROMPT.
@@ -178,14 +181,21 @@ class GeminiAdapter(CLIAdapter):
 
 class AntigravityAdapter(CLIAdapter):
     """Google's Antigravity CLI (`agy`) on the Gemini API: the proxy's /gemini passthrough, the virtual key as
-    GEMINI_API_KEY."""
+    GEMINI_API_KEY. With `gateway`, agy uses its model gateway instead: the agy_gateway relay on localhost
+    adds the virtual key, and agy takes its model list from the Gemini API rather than its built-in one."""
 
     def launch_cmd(self, prompt: str) -> list[str]:
-        return ["agy", "-p", prompt, *self._flags()]
+        return self._with_relay(["agy", "-p", prompt, *self._flags()])
 
     def resume_cmd(self, prompt: str) -> list[str] | None:
         # -c: continues the most recent conversation in the current directory (the workspace)
-        return ["agy", "-c", "-p", prompt, *self._flags()]
+        return self._with_relay(["agy", "-c", "-p", prompt, *self._flags()])
+
+    def _with_relay(self, cmd: list[str]) -> list[str]:
+        if not self.spec.gateway:
+            return cmd
+        # The relay returns once it listens; "$@" keeps the prompt out of the shell string.
+        return ["sh", "-c", f'python3 "$HOME/{GATEWAY_SCRIPT}" && exec "$@"', "agy-gateway", *cmd]
 
     def _flags(self) -> list[str]:
         # In print mode an unknown --model exits non-zero instead of falling back to another model.
@@ -195,6 +205,13 @@ class AntigravityAdapter(CLIAdapter):
         return flags
 
     def env(self) -> dict[str, str]:
+        if self.spec.gateway:
+            return {
+                "AGY_LLM_GATEWAY_URL": f"http://127.0.0.1:{agy_gateway.PORT}",
+                agy_gateway.UPSTREAM_ENV: f"{self.proxy_url}/gemini",
+                agy_gateway.KEY_ENV: self.virtual_key,
+                "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
+            }
         # No GOOGLE_API_KEY: the Gemini SDK prefers it over GEMINI_API_KEY.
         return {
             "GOOGLE_GEMINI_BASE_URL": f"{self.proxy_url}/gemini",
@@ -203,6 +220,8 @@ class AntigravityAdapter(CLIAdapter):
         }
 
     def provision_files(self) -> dict[str, str]:
+        if self.spec.gateway:
+            return {f"~/{GATEWAY_SCRIPT}": Path(agy_gateway.__file__).read_text()}
         # GEMINI_API_KEY is read only with modelProvider "gemini".
         return {"~/.gemini/antigravity-cli/settings.json": json.dumps({"modelProvider": "gemini"}) + "\n"}
 
