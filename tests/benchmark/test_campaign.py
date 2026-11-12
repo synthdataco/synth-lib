@@ -110,6 +110,20 @@ def test_antigravity_cli_effort_loads(tmp_path):
     assert load_campaign(_write(tmp_path, text)).models[0].effort == "high"
 
 
+def test_antigravity_cli_gateway_loads_and_is_rejected_elsewhere(tmp_path):
+    text = VALID_YAML.replace(
+        "{id: claude, cli: claude-code, model: claude-model}",
+        "{id: carbon, cli: antigravity-cli, model: gemini-4-carbon, effort: high, gateway: true}",
+    )
+    assert load_campaign(_write(tmp_path, text)).models[0].gateway
+    bad = VALID_YAML.replace(
+        "{id: claude, cli: claude-code, model: claude-model}",
+        "{id: c, cli: claude-code, model: claude-model, gateway: true}",
+    )
+    with pytest.raises(ValueError, match="gateway"):
+        load_campaign(_write(tmp_path, bad))
+
+
 def test_workflow_size_and_agents_load_with_ultracode(tmp_path):
     text = VALID_YAML.replace(
         "{id: claude, cli: claude-code, model: claude-model}",

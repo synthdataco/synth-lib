@@ -1,8 +1,10 @@
 import json
 import tomllib
+from pathlib import Path
 
+from synth_lib.benchmark import agy_gateway
 from synth_lib.benchmark.campaign import ModelSpec
-from synth_lib.benchmark.cli_adapters import GOAL_CONDITION, build_adapter
+from synth_lib.benchmark.cli_adapters import GATEWAY_SCRIPT, GOAL_CONDITION, build_adapter
 
 
 def test_claude_adapter_cmd_and_env():
@@ -174,6 +176,27 @@ def test_antigravity_adapter_pins_model_and_effort_and_routes_through_the_passth
     assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "true" and "GOOGLE_API_KEY" not in env
     settings = json.loads(a.provision_files()["~/.gemini/antigravity-cli/settings.json"])
     assert settings == {"modelProvider": "gemini"}  # without it GEMINI_API_KEY is ignored
+
+
+def test_antigravity_adapter_gateway_starts_the_relay_before_agy():
+    a = build_adapter(
+        ModelSpec(id="c", cli="antigravity-cli", model="gemini-4-carbon", effort="high", gateway=True),
+        proxy_url="http://host.docker.internal:4000",
+        virtual_key="sk-v",
+    )
+    plain = build_adapter(
+        ModelSpec(id="c", cli="antigravity-cli", model="gemini-4-carbon", effort="high"), "http://x", "sk-v"
+    )
+    cmd = a.launch_cmd("go")
+    assert cmd[:2] == ["sh", "-c"] and f'"$HOME/{GATEWAY_SCRIPT}" && exec "$@"' in cmd[2]
+    assert cmd[4:] == plain.launch_cmd("go")  # the prompt is an argument, never part of the shell string
+    assert a.resume_cmd("again")[4:] == plain.resume_cmd("again")
+    env = a.env()
+    assert env["AGY_LLM_GATEWAY_URL"] == f"http://127.0.0.1:{agy_gateway.PORT}"
+    assert env[agy_gateway.UPSTREAM_ENV] == "http://host.docker.internal:4000/gemini"
+    assert env[agy_gateway.KEY_ENV] == "sk-v"
+    assert "GEMINI_API_KEY" not in env and "GOOGLE_GEMINI_BASE_URL" not in env
+    assert a.provision_files() == {f"~/{GATEWAY_SCRIPT}": Path(agy_gateway.__file__).read_text()}
 
 
 def test_antigravity_adapter_without_effort_passes_no_flag():

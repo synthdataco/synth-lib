@@ -44,6 +44,7 @@ class ModelSpec:
     goal: bool = False  # claude-code only: an evaluator holds the session to cli_adapters.GOAL_CONDITION
     workflow_size: str | None = None  # with ultracode: a WORKFLOW_SIZES name; None = the CLI's default
     max_workflow_agents: int | None = None  # with ultracode: workflow agents at once; None = the CLI's default
+    gateway: bool = False  # antigravity-cli only: agy's model gateway, through cli_adapters' localhost relay
 
 
 PACKAGED_BASELINE = "synth_lib.benchmark.verdict.baseline_default"
@@ -168,6 +169,8 @@ def _validate_model(m: ModelSpec) -> None:
         raise ValueError(f"{m.id}: ultracode is a claude-code setting")
     if m.goal and m.cli != "claude-code":
         raise ValueError(f"{m.id}: goal is a claude-code setting")
+    if m.gateway and m.cli != "antigravity-cli":
+        raise ValueError(f"{m.id}: gateway is an antigravity-cli setting")
     if (m.workflow_size is not None or m.max_workflow_agents is not None) and not m.ultracode:
         raise ValueError(f"{m.id}: workflow_size and max_workflow_agents need ultracode")
     if m.workflow_size is not None and m.workflow_size not in WORKFLOW_SIZES:
