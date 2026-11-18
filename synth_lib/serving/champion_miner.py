@@ -11,6 +11,9 @@ calendar at startup and daily, and the champion finds it at `$SYNTH_BENCHMARK_CA
 campaign. A calendar already stored on the volume, no older than `CALENDAR_MAX_AGE_SECONDS`, is
 served until the first refresh replaces it.
 
+`prewarm()` fills the same stores and calendar once, with no wallet and no chain. A miner started
+afterwards on that volume fetches only the partitions not yet settled, and serves the stored calendar.
+
 No guards: an unservable asset, a data hole, or an exploding path crashes the request so it
 shows up in monitoring instead of silently degrading.
 
@@ -27,6 +30,7 @@ import os
 import threading
 import time
 from datetime import timedelta
+from pathlib import Path
 from typing import Callable
 
 import pandas as pd
@@ -68,6 +72,21 @@ CALENDAR_MAX_AGE_SECONDS = CALENDAR_REFRESH_SECONDS
 CALENDAR_WAIT_SECONDS = 10 * 60
 
 
+def refresh_calendar(root: Path) -> None:
+    """One update of the calendar: a source that fails keeps its rows, and the champion keeps the last view."""
+    now = pd.Timestamp.now(tz="UTC")
+    today = now.date()
+    try:
+        calendar_build.update(
+            root,
+            today - timedelta(days=CALENDAR_HISTORY_DAYS),
+            today + timedelta(days=calendar_build.DAYS_AHEAD),
+            now,
+        )
+    except Exception as exc:
+        logger.warning("calendar refresh failed: %s", exc)
+
+
 class ChampionMiner(Miner):
     """Serves one champion's simulate() over all venue-routed competition assets."""
 
@@ -79,6 +98,13 @@ class ChampionMiner(Miner):
         if type(self).simulate_fn is None:
             raise TypeError("subclass must set simulate_fn (see synth_lib/serving/unpack_champion.py)")
         self._start(servable_assets())
+
+    @classmethod
+    def prewarm(cls) -> None:
+        """One warm-up of every servable asset, then one calendar refresh, into MARKET_DATA_DIR."""
+        warm_up(servable_assets(), cls.context_days)
+        refresh_calendar(MARKET_DATA_DIR)
+        logger.info("prewarm complete")
 
     def _start(self, assets: list[str]) -> None:
         """Binds the stores and starts the background thread. Returns before any venue call, so the
@@ -128,18 +154,7 @@ class ChampionMiner(Miner):
         self._contexts.store_refreshed()
 
     def _refresh_calendar(self) -> None:
-        """One update of the calendar: a source that fails keeps its rows, and the champion keeps the last view."""
-        now = pd.Timestamp.now(tz="UTC")
-        today = now.date()
-        try:
-            calendar_build.update(
-                self._calendar_root,
-                today - timedelta(days=CALENDAR_HISTORY_DAYS),
-                today + timedelta(days=calendar_build.DAYS_AHEAD),
-                now,
-            )
-        except Exception as exc:
-            logger.warning("calendar refresh failed: %s", exc)
+        refresh_calendar(self._calendar_root)
 
     def _refresh_calendar_daily(self) -> None:
         while True:

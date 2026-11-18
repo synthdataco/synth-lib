@@ -78,6 +78,20 @@ def test_an_asset_is_served_as_soon_as_its_own_warm_up_is_done(miner):
     assert _forward(miner, "XAU").simulation_output == ("store:XAU",)
 
 
+def test_prewarm_fills_every_store_then_the_calendar_with_no_chain(monkeypatch, tmp_path):
+    calls: list[tuple] = []
+    monkeypatch.setattr(cm, "MARKET_DATA_DIR", tmp_path / "market_data")
+    monkeypatch.setattr(cm, "servable_assets", lambda: ["BTC", "XAU"])
+    monkeypatch.setattr(cm, "warm_up", lambda assets, context_days: calls.append(("warm_up", assets, context_days)))
+    monkeypatch.setattr(cm.calendar_build, "update", lambda root, start, end, now: calls.append(("calendar", root)))
+
+    class FourteenDays(ChampionMiner):
+        context_days = 14
+
+    FourteenDays.prewarm()  # a classmethod: Miner.__init__, its wallet and its chain never run
+    assert calls == [("warm_up", ["BTC", "XAU"], 14), ("calendar", tmp_path / "market_data")]
+
+
 def test_an_asset_with_no_live_venue_still_fails_loudly(miner):
     miner._start(["BTC"])
     with pytest.raises(KeyError):
