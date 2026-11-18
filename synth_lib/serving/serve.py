@@ -77,9 +77,10 @@ def venue_store(asset: str) -> MinutePriceStore:
 
 
 def servable_assets() -> list[str]:
-    """Every competition asset that has a live venue, in competition order."""
+    """Every competition asset that has a live venue, the shortest horizon's first: the miner warms them up
+    in this order, and the 1h competition's assets are prompted most often."""
     assets: list[str] = []
-    for comp in ALL_COMPETITIONS:
+    for comp in sorted(ALL_COMPETITIONS, key=lambda comp: comp.time_length):
         for asset in comp.asset_list:
             if asset in assets:
                 continue

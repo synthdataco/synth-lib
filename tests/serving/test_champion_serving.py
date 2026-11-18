@@ -12,10 +12,12 @@ import pandas as pd
 import pytest
 from synth.simulation_input import SimulationInput  # type: ignore[import-untyped]
 from synth.validator import response_validation_v2  # type: ignore[import-untyped]
+from synth.validator.competition_config import ALL_COMPETITIONS  # type: ignore[import-untyped]
 
 import synth_lib.serving.serve as serve
 from synth_lib.benchmark.generate_predictions import load_simulate
 from synth_lib.benchmark.verdict.run_verdict import DEFAULT_SEED, HASH_SEED_ENV, SEED_ENV, generation_env
+from synth_lib.serving.champion_miner import ChampionMiner
 from synth_lib.serving.serve import (
     ContextCache,
     build_context,
@@ -271,6 +273,11 @@ def test_venue_routing_never_pyth():
     assert "BTC" in servable_assets()
 
 
+def test_the_1h_competitions_assets_warm_up_first():
+    one_hour = min(ALL_COMPETITIONS, key=lambda comp: comp.time_length)
+    assert servable_assets()[: len(one_hour.asset_list)] == one_hour.asset_list
+
+
 # -- the unpacker, end to end on a synthetic bundle ------------------------------
 
 
@@ -338,6 +345,37 @@ def test_the_entrypoint_pins_the_verdicts_seeds(tmp_path):
     ).stdout.split()
     expected = generation_env(DEFAULT_SEED)
     assert seeds == [expected[SEED_ENV], expected[HASH_SEED_ENV]]
+
+
+@pytest.mark.parametrize("args, chain", [(["--prewarm"], False), ([], True)])
+def test_the_entrypoint_prewarms_without_the_chain(tmp_path, args, chain):
+    dest = unpack("test-camp", "fake", None, _make_bundle(tmp_path), tmp_path / "champions")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "uv").write_text('#!/bin/sh\necho "$@"\n')
+    (bin_dir / "uv").chmod(0o755)
+    command = subprocess.run(
+        ["bash", str(dest / "entrypoint.sh"), *args],
+        env={"PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    assert command[:3] == ["run", "python3.12", str(dest / "miner.py")]
+    assert ("--netuid" in command) is chain and ("--prewarm" in command) is not chain
+
+
+def test_the_generated_miner_prewarms_without_a_wallet(monkeypatch):
+    called: list[str] = []
+    monkeypatch.setattr(ChampionMiner, "prewarm", classmethod(lambda cls: called.append(cls.__name__)))
+    modeling = ModuleType("modeling")
+    modeling.simulate = _recording([])
+    monkeypatch.setitem(sys.modules, "modeling", modeling)
+    monkeypatch.setattr(sys, "argv", ["miner.py", "--prewarm"])
+    source = MINER_TEMPLATE.substitute(name="test", campaign="c", leg="l", class_name="TestMiner")
+    with pytest.raises(SystemExit) as exit_info:
+        exec(compile(source, "miner.py", "exec"), {"__name__": "__main__"})
+    assert exit_info.value.code == 0 and called == ["TestMiner"]
 
 
 def test_unpack_refuses_a_champion_that_fails_the_gate(tmp_path):

@@ -59,6 +59,7 @@ Run via entrypoint.sh, not directly.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 
 from synth_lib.benchmark.generate_predictions import context_days_of
@@ -76,6 +77,9 @@ class $class_name(ChampionMiner):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    if sys.argv[1:] == ["--prewarm"]:
+        $class_name.prewarm()
+        sys.exit(0)
     with $class_name() as miner:
         while True:
             miner.print_info()
@@ -101,6 +105,11 @@ VALIDATOR_MIN_STAKE="$${VALIDATOR_MIN_STAKE:-65000}"
 # response replays offline. PYTHONHASHSEED only works when set before the interpreter starts.
 export SYNTH_BENCHMARK_SEED="$${SYNTH_BENCHMARK_SEED:-0}"
 export PYTHONHASHSEED="$${PYTHONHASHSEED:-0}"
+
+# --prewarm fills market_data/ once, with no wallet and no chain, then exits.
+if [ "$${1:-}" = "--prewarm" ]; then
+    exec uv run python3.12 "$${SCRIPT_DIR}/miner.py" --prewarm
+fi
 
 exec uv run python3.12 "$${SCRIPT_DIR}/miner.py" \\
     --subtensor.network "$$NETWORK" \\
