@@ -1,6 +1,7 @@
 """Competition kinds: the built-in monte-carlo kind, and a kind another package registers through the
 entry-point group, set up and run for one fake-CLI leg."""
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -10,12 +11,15 @@ import yaml
 
 import synth_lib.benchmark.run_campaign as rc
 from synth_lib.benchmark import monte_carlo
+from synth_lib.benchmark.fake_cli import FAKE_MODELING
 from synth_lib.benchmark.campaign import load_campaign
 from synth_lib.benchmark.kinds import KINDS_GROUP, load_kind
 from synth_lib.benchmark.budget import Phase
+from synth_lib.benchmark.nomination import nominated_sha
 from synth_lib.benchmark.run_campaign import run_all, setup_campaign
 from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
-from tests.benchmark.test_driver import HoldAdmin, _cfg, _exited_with, _run
+from tests.benchmark.test_driver import BROKEN_SIBLING_MODELING, HoldAdmin, _cfg, _exited_with, _nominate, _run
+from tests.benchmark.test_nomination import CALENDAR_MODELING, SANDBOX, fake_venv
 
 TOY_KIND = """
 from dataclasses import replace
@@ -35,7 +39,7 @@ def _build_snapshot(data_root, snapshot, cfg):
     (snapshot / "toy.txt").write_text((data_root / "toy_source.txt").read_text())
 
 
-def _probe(agent_dir, snapshot, python_exe):
+def _probe(agent_dir, snapshot, sandbox):
     (agent_dir / "PROBED").write_text(str(snapshot))
     if (agent_dir / "RAISES").exists():
         raise RuntimeError("toy exploded")
@@ -151,7 +155,8 @@ def test_a_registered_kind_sets_up_and_runs_a_fake_leg(tmp_path, toy_kind):
     )
     assert [r.landed for r in results] == [True]
     assert "## LANDING ORDER — toy" in (ws / "agent" / "BUDGET.md").read_text()
-    assert "check interface: toy interface ok" in (ws / "agent" / "BUDGET.md").read_text()
+    sha = nominated_sha(ws / "agent" / "CHAMPION")
+    assert f"check interface at {sha}: toy interface ok" in (ws / "agent" / "BUDGET.md").read_text()
     assert (ws / "agent" / "PROBED").read_text() == str((state.dir / "snapshot").resolve())
 
 
@@ -207,3 +212,39 @@ def test_a_kind_without_its_placeholders_is_refused(tmp_path, toy_kind, target, 
     _register(toy_kind, "bad_toy", "bad", target)
     with pytest.raises(ValueError, match=f"competition kind 'bad': .* has no {re.escape(missing)}"):
         load_kind("bad")
+
+
+def test_the_monte_carlo_probe_checks_the_nominated_commit_not_the_working_tree(tmp_path):
+    run = _run(tmp_path, "lands", HoldAdmin(spend=1.0))
+    snapshot = tmp_path / "snapshot"
+    _nominate(run, BROKEN_SIBLING_MODELING)
+    (run.agent_dir / "modeling.py").write_text(FAKE_MODELING)
+    ok, msg = monte_carlo.KIND.probe(run.agent_dir, snapshot, None)
+    assert ok is False and "missing_sibling" in msg
+
+    _nominate(run, FAKE_MODELING)
+    (run.agent_dir / "modeling.py").write_text(BROKEN_SIBLING_MODELING)
+    ok, msg = monte_carlo.KIND.probe(run.agent_dir, snapshot, None)
+    assert ok is True and msg.startswith("ok (24h + 1h)"), msg
+
+
+def test_the_monte_carlo_probe_runs_in_the_leg_s_sandbox_with_the_workspace_venv(tmp_path, fake_docker):
+    run = _run(tmp_path, "lands", HoldAdmin(spend=1.0))
+    snapshot = tmp_path / "snapshot"
+    (snapshot / CALENDAR_DIR).mkdir(parents=True)
+    (snapshot / CALENDAR_DIR / VIEW_FILE).write_bytes(b"view")
+    _nominate(run, CALENDAR_MODELING)
+    fake_venv(run.workspace / ".venv", {})
+
+    ok, msg = monte_carlo.KIND.probe(run.agent_dir, snapshot, SANDBOX)
+    assert ok is True and msg.startswith("ok (24h + 1h)"), msg
+    [docker_run] = [json.loads(line) for line in fake_docker.read_text().splitlines()]
+    assert f"{CALENDAR_ENV}=/workspace/market_data/{CALENDAR_DIR}/{VIEW_FILE}" in docker_run
+
+
+def test_without_a_workspace_venv_the_monte_carlo_probe_checks_on_the_host_and_says_so(tmp_path, fake_docker):
+    run = _run(tmp_path, "lands", HoldAdmin(spend=1.0))
+    _nominate(run, FAKE_MODELING)
+    ok, msg = monte_carlo.KIND.probe(run.agent_dir, tmp_path / "snapshot", SANDBOX)
+    assert ok is True and msg.endswith(" (checked with the harness's Python: the workspace has no .venv)")
+    assert fake_docker.read_text() == ""

@@ -2,9 +2,11 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from synth_lib.benchmark.campaign import BaselineSpec, CampaignConfig, ModelSpec
 from synth_lib.benchmark.cli_adapters import FakeAdapter
 from synth_lib.benchmark.clock import RunClock
 from synth_lib.benchmark.driver import GPU_PROMPT, MAX_GPU_RELAUNCHES, SESSIONS_DIR, ModelRun
-from synth_lib.benchmark.fake_cli import FAKE_MODELING
+from synth_lib.benchmark.fake_cli import FAKE_MODELING, commit
 from synth_lib.benchmark.gpu_usage import GpuUsage
 from synth_lib.benchmark.monte_carlo import LANDING_ORDER
 
@@ -90,6 +92,7 @@ def _run(tmp_path, scenario: str, admin, cfg=None) -> "ModelRun":
     agent_dir = ws / "agent"
     agent_dir.mkdir(parents=True)
     (agent_dir / "journal.md").write_text("")
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
     model = cfg.models[0]
     adapter = FakeAdapter(model, cfg.proxy_url, "sk-v")
     tracker = BudgetTracker(
@@ -116,6 +119,14 @@ def _run(tmp_path, scenario: str, admin, cfg=None) -> "ModelRun":
         python_exe=sys.executable,
     )
     return run
+
+
+def _nominate(run: ModelRun, modeling: str) -> str:
+    """Commits `modeling` as agent/modeling.py and nominates the commit; returns its sha."""
+    (run.agent_dir / "modeling.py").write_text(modeling)
+    sha = commit(run.workspace)
+    (run.agent_dir / "CHAMPION").write_text(f"sha: {sha}\nagent_dir: agent\nprofiles: [low]\n")
+    return sha
 
 
 def test_collect_bundles_the_workspace_repo(tmp_path):
@@ -168,6 +179,7 @@ def test_collect_bundles_with_a_relative_artifacts_dir(tmp_path, monkeypatch):
 def test_collect_survives_a_workspace_that_is_not_a_repo(tmp_path):
     """Bundling is best-effort: a git failure must not cost us the markdown deliverables."""
     run = _run(tmp_path, "lands", HoldAdmin(spend=0.0))
+    shutil.rmtree(run.workspace / ".git")
     (run.agent_dir / "report.md").write_text("the report")
 
     run._collect()
@@ -223,9 +235,9 @@ def test_probe_note_persists_across_polls(tmp_path):
     # fix (self._probe_note republished on EVERY write_budget_file), the next poll's notes-less
     # write_budget_file() would overwrite the "check interface" note in the final BUDGET.md.
     run = _run(tmp_path, "crashes", RampAdmin(step=0.01))
-    (run.agent_dir / "CHAMPION").write_text("sha: pre\nagent_dir: campaign_f\nprofiles: [low]\nnotes: pre\n")
+    sha = _nominate(run, FAKE_MODELING)
     run.run()
-    assert "check interface" in (run.agent_dir / "BUDGET.md").read_text()
+    assert f"check interface at {sha}: ok" in (run.agent_dir / "BUDGET.md").read_text()
 
 
 def test_initial_budget_file_written_before_first_launch(tmp_path):
@@ -288,7 +300,7 @@ def _nominated(tmp_path, gpu_minutes: float | None, phase: Phase = Phase.NORMAL,
         tmp_path, "lands", HoldAdmin(spend=1.0), cfg=_cfg(tmp_path / "campaigns", min_gpu_minutes=min_gpu_minutes)
     )
     run.gpu = GpuUsage(busy_seconds=60 * (gpu_minutes or 0), error=None if gpu_minutes is not None else "no meter")
-    (run.agent_dir / "CHAMPION").write_text("sha: abc\nagent_dir: agent\nprofiles: [low]\n")
+    _nominate(run, FAKE_MODELING)
     launched: list[str] = []
     run._launch = lambda prompt, resume=False: launched.append(prompt) or object()
     status = BudgetStatus(
@@ -339,9 +351,8 @@ def _exited_with(run: ModelRun, phase: Phase = Phase.NORMAL) -> tuple[bool, list
 def _failed_nomination(tmp_path, spend: float = 1.0) -> ModelRun:
     """A run whose champion failed the interface check when it was nominated."""
     run = _run(tmp_path, "lands", HoldAdmin(spend=spend))
-    (run.agent_dir / "CHAMPION").write_text("sha: abc\nagent_dir: agent\nprofiles: [low]\n")
-    (run.agent_dir / "modeling.py").write_text(BROKEN_SIBLING_MODELING)
-    run._probe_ok = False
+    _nominate(run, BROKEN_SIBLING_MODELING)
+    assert run._probe_interface(run.tracker.status()) and run._probe_ok is False
     return run
 
 
@@ -366,10 +377,49 @@ def test_no_hand_back_once_the_envelope_is_spent(tmp_path):
 
 def test_a_champion_fixed_before_exit_stands(tmp_path):
     run = _failed_nomination(tmp_path)
-    (run.agent_dir / "modeling.py").write_text(FAKE_MODELING)
+    sha = _nominate(run, FAKE_MODELING)
     done, launched = _exited_with(run)
     assert done is True and launched == []
-    assert "check interface: ok" in (run.agent_dir / "BUDGET.md").read_text()
+    assert f"check interface at {sha}: ok" in (run.agent_dir / "BUDGET.md").read_text()
+
+
+def test_a_failed_check_runs_again_at_exit(tmp_path):
+    run = _run(tmp_path, "lands", HoldAdmin(spend=1.0))
+    calls: list[Path] = []
+
+    def busy_then_idle(agent_dir, snapshot, sandbox):
+        calls.append(agent_dir)
+        return (True, "ok") if len(calls) > 1 else (False, "probe timeout after 120.0s")
+
+    run.kind = replace(run.kind, probe=busy_then_idle)
+    _nominate(run, FAKE_MODELING)
+    assert run._probe_interface(run.tracker.status()) and run._probe_ok is False
+    done, launched = _exited_with(run)
+    assert done is True and launched == [] and len(calls) == 2
+
+
+def test_a_fix_outside_the_nominated_commit_is_handed_back(tmp_path):
+    run = _failed_nomination(tmp_path)
+    (run.agent_dir / "modeling.py").write_text(FAKE_MODELING)
+    done, launched = _exited_with(run)
+    assert done is False and "missing_sibling" in launched[0]
+
+
+def test_each_new_nomination_is_checked_once(tmp_path):
+    run = _run(tmp_path, "lands", HoldAdmin(spend=1.0))
+    status = run.tracker.status()
+    assert run._probe_interface(status) is False  # nothing nominated
+
+    first = _nominate(run, FAKE_MODELING)
+    assert run._probe_interface(status) is True and run._probe_ok is True
+    (run.agent_dir / "CHAMPION").write_text(f"sha: {first}\nagent_dir: agent\nprofiles: [low]\nnotes: edited\n")
+    assert run._probe_interface(status) is False
+
+    second = _nominate(run, BROKEN_SIBLING_MODELING)
+    assert run._probe_interface(status) is True and run._probe_ok is False
+    budget = (run.agent_dir / "BUDGET.md").read_text()
+    assert f"check interface at {second}: " in budget and "missing_sibling" in budget
+    assert f"check interface at {first}" not in budget
 
 
 def test_the_gpu_line_reaches_budget_md(tmp_path):

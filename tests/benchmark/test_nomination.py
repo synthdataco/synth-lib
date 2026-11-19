@@ -1,15 +1,23 @@
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from synth_lib.benchmark.fake_cli import commit
 from synth_lib.benchmark.generate_predictions import load_module
 from synth_lib.benchmark.nomination import (
     Champion,
+    checkout_champion,
+    nominated_sha,
     parse_champion,
     probe_all_shapes,
+    probe_in_sandbox,
     probe_simulate,
     probe_simulate_subprocess,
 )
+from synth_lib.benchmark.sandbox.run_sandbox import LegSandbox
 
 TOY_MODELING = """
 def simulate(asset, start_time, time_increment=300, time_length=86400, num_simulations=100,
@@ -237,3 +245,125 @@ def test_probe_subprocess_hands_the_champion_its_calendar(tmp_path):
         tmp_path / "modeling.py", extra_env={"SYNTH_BENCHMARK_CALENDAR": str(tmp_path / "events.parquet")}
     )
     assert ok is True, msg
+
+
+SANDBOX = LegSandbox(image="bench-image", memory_gb=16, cpus=4, gpus=False)
+
+VENV_ONLY_MODELING = "import only_in_venv\n" + TOY_MODELING
+
+
+def fake_venv(venv: Path, modules: dict[str, str]) -> Path:
+    """A workspace venv whose interpreter is the test's, with `modules` importable only through it."""
+    (venv / "bin").mkdir(parents=True)
+    (venv / "site").mkdir()
+    for name, source in modules.items():
+        (venv / "site" / f"{name}.py").write_text(source)
+    python = venv / "bin" / "python"
+    python.write_text(f'#!/bin/sh\nPYTHONPATH="{venv / "site"}" exec "{sys.executable}" "$@"\n')
+    python.chmod(0o755)
+    return venv
+
+
+def _tree(tmp_path: Path, modeling: str) -> Path:
+    tree = tmp_path / "tree"
+    (tree / "agent").mkdir(parents=True)
+    (tree / "agent" / "modeling.py").write_text(modeling)
+    return tree
+
+
+def _calls(log: Path) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+@pytest.mark.parametrize(
+    ("text", "sha"),
+    [
+        ("sha: abc123\nagent_dir: agent\nprofiles: [low]\nnotes: v1\n", "abc123"),
+        ("commit: 412b3b4\nagent_dir: agent\n", "412b3b4"),
+        ("commit: 412b3b4\nprofiles: [low]\nnotes: fan width: k=1.30\n", "412b3b4"),  # not YAML
+        ("sha: 5fbf857\nagent_dir: agent\nentrypoint: champion.main:serve\n", "5fbf857"),
+        ("agent_dir: agent\nprofiles: [low]\n", ""),
+        ("sha:\n", ""),
+        ("", ""),
+    ],
+)
+def test_nominated_sha_reads_the_commit_of_any_kind_s_champion(tmp_path, text, sha):
+    (tmp_path / "CHAMPION").write_text(text)
+    assert nominated_sha(tmp_path / "CHAMPION") == sha
+
+
+def test_checkout_champion_gives_the_tree_of_the_commit(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "agent").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    (ws / "agent" / "modeling.py").write_text("committed\n")
+    sha = commit(ws)
+    (ws / "agent" / "modeling.py").write_text("edited after the commit\n")
+    (ws / "agent" / "scratch.py").write_text("never committed\n")
+
+    checkout_champion(ws, sha, tmp_path / "tree")
+    assert (tmp_path / "tree" / "agent" / "modeling.py").read_text() == "committed\n"
+    assert not (tmp_path / "tree" / "agent" / "scratch.py").exists()
+
+    with pytest.raises(ValueError, match="cannot check out 'deadbeef'"):
+        checkout_champion(ws, "deadbeef", tmp_path / "other")
+
+
+def test_checkout_champion_refuses_a_commit_no_ref_reaches(tmp_path):
+    ws = tmp_path / "ws"
+    (ws / "agent").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    (ws / "agent" / "modeling.py").write_text("v1\n")
+    amended = commit(ws)
+    git = ["git", "-C", str(ws), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "commit", "-q", "--amend", "-m", "amended"], check=True)
+
+    with pytest.raises(ValueError, match=f"cannot check out '{amended}'"):
+        checkout_champion(ws, amended, tmp_path / "tree")
+
+
+def test_the_sandboxed_probe_runs_the_workspace_venv_without_network(tmp_path, fake_docker):
+    tree = _tree(tmp_path, TOY_MODELING)
+    venv = fake_venv(tmp_path / "venv", {})
+    ok, msg = probe_in_sandbox(tree, venv, tmp_path / "snapshot", SANDBOX, {"SYNTH_BENCHMARK_CALENDAR": "/x"})
+    assert ok is True, msg
+
+    [run] = _calls(fake_docker)
+    argv = " ".join(run)
+    assert "--network none" in argv and "--gpus" not in argv
+    assert f"-v {tree}:/workspace:rw" in argv and f"-v {venv}:/workspace/.venv:ro" in argv
+    assert "--memory 16g --cpus 4" in argv
+    assert [run[i + 1] for i, arg in enumerate(run) if arg == "-e"] == [
+        "SYNTH_BENCHMARK_CALENDAR=/x",
+        "PYTHONDONTWRITEBYTECODE=1",
+    ]
+    assert run[-2:] == [
+        "bench-image",
+        "/workspace/.venv/bin/python -m synth_lib.benchmark.nomination /workspace/agent/modeling.py",
+    ]
+
+
+def test_a_package_only_in_the_workspace_venv_passes_in_the_sandbox(tmp_path, fake_docker):
+    tree = _tree(tmp_path, VENV_ONLY_MODELING)
+    venv = fake_venv(tmp_path / "venv", {"only_in_venv": ""})
+
+    ok, msg = probe_in_sandbox(tree, venv, tmp_path / "snapshot", SANDBOX, {})
+    assert ok is True, msg
+    ok, msg = probe_simulate_subprocess(tree / "agent" / "modeling.py")
+    assert ok is False and "No module named 'only_in_venv'" in msg
+
+
+def test_a_package_in_neither_venv_fails_in_the_sandbox_with_its_import_error(tmp_path, fake_docker):
+    tree = _tree(tmp_path, VENV_ONLY_MODELING)
+    ok, msg = probe_in_sandbox(tree, fake_venv(tmp_path / "venv", {}), tmp_path / "snapshot", SANDBOX, {})
+    assert ok is False and msg == "ModuleNotFoundError: No module named 'only_in_venv'"
+
+
+def test_the_sandboxed_probe_times_out_and_removes_its_container(tmp_path, fake_docker):
+    tree = _tree(tmp_path, SLEEPY_MODELING)
+    venv = fake_venv(tmp_path / "venv", {})
+    ok, msg = probe_in_sandbox(tree, venv, tmp_path / "snapshot", SANDBOX, {}, timeout_s=2.0)
+    assert ok is False and msg == "probe timeout after 2.0s"
+
+    run, remove = _calls(fake_docker)
+    assert remove == ["rm", "-f", run[run.index("--name") + 1]]

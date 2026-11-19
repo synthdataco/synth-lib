@@ -43,6 +43,15 @@ def test_sandbox_cmd_without_name_omits_flag():
     assert "--name" not in cmd
 
 
+def test_a_venv_is_mounted_read_only_at_its_workspace_path():
+    kwargs = dict(
+        workspace=Path("/w"), snapshot=Path("/s"), home=Path("/h"), image="i", memory_gb=8, cpus=8, network="none"
+    )
+    joined = " ".join(sandbox_cmd(**kwargs, env={}, inner_cmd="x", venv=Path("/c/runs/claude/.venv")))
+    assert "-v /c/runs/claude/.venv:/workspace/.venv:ro" in joined
+    assert ".venv" not in " ".join(sandbox_cmd(**kwargs, env={}, inner_cmd="x"))
+
+
 def test_network_none_for_verdict():
     cmd = sandbox_cmd(
         workspace=Path("/w"),

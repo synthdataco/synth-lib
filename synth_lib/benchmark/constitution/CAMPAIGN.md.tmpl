@@ -279,6 +279,9 @@ horizon before the window and yours is never treated as late.
    shorter context inside `simulate()` where you want one. The interface check reports the wall
    time of one call at your length.
    Runnable OFFLINE (weights/artifacts committed or included in the workspace).
+   Its dependencies are the ones `pyproject.toml` and `uv.lock` list at the champion's commit
+   (`uv add`, then commit both): the interface check runs your `.venv`, but the scoring rebuilds the
+   environment from those two files, so a package installed any other way is missing there.
 8. **If your model uses randomness at all, seed it from `SYNTH_BENCHMARK_SEED`.** Nothing
    here asks you to introduce randomness — a deterministic champion ignores this rule. If you
    do use it, read the variable once at the top of `simulate()` and seed every generator your
@@ -302,8 +305,9 @@ to the Synth miner community.
   supports: `[low, high]` if you cover both 24h AND 1h (expected), `[low]` if you could only
   handle the 24h. `notes` MUST include your champion's backtested **CRPS per configuration**,
   produced by the official backtester (`agent/predict.py`) at 1000 paths, alongside the CRPS of
-  whatever you started from — a nomination without measured numbers is incomplete. The harness checks the interface as soon as
-  this file appears (result in BUDGET.md) — fix it if the check fails.
+  whatever you started from — a nomination without measured numbers is incomplete. Each time `sha`
+  changes, the harness checks the interface of that commit with your `.venv` (result in BUDGET.md):
+  if the check fails, fix it, commit, and nominate the new commit.
 - `suggestions.md`: anything that falls outside your scope.
 - you must commit all deliverables to your workspace git repo before the deadline.
 

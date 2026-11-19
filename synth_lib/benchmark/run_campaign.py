@@ -25,7 +25,7 @@ from synth_lib.benchmark.clock import RunClock
 from synth_lib.benchmark.driver import ModelRun, RunResult
 from synth_lib.benchmark.kinds import DEFAULT_KIND, load_kind
 from synth_lib.benchmark.metering.keys import LiteLLMAdmin
-from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, image_identity, sandbox_cmd
+from synth_lib.benchmark.sandbox.run_sandbox import DEFAULT_IMAGE, LegSandbox, image_identity, sandbox_cmd
 from synth_lib.benchmark.workspace import create_workspace
 
 SANDBOX_IMAGE = DEFAULT_IMAGE
@@ -48,9 +48,7 @@ def _sandbox_cmd_wrapper(
     home: Path,
     env: dict[str, str],
     container_name: str,
-    memory_gb: int,
-    cpus: int,
-    gpus: bool = True,
+    sandbox: LegSandbox,
 ) -> Callable[[list[str]], list[str]]:
     """cmd_wrapper (spec ModelRun) that wraps the adapter's raw command (launch_cmd OR
     resume_cmd — both go through the same wrapper) in `docker run` via sandbox_cmd."""
@@ -60,14 +58,14 @@ def _sandbox_cmd_wrapper(
             workspace=workspace,
             snapshot=snapshot,
             home=home,
-            image=SANDBOX_IMAGE,
-            memory_gb=memory_gb,
-            cpus=cpus,
+            image=sandbox.image,
+            memory_gb=sandbox.memory_gb,
+            cpus=sandbox.cpus,
             network=SANDBOX_NETWORK,
             env=env,
             inner_cmd=shlex.join(cmd),
             name=container_name,
-            gpus=gpus,
+            gpus=sandbox.gpus,
         )
 
     return wrapper
@@ -200,7 +198,11 @@ def run_all(
             extra_env["FAKE_CLI_AGENT_DIR"] = str(agent_dir.resolve())
         container_name: str | None = None
         cmd_wrapper: Callable[[list[str]], list[str]] | None = None
+        sandbox: LegSandbox | None = None
         if sandboxed:
+            sandbox = LegSandbox(
+                image=SANDBOX_IMAGE, memory_gb=cfg.sandbox_memory_gb, cpus=cfg.sandbox_cpus, gpus=cfg.gpu
+            )
             container_name = f"synthbench-{cfg.name}-{model.id}"
             # HOME=/root INSIDE the container is implicit via mounting `home` onto /root
             # (sandbox_cmd) — the provisioning files above are already written there.
@@ -215,9 +217,7 @@ def run_all(
                     "IS_SANDBOX": "1",
                 },
                 container_name=container_name,
-                memory_gb=cfg.sandbox_memory_gb,
-                cpus=cfg.sandbox_cpus,
-                gpus=cfg.gpu,
+                sandbox=sandbox,
             )
         tracker = BudgetTracker(
             admin=admin,
@@ -238,6 +238,7 @@ def run_all(
             python_exe=python_exe,
             container_name=container_name,
             cmd_wrapper=cmd_wrapper,
+            sandbox=sandbox,
         )
         results.append(run.run())
         data["runs_done"].append(model.id)

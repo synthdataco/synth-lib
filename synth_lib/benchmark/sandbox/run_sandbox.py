@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-
+from dataclasses import dataclass
 from pathlib import Path
 
 # One definition of the image name; override with SYNTH_BENCH_SANDBOX_IMAGE so an operator who
@@ -12,6 +12,18 @@ from pathlib import Path
 DEFAULT_IMAGE = os.environ.get("SYNTH_BENCH_SANDBOX_IMAGE", "synth-bench-sandbox")
 # Where sandbox_cmd mounts the snapshot, read-only.
 SANDBOX_MARKET_DATA = "/workspace/market_data"
+# Where sandbox_cmd mounts a workspace's venv, read-only: the path the agent built it at.
+SANDBOX_VENV = "/workspace/.venv"
+
+
+@dataclass(frozen=True)
+class LegSandbox:
+    """The image and limits a leg's agent runs with."""
+
+    image: str
+    memory_gb: int
+    cpus: int
+    gpus: bool
 
 
 def image_identity(image: str = DEFAULT_IMAGE) -> dict[str, str | None]:
@@ -47,6 +59,7 @@ def sandbox_cmd(
     name: str | None = None,
     gpus: bool = True,
     predictions: Path | None = None,
+    venv: Path | None = None,
 ) -> list[str]:
     # docker requires ABSOLUTE host paths (a relative path is read as a volume name)
     workspace, snapshot, home = workspace.resolve(), snapshot.resolve(), home.resolve()
@@ -79,6 +92,8 @@ def sandbox_cmd(
     if predictions is not None:
         predictions.mkdir(parents=True, exist_ok=True)
         cmd += ["-v", f"{predictions.resolve()}:/workspace/predictions:rw"]
+    if venv is not None:
+        cmd += ["-v", f"{venv.resolve()}:{SANDBOX_VENV}:ro"]
     if name is not None:
         cmd += ["--name", name]
     for k, v in env.items():

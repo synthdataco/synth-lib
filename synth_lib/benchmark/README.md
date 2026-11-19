@@ -87,7 +87,9 @@ A campaign names its kind (`kind:` in campaign.yaml, default `monte-carlo`): wha
 and how the engine prepares and checks it. A kind (`kinds.CompetitionKind`) supplies the constitution
 template, the workspace scaffold and its pins, the snapshot and DATA.md, the sandbox environment and
 the check before `run`, the champion's interface probe, and the texts that hand a nomination back and
-order the landing. `monte-carlo` is the sampled-paths kind this README describes.
+order the landing. `monte-carlo` is the sampled-paths kind this README describes. The driver calls
+the probe each time `agent/CHAMPION` names a new commit, with the leg's sandbox (`LegSandbox`, None when
+the leg runs on the host).
 
 Another package adds a kind by registering a `CompetitionKind` under the `synth_lib.benchmark.kinds`
 entry-point group in its own pyproject; a campaign then sets `kind:` and that kind's `primary_metric`.

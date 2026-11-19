@@ -1,17 +1,19 @@
 """Simulated agent for testing the driver without an LLM.
 
 Scenarios (env FAKE_CLI_SCENARIO):
-  lands           : journals on each tick; on the landing order, writes report.md + CHAMPION then exit 0.
+  lands           : journals on each tick; on the landing order, writes report.md, commits, nominates the
+                    commit in CHAMPION, then exit 0.
   ignores_landing : journals but never lands (tests kill + relaunch).
   crashes         : exit 1 after 2 ticks (tests the resume).
   silent          : produces nothing (tests the did-not-land).
   stops_early     : if BUDGET.md already orders landing, lands; otherwise journals once
                     and exits 0 (tests the voluntary stop, distinct from a crash).
-Env: FAKE_CLI_AGENT_DIR (agent workspace), FAKE_CLI_TICK_SECONDS (default 0.1).
+Env: FAKE_CLI_AGENT_DIR (agent/ in a workspace git repo), FAKE_CLI_TICK_SECONDS (default 0.1).
 A prompt containing "LANDING ORDER" forces immediate landing mode (landing-only relaunch).
 """
 
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,6 +27,27 @@ FAKE_MODELING = (
 )
 
 
+def commit(workspace: Path) -> str:
+    """Commits everything in the workspace repo; returns the commit's sha."""
+    git = ["git", "-C", str(workspace)]
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run(
+        [
+            *git,
+            "-c",
+            "user.email=fake@campaign.local",
+            "-c",
+            "user.name=fake-cli",
+            "commit",
+            "-qm",
+            "champion",
+            "--allow-empty",
+        ],
+        check=True,
+    )
+    return subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+
+
 def main() -> int:
     scenario = os.environ.get("FAKE_CLI_SCENARIO", "lands")
     agent_dir = Path(os.environ["FAKE_CLI_AGENT_DIR"])
@@ -36,9 +59,8 @@ def main() -> int:
     def land() -> int:
         (agent_dir / "report.md").write_text("# Report\n\nHonest results.\n")
         (agent_dir / "modeling.py").write_text(FAKE_MODELING)
-        (agent_dir / "CHAMPION").write_text(
-            f"sha: deadbeef\nagent_dir: {agent_dir.name}\nprofiles: [low]\nnotes: fake\n"
-        )
+        sha = commit(agent_dir.parent)
+        (agent_dir / "CHAMPION").write_text(f"sha: {sha}\nagent_dir: {agent_dir.name}\nprofiles: [low]\nnotes: fake\n")
         with journal.open("a") as fh:
             fh.write("\n## Landing\ndone.\n")
         return 0
