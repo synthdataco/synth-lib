@@ -280,8 +280,10 @@ horizon before the window and yours is never treated as late.
    time of one call at your length.
    Runnable OFFLINE (weights/artifacts committed or included in the workspace).
    Its dependencies are the ones `pyproject.toml` and `uv.lock` list at the champion's commit
-   (`uv add`, then commit both): the interface check runs your `.venv`, but the scoring rebuilds the
-   environment from those two files, so a package installed any other way is missing there.
+   (`uv add`, then commit both): the scoring rebuilds the environment from those two files, so a
+   package installed any other way is missing there. The interface check runs your `.venv`, and fails
+   when it holds a package `uv.lock` does not list or lists at another version (`uv sync` makes it
+   match), or when the commit has no `uv.lock`.
 8. **If your model uses randomness at all, seed it from `SYNTH_BENCHMARK_SEED`.** Nothing
    here asks you to introduce randomness — a deterministic champion ignores this rule. If you
    do use it, read the variable once at the top of `simulate()` and seed every generator your

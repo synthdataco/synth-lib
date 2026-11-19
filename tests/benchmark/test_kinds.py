@@ -19,7 +19,7 @@ from synth_lib.benchmark.nomination import nominated_sha
 from synth_lib.benchmark.run_campaign import run_all, setup_campaign
 from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 from tests.benchmark.test_driver import BROKEN_SIBLING_MODELING, HoldAdmin, _cfg, _exited_with, _nominate, _run
-from tests.benchmark.test_nomination import CALENDAR_MODELING, SANDBOX, fake_venv
+from tests.benchmark.test_nomination import CALENDAR_MODELING, SANDBOX, fake_venv, lockfile
 
 TOY_KIND = """
 from dataclasses import replace
@@ -233,6 +233,7 @@ def test_the_monte_carlo_probe_runs_in_the_leg_s_sandbox_with_the_workspace_venv
     snapshot = tmp_path / "snapshot"
     (snapshot / CALENDAR_DIR).mkdir(parents=True)
     (snapshot / CALENDAR_DIR / VIEW_FILE).write_bytes(b"view")
+    (run.workspace / "uv.lock").write_text(lockfile([]))
     _nominate(run, CALENDAR_MODELING)
     fake_venv(run.workspace / ".venv", {})
 

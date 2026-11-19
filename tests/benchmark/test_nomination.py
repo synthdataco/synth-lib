@@ -16,6 +16,7 @@ from synth_lib.benchmark.nomination import (
     probe_in_sandbox,
     probe_simulate,
     probe_simulate_subprocess,
+    venv_differences,
 )
 from synth_lib.benchmark.sandbox.run_sandbox import LegSandbox
 
@@ -252,22 +253,51 @@ SANDBOX = LegSandbox(image="bench-image", memory_gb=16, cpus=4, gpus=False)
 VENV_ONLY_MODELING = "import only_in_venv\n" + TOY_MODELING
 
 
+def site_packages(venv: Path) -> Path:
+    return venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+
+
+def install_distribution(venv: Path, name: str, files: dict[str, str], version: str = "1.0") -> None:
+    """Records in `venv` an installed distribution `name` at `version` that wrote `files` into site-packages."""
+    site = site_packages(venv)
+    info = site / f"{name}-{version}.dist-info"
+    info.mkdir(parents=True)
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+    for path, text in files.items():
+        (site / path).parent.mkdir(parents=True, exist_ok=True)
+        (site / path).write_text(text)
+    record = [*files, f"{info.name}/METADATA", f"{info.name}/RECORD"]
+    (info / "RECORD").write_text("".join(f"{path},,\n" for path in record))
+
+
 def fake_venv(venv: Path, modules: dict[str, str]) -> Path:
-    """A workspace venv whose interpreter is the test's, with `modules` importable only through it."""
-    (venv / "bin").mkdir(parents=True)
-    (venv / "site").mkdir()
+    """A uv venv whose interpreter is the test's, with `modules` importable only through it, each installed as a
+    distribution of its name at version 1.0."""
+    site = site_packages(venv)
+    (site / "__pycache__").mkdir(parents=True)
+    (site / "_virtualenv.py").write_text("")
+    (site / "_virtualenv.pth").write_text("import _virtualenv\n")
     for name, source in modules.items():
-        (venv / "site" / f"{name}.py").write_text(source)
+        install_distribution(venv, name, {f"{name}.py": source})
+    (venv / "bin").mkdir()
     python = venv / "bin" / "python"
-    python.write_text(f'#!/bin/sh\nPYTHONPATH="{venv / "site"}" exec "{sys.executable}" "$@"\n')
+    python.write_text(f'#!/bin/sh\nPYTHONPATH="{site}" exec "{sys.executable}" "$@"\n')
     python.chmod(0o755)
     return venv
 
 
-def _tree(tmp_path: Path, modeling: str) -> Path:
+def lockfile(packages: list[str], version: str = "1.0") -> str:
+    """A uv.lock listing `packages` at `version`."""
+    entries = "".join(f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n' for name in packages)
+    return f'version = 1\nrevision = 3\nrequires-python = ">=3.12"\n{entries}'
+
+
+def _tree(tmp_path: Path, modeling: str, locked: list[str] | None = None) -> Path:
     tree = tmp_path / "tree"
     (tree / "agent").mkdir(parents=True)
     (tree / "agent" / "modeling.py").write_text(modeling)
+    if locked is not None:
+        (tree / "uv.lock").write_text(lockfile(locked))
     return tree
 
 
@@ -323,7 +353,7 @@ def test_checkout_champion_refuses_a_commit_no_ref_reaches(tmp_path):
 
 
 def test_the_sandboxed_probe_runs_the_workspace_venv_without_network(tmp_path, fake_docker):
-    tree = _tree(tmp_path, TOY_MODELING)
+    tree = _tree(tmp_path, TOY_MODELING, locked=[])
     venv = fake_venv(tmp_path / "venv", {})
     ok, msg = probe_in_sandbox(tree, venv, tmp_path / "snapshot", SANDBOX, {"SYNTH_BENCHMARK_CALENDAR": "/x"})
     assert ok is True, msg
@@ -343,8 +373,8 @@ def test_the_sandboxed_probe_runs_the_workspace_venv_without_network(tmp_path, f
     ]
 
 
-def test_a_package_only_in_the_workspace_venv_passes_in_the_sandbox(tmp_path, fake_docker):
-    tree = _tree(tmp_path, VENV_ONLY_MODELING)
+def test_a_package_in_the_workspace_venv_and_its_lock_passes_in_the_sandbox(tmp_path, fake_docker):
+    tree = _tree(tmp_path, VENV_ONLY_MODELING, locked=["only-in-venv"])
     venv = fake_venv(tmp_path / "venv", {"only_in_venv": ""})
 
     ok, msg = probe_in_sandbox(tree, venv, tmp_path / "snapshot", SANDBOX, {})
@@ -353,14 +383,59 @@ def test_a_package_only_in_the_workspace_venv_passes_in_the_sandbox(tmp_path, fa
     assert ok is False and "No module named 'only_in_venv'" in msg
 
 
-def test_a_package_in_neither_venv_fails_in_the_sandbox_with_its_import_error(tmp_path, fake_docker):
+@pytest.mark.parametrize(
+    ("locked", "version", "difference"),
+    [([], "1.0", "only-in-venv is not in uv.lock"), (["only-in-venv"], "2.0", "only-in-venv is 1.0, uv.lock has 2.0")],
+)
+def test_a_venv_that_differs_from_uv_lock_fails_the_check_without_a_container(
+    tmp_path, fake_docker, locked, version, difference
+):
+    venv = fake_venv(tmp_path / "venv", {"only_in_venv": ""})
     tree = _tree(tmp_path, VENV_ONLY_MODELING)
+    (tree / "uv.lock").write_text(lockfile(locked, version))
+
+    ok, msg = probe_in_sandbox(tree, venv, tmp_path / "snapshot", SANDBOX, {})
+    assert ok is False and msg.startswith(".venv differs from the uv.lock of the nominated commit")
+    assert f": {difference}. `uv add`" in msg
+    assert fake_docker.read_text() == ""
+
+
+def test_a_nominated_commit_without_uv_lock_fails_the_check(tmp_path, fake_docker):
+    venv = fake_venv(tmp_path / "venv", {})
+    ok, msg = probe_in_sandbox(_tree(tmp_path, TOY_MODELING), venv, tmp_path / "snapshot", SANDBOX, {})
+    assert ok is False and msg.startswith("uv.lock is not in the nominated commit")
+    assert fake_docker.read_text() == ""
+
+
+def test_venv_differences_names_what_uv_lock_would_not_install(tmp_path):
+    venv = fake_venv(tmp_path / "venv", {})
+    install_distribution(venv, "Foo_Bar", {"foo_bar.py": ""})
+    install_distribution(venv, "zope.interface", {"zope/interface/__init__.py": ""})
+    install_distribution(venv, "forked", {"forked.py": ""}, version="2.0")
+    install_distribution(venv, "workspace", {"_workspace.pth": "/workspace/src\n"}, version="0.3.0")
+    install_distribution(venv, "extra", {"extra.py": ""})
+    (site_packages(venv) / "vendor.pth").write_text("/workspace/vendor\n")
+    (site_packages(venv) / "copied").mkdir()
+    lock = lockfile(["foo-bar", "zope-interface", "forked", "locked-not-installed"])
+    lock += '\n[[package]]\nname = "forked"\nversion = "2.0"\n'
+    lock += '\n[[package]]\nname = "workspace"\nsource = { editable = "." }\n'
+    (tmp_path / "uv.lock").write_text(lock)
+
+    assert venv_differences(venv, tmp_path / "uv.lock") == [
+        "extra is not in uv.lock",
+        "site-packages/copied is from no package",
+        "site-packages/vendor.pth is from no package",
+    ]
+
+
+def test_a_package_in_neither_venv_fails_in_the_sandbox_with_its_import_error(tmp_path, fake_docker):
+    tree = _tree(tmp_path, VENV_ONLY_MODELING, locked=[])
     ok, msg = probe_in_sandbox(tree, fake_venv(tmp_path / "venv", {}), tmp_path / "snapshot", SANDBOX, {})
     assert ok is False and msg == "ModuleNotFoundError: No module named 'only_in_venv'"
 
 
 def test_the_sandboxed_probe_times_out_and_removes_its_container(tmp_path, fake_docker):
-    tree = _tree(tmp_path, SLEEPY_MODELING)
+    tree = _tree(tmp_path, SLEEPY_MODELING, locked=[])
     venv = fake_venv(tmp_path / "venv", {})
     ok, msg = probe_in_sandbox(tree, venv, tmp_path / "snapshot", SANDBOX, {}, timeout_s=2.0)
     assert ok is False and msg == "probe timeout after 2.0s"
