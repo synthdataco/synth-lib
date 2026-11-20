@@ -19,6 +19,8 @@ from synth_lib.benchmark.campaign import CampaignConfig, ModelSpec
 from synth_lib.benchmark.cli_adapters import CLIAdapter
 from synth_lib.benchmark.gpu_usage import GpuUsage
 from synth_lib.benchmark.kinds import load_kind
+from synth_lib.benchmark.nomination import nominated_sha
+from synth_lib.benchmark.sandbox.run_sandbox import LegSandbox
 
 INITIAL_PROMPT = "Read the CAMPAIGN.md file in your agent folder and start your research campaign."
 RESUME_PROMPT = (
@@ -98,6 +100,7 @@ class ModelRun:
         python_exe: str = "python",
         container_name: str | None = None,
         cmd_wrapper: Callable[[list[str]], list[str]] | None = None,
+        sandbox: LegSandbox | None = None,
     ):
         self.cfg = cfg
         self.kind = load_kind(cfg.kind)
@@ -114,6 +117,8 @@ class ModelRun:
         # command (e.g. via sandbox_cmd) when sandboxed=True, identity otherwise.
         self.container_name = container_name
         self.cmd_wrapper = cmd_wrapper or (lambda cmd: cmd)
+        # The leg's sandbox, handed to the kind's probe; None when the leg runs on the host.
+        self.sandbox = sandbox
         # Continue transcript numbering after any existing files: a rerun used to restart at 0
         # and OVERWRITE the previous attempt's transcripts one by one (the stale-transcript trap,
         # the restart runbook) — now each attempt appends to the leg's audit trail instead.
@@ -123,8 +128,10 @@ class ModelRun:
             if (m := re.fullmatch(r"transcript-(\d+)\.log", p.name))
         ]
         self._transcripts = max(existing, default=-1) + 1
+        self._probe_msg = ""
         self._probe_note = ""
         self._probe_ok: bool | None = None
+        self._probed_sha: str | None = None
         self._interface_relaunches = 0
         self.gpu = GpuUsage() if cfg.gpu else None
         self._gpu_relaunches = 0
@@ -256,29 +263,38 @@ class ModelRun:
             and self._gpu_relaunches < MAX_GPU_RELAUNCHES
         )
 
-    def _probe_interface(self, status: BudgetStatus) -> None:
-        """Checks the nominated champion's interface once, with the kind's probe, and logs the result.
-        The result is memoized on the instance (self._probe_note): once known, it must stay visible
-        in BUDGET.md on every subsequent poll, not just the one where the probe ran."""
+    def _probe_interface(self, status: BudgetStatus) -> bool:
+        """Checks the champion agent/CHAMPION nominates, with the kind's probe, when it names a commit
+        not checked yet; True when the check ran. The result is memoized on the instance
+        (self._probe_note): once known, it must stay visible in BUDGET.md on every subsequent poll,
+        not just the one where the probe ran."""
+        champion = self._champion()
+        if champion is None:
+            return False
+        sha = nominated_sha(champion)
+        if sha == self._probed_sha:
+            return False
+        self._probed_sha = sha
         try:
-            ok, msg = self.kind.probe(self.agent_dir, (self.cfg.dir / "snapshot").resolve(), self.python_exe)
+            ok, msg = self.kind.probe(self.agent_dir, (self.cfg.dir / "snapshot").resolve(), self.sandbox)
         except Exception as exc:
             ok, msg = False, f"the check raised {type(exc).__name__}: {exc}"
         # msg on success too: it names what passed.
-        self._probe_ok = ok
-        self._probe_note = f"check interface: {msg}"
+        self._probe_ok, self._probe_msg = ok, msg
+        self._probe_note = f"check interface at {sha}: {msg}" if sha else f"check interface: {msg}"
         self.tracker.write_budget_file(self.agent_dir, status, notes=self._notes())
+        return True
 
     def _fails_interface(self, status: BudgetStatus) -> bool:
-        """A nomination whose interface check failed, re-checked as it stands at exit: True while it
-        still fails and can be handed back within the envelope."""
-        if self._probe_ok is not False:
-            return False
-        self._probe_interface(status)
-        self._log(f"champion re-checked at exit; {self._probe_note}")
+        """A nomination whose interface check fails at the commit agent/CHAMPION names at exit, checked
+        now when it is new or failed before: True while it can be handed back within the envelope."""
+        if self._probe_ok is False:
+            self._probed_sha = None
+        if self._probe_interface(status):
+            self._log(f"champion checked at exit; {self._probe_note}")
         if self._probe_ok is not False or self._interface_relaunches >= MAX_INTERFACE_RELAUNCHES:
             return False
-        # The re-check can take the probe's whole timeout, so the envelope is read again after it.
+        # The check can take the probe's whole timeout, so the envelope is read again after it.
         return self.tracker.status().phase is not Phase.EXHAUSTED
 
     def _handle_exit(
@@ -304,7 +320,7 @@ class ModelRun:
                     f"champion fails the interface check: relaunching "
                     f"({self._interface_relaunches}/{MAX_INTERFACE_RELAUNCHES})"
                 )
-                check = self._probe_note.removeprefix("check interface: ")[:600]
+                check = self._probe_msg[:600]
                 prompt = self.kind.interface_prompt.replace("{check}", check)
                 return False, self._launch(prompt, resume=True), crash_resumes, voluntary_resumes + 1
             self._log("clean landing: process exited with agent/CHAMPION present")
@@ -345,7 +361,6 @@ class ModelRun:
         voluntary_resumes = 0
         landing_relaunches = 0
         landing_ordered_at: float | None = None
-        probed = False
         last_decile = -1
         while True:
             time.sleep(self.cfg.poll_seconds)
@@ -360,9 +375,7 @@ class ModelRun:
                     f"spend ${status.spend_usd:.2f} ({status.pct_usd:.0%}) time {status.elapsed_s / 3600:.1f}h "
                     f"({status.pct_time:.0%}) phase={status.phase.value}"
                 )
-            if not probed and self._champion() is not None:
-                probed = True
-                self._probe_interface(status)
+            if self._probe_interface(status):
                 self._log(f"champion nominated; {self._probe_note}")
             if status.phase is Phase.EXHAUSTED:
                 self._log("envelope EXHAUSTED: killing the leg")

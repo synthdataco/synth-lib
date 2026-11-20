@@ -12,6 +12,8 @@ from importlib.metadata import entry_points
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from synth_lib.benchmark.sandbox.run_sandbox import LegSandbox
+
 if TYPE_CHECKING:
     from synth_lib.benchmark.campaign import CampaignConfig
 
@@ -38,10 +40,12 @@ class CompetitionKind:
     sandbox_env: Callable[[Path], dict[str, str]]
     # (snapshot) raises SystemExit when `run` must not start.
     require_ready: Callable[[Path], object]
-    # (agent_dir, snapshot, python_exe) -> (ok, message): the nominated champion's interface check. Runs
-    # the champion out of process, with none of the host's secrets in its environment, and returns within
-    # a bounded time: the driver calls it in its poll loop. An exception counts as a failed check.
-    probe: Callable[[Path, Path, str], tuple[bool, str]]
+    # (agent_dir, snapshot, sandbox) -> (ok, message): the interface check of the champion agent_dir/CHAMPION
+    # nominates, at the commit it names. `sandbox` is the leg's, None when the leg runs on the host. Runs the
+    # champion out of process, with none of the host's secrets in its environment, and returns within a
+    # bounded time: the driver calls it in its poll loop, once per commit nominated. An exception counts as
+    # a failed check.
+    probe: Callable[[Path, Path, LegSandbox | None], tuple[bool, str]]
     # Hands back a nomination that fails the probe. Must contain `{check}`, replaced by the probe's message.
     interface_prompt: str
     # BUDGET.md's landing section. Must contain "LANDING ORDER": the CLI goal condition and the fake

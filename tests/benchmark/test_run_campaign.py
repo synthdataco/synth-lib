@@ -13,6 +13,7 @@ from synth_lib.benchmark.monte_carlo import (
     require_offline_bundle,
 )
 from synth_lib.benchmark.run_campaign import CampaignState
+from synth_lib.benchmark.sandbox.run_sandbox import LegSandbox
 from synth_lib.preparation.event_calendar.events import CALENDAR_ENV
 
 
@@ -274,6 +275,9 @@ def test_run_all_sandboxed_wires_container_and_wrapper(tmp_path, monkeypatch):
 
     kwargs = captured["kwargs"]
     assert kwargs["container_name"] == "synthbench-camp-f"
+    assert kwargs["sandbox"] == LegSandbox(
+        image=rc.SANDBOX_IMAGE, memory_gb=cfg.sandbox_memory_gb, cpus=cfg.sandbox_cpus, gpus=cfg.gpu
+    )
     wrapped = kwargs["cmd_wrapper"](["echo", "hi"])
     assert wrapped[0] == "docker"
     assert "--name" in wrapped and "synthbench-camp-f" in wrapped

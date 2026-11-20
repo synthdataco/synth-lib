@@ -5,8 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,7 @@ import pandas as pd
 import yaml
 
 from synth_lib.benchmark.generate_predictions import context_days_of, context_slice, load_module
+from synth_lib.benchmark.sandbox.run_sandbox import SANDBOX_VENV, LegSandbox, sandbox_cmd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -58,12 +61,16 @@ def _parse_champion_lenient(text: str) -> dict:
     return raw
 
 
-def parse_champion(path: Path) -> Champion:
+def _champion_fields(path: Path) -> dict:
     text = path.read_text()
     try:
-        raw = yaml.safe_load(text)
+        return yaml.safe_load(text)
     except yaml.YAMLError:
-        raw = _parse_champion_lenient(text)
+        return _parse_champion_lenient(text)
+
+
+def parse_champion(path: Path) -> Champion:
+    raw = _champion_fields(path)
     # `commit` accepted as an alias for `sha`: agents have nominated with that key, and
     # archived CHAMPION files are the agent's verbatim deliverable — tolerate here, never edit them.
     sha = raw["sha"] if "sha" in raw else raw["commit"]
@@ -73,6 +80,27 @@ def parse_champion(path: Path) -> Champion:
         profiles=tuple(raw["profiles"]),
         notes=str(raw.get("notes", "")),
     )
+
+
+def nominated_sha(path: Path) -> str:
+    """The commit a CHAMPION file of any kind names: its `sha`, or `commit`; "" when it names none."""
+    raw = _champion_fields(path)
+    if not isinstance(raw, dict):
+        return ""
+    sha = raw.get("sha", raw.get("commit"))
+    return "" if sha is None else str(sha)
+
+
+def checkout_champion(workspace: Path, sha: str, dest: Path) -> None:
+    """The tree of the workspace repo at commit `sha`, in `dest`, cloned with only the objects its refs reach,
+    as the verdict clones the workspace bundle. ValueError with git's message when it cannot."""
+    for cmd in (
+        ["git", "clone", "-q", "--no-local", "--no-checkout", str(workspace), str(dest)],
+        ["git", "-C", str(dest), "checkout", "-q", sha],
+    ):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise ValueError(f"cannot check out {sha!r}: {result.stderr.strip()[-500:]}")
 
 
 def load_simulate(modeling_path: Path):
@@ -155,8 +183,7 @@ def probe_simulate_subprocess(
     host's secrets) and a hard timeout. `extra_env` adds what the champion is entitled to, such as
     the path of the snapshot's calendar.
 
-    Honest note: this does NOT cut off the network — real network isolation comes with the
-    sandbox wiring (Task 14), which launches this same probe via `docker --network none`.
+    It does not cut off the network: probe_in_sandbox does.
     """
     env = {
         "PATH": os.environ["PATH"],
@@ -174,6 +201,50 @@ def probe_simulate_subprocess(
         )
     except subprocess.TimeoutExpired:
         return False, f"probe timeout after {timeout_s}s"
+    return _probe_outcome(result)
+
+
+def probe_in_sandbox(
+    tree: Path,
+    venv: Path,
+    snapshot: Path,
+    sandbox: LegSandbox,
+    env: dict[str, str],
+    timeout_s: float = 120.0,
+) -> tuple[bool, str]:
+    """probe_simulate_subprocess in the leg's sandbox, without network: `tree` mounted as the workspace, `venv`
+    read-only at its place in it, and the venv's interpreter running the champion. `env` holds sandbox paths.
+    Files the container leaves in its home are removed where the host user can."""
+    home = Path(tempfile.mkdtemp(prefix="synthbench-probe-"))
+    name = home.name
+    try:
+        cmd = sandbox_cmd(
+            workspace=tree,
+            snapshot=snapshot,
+            home=home,
+            image=sandbox.image,
+            memory_gb=sandbox.memory_gb,
+            cpus=sandbox.cpus,
+            network="none",
+            env={**env, "PYTHONDONTWRITEBYTECODE": "1"},
+            inner_cmd=f"{SANDBOX_VENV}/bin/python -m synth_lib.benchmark.nomination /workspace/agent/modeling.py",
+            name=name,
+            gpus=sandbox.gpus,
+            venv=venv,
+        )
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            # The container outlives its `docker run` client.
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+            return False, f"probe timeout after {timeout_s}s"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+    return _probe_outcome(result)
+
+
+def _probe_outcome(result: subprocess.CompletedProcess) -> tuple[bool, str]:
+    """The JSON line `_main` prints, or the end of stderr when there is none."""
     if result.returncode != 0:
         return False, result.stderr.decode(errors="replace")[-2000:]
     for line in result.stdout.decode(errors="replace").splitlines():

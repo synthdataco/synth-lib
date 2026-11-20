@@ -3,14 +3,21 @@ com-equ-24h. Registered under `monte-carlo` in pyproject.toml's entry points."""
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 
 from synth_lib.backtester.field_store import REWARDS_DIR, SCORES_DIR
 from synth_lib.benchmark import workspace
 from synth_lib.benchmark.campaign import PRIMARY_METRIC, CampaignConfig
 from synth_lib.benchmark.kinds import CompetitionKind
-from synth_lib.benchmark.nomination import probe_simulate_subprocess
-from synth_lib.benchmark.sandbox.run_sandbox import SANDBOX_MARKET_DATA
+from synth_lib.benchmark.nomination import (
+    checkout_champion,
+    parse_champion,
+    probe_in_sandbox,
+    probe_simulate_subprocess,
+)
+from synth_lib.benchmark.sandbox.run_sandbox import SANDBOX_MARKET_DATA, LegSandbox
 from synth_lib.benchmark.snapshot import build_snapshot, render_data_md
 from synth_lib.preparation.event_calendar.events import CALENDAR_DIR, CALENDAR_ENV, VIEW_FILE
 
@@ -27,8 +34,8 @@ LANDING_ORDER = (
 )
 INTERFACE_PROMPT = (
     "Your nomination does not stand yet: the harness called agent/modeling.py's simulate() on both "
-    "prompt formats and got: {check}. Fix it, run no new experiments, and nominate again. BUDGET.md "
-    "shows the check."
+    "prompt formats, at the commit agent/CHAMPION names, and got: {check}. Fix it, run no new experiments, "
+    "commit, and nominate the new commit. BUDGET.md shows the check."
 )
 # The bundle's subdirectory inside the snapshot.
 OFFLINE_BUNDLE_DIR = "offline_data"
@@ -89,15 +96,29 @@ def _sandbox_env(snapshot: Path) -> dict[str, str]:
     return {**offline_bundle_env(snapshot), **calendar_env(snapshot)}
 
 
-def _probe(agent_dir: Path, snapshot: Path, python_exe: str) -> tuple[bool, str]:
-    """simulate() on both prompt formats, with the snapshot's calendar when it froze one, out of process
-    with a timeout and without the host's secrets (synth_lib.benchmark.nomination.probe_simulate_subprocess)."""
-    calendar = snapshot / CALENDAR_DIR / VIEW_FILE
-    return probe_simulate_subprocess(
-        agent_dir / "modeling.py",
-        python_exe=python_exe,
-        extra_env={CALENDAR_ENV: str(calendar.resolve())} if calendar.exists() else None,
-    )
+def _probe(agent_dir: Path, snapshot: Path, sandbox: LegSandbox | None) -> tuple[bool, str]:
+    """simulate() on both prompt formats, in the tree of the commit agent/CHAMPION names, with the snapshot's
+    calendar when it froze one, out of process with a timeout and without the host's secrets: in the leg's
+    sandbox with the workspace's .venv, or with the harness's interpreter when the leg has no sandbox or the
+    workspace no .venv. Files the sandbox leaves in the checked-out tree are removed where the host user can."""
+    workspace = agent_dir.parent
+    venv = workspace / ".venv"
+    sha = parse_champion(agent_dir / "CHAMPION").sha
+    tree = Path(tempfile.mkdtemp(prefix="synthbench-probe-")) / "workspace"
+    try:
+        checkout_champion(workspace, sha, tree)
+        if sandbox is not None and venv.is_dir():
+            return probe_in_sandbox(tree, venv, snapshot, sandbox, calendar_env(snapshot))
+        calendar = snapshot / CALENDAR_DIR / VIEW_FILE
+        ok, msg = probe_simulate_subprocess(
+            tree / "agent" / "modeling.py",
+            extra_env={CALENDAR_ENV: str(calendar.resolve())} if calendar.exists() else None,
+        )
+    finally:
+        shutil.rmtree(tree.parent, ignore_errors=True)
+    if sandbox is not None:
+        msg += " (checked with the harness's Python: the workspace has no .venv)"
+    return ok, msg
 
 
 KIND = CompetitionKind(
