@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -21,6 +24,8 @@ from synth_lib.benchmark.generate_predictions import context_days_of, context_sl
 from synth_lib.benchmark.sandbox.run_sandbox import SANDBOX_VENV, LegSandbox, sandbox_cmd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# Top-level site-packages entries of a uv venv that no distribution records: uv's venv files and the bytecode cache.
+UV_VENV_FILES = frozenset({"__pycache__", "_virtualenv.pth", "_virtualenv.py"})
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,37 @@ def checkout_champion(workspace: Path, sha: str, dest: Path) -> None:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise ValueError(f"cannot check out {sha!r}: {result.stderr.strip()[-500:]}")
+
+
+def _normalized(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def venv_differences(venv: Path, lockfile: Path) -> list[str]:
+    """How `venv` differs from the environment `lockfile` installs: distributions it does not list or lists at
+    another version, and site-packages entries no distribution installed."""
+    locked: dict[str, set[str]] = {}
+    for package in tomllib.loads(lockfile.read_text()).get("package", []):
+        locked.setdefault(_normalized(package["name"]), set()).add(package.get("version", ""))
+    sites = sorted(venv.glob("lib/python3*/site-packages"))
+    differences = []
+    owned = set(UV_VENV_FILES)
+    dists = importlib.metadata.distributions(path=[str(site) for site in sites])
+    for dist in sorted(dists, key=lambda dist: dist.metadata["Name"] or ""):
+        name = _normalized(dist.metadata["Name"] or "")
+        versions = locked.get(name)
+        if versions is None:
+            differences.append(f"{name} is not in uv.lock")
+        elif "" not in versions and dist.version not in versions:
+            differences.append(f"{name} is {dist.version}, uv.lock has {' or '.join(sorted(versions))}")
+        owned.update(file.parts[0] for file in dist.files or [])
+    for site in sites:
+        differences += [
+            f"site-packages/{entry.name} is from no package"
+            for entry in sorted(site.iterdir())
+            if entry.name not in owned
+        ]
+    return differences
 
 
 def load_simulate(modeling_path: Path):
@@ -214,7 +250,21 @@ def probe_in_sandbox(
 ) -> tuple[bool, str]:
     """probe_simulate_subprocess in the leg's sandbox, without network: `tree` mounted as the workspace, `venv`
     read-only at its place in it, and the venv's interpreter running the champion. `env` holds sandbox paths.
+    Fails without starting the container when the tree has no uv.lock or `venv` differs from what it installs.
     Files the container leaves in its home are removed where the host user can."""
+    lockfile = tree / "uv.lock"
+    if not lockfile.exists():
+        return False, (
+            "uv.lock is not in the nominated commit: the scoring builds the environment from pyproject.toml and "
+            "uv.lock, so commit both"
+        )
+    differences = venv_differences(venv, lockfile)
+    if differences:
+        return False, (
+            f".venv differs from the uv.lock of the nominated commit, from which the scoring builds the environment: "
+            f"{'; '.join(differences)}. `uv add` what the champion needs and commit, `uv sync` to drop the other "
+            "packages, and delete what no package installed"
+        )
     home = Path(tempfile.mkdtemp(prefix="synthbench-probe-"))
     name = home.name
     try:
